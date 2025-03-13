@@ -2,14 +2,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import { glob } from 'glob';
-import * as child_process from 'child_process';
-import * as semver from 'semver';
 import { log } from '../utils/logging';
-import { DependencyIssue, VulnerabilityInfo } from '../types/scanning';
-import { compareVersions, getVersionChangeType, classifyMigrationRisk } from '../utils/scanner-utils';
+import { DependencyIssue } from '../types/scanning';
+import { compareVersions, formatDate } from '../utils/scanner-utils';
 
 const readFileAsync = promisify(fs.readFile);
-const execAsync = promisify(child_process.exec);
 
 /**
  * Configuration for dependency scanning
@@ -18,35 +15,65 @@ export interface DependencyScannerConfig {
   // Root directory to scan
   rootDirectory: string;
   
-  // Package types to check
-  packageTypes: Array<'npm' | 'yarn' | 'pnpm' | 'pip' | 'gem' | 'composer' | 'cargo' | 'nuget' | 'maven'>;
-  
-  // Check for direct dependencies only
-  directDependenciesOnly: boolean;
-  
-  // Whether to check for unused dependencies
-  checkUnused: boolean;
-  
-  // Whether to check for vulnerable dependencies
-  checkVulnerabilities: boolean;
-  
-  // Whether to check licenses
-  checkLicenses: boolean;
-  
-  // Ignore packages with specific names
-  ignorePackages?: string[];
-  
-  // Ignore specific development dependencies
-  ignoreDevDependencies?: boolean;
-  
   // Whether to use offline mode (don't make API calls)
   offlineMode: boolean;
+  
+  // Skip specific dependencies
+  ignoreDependencies?: string[];
   
   // API timeout in milliseconds
   apiTimeoutMs: number;
   
   // Directory to store cached data
   cacheDir?: string;
+  
+  // Only flag major version differences
+  majorVersionsOnly?: boolean;
+  
+  // Custom package manifests to scan
+  customManifests?: string[];
+  
+  // Scan development dependencies
+  includeDevDependencies?: boolean;
+  
+  // Scan peer dependencies
+  includePeerDependencies?: boolean;
+  
+  // Scan optional dependencies
+  includeOptionalDependencies?: boolean;
+}
+
+/**
+ * Package managers supported by the scanner
+ */
+enum PackageManager {
+  NPM = 'npm',
+  YARN = 'yarn',
+  PNPM = 'pnpm',
+  PIP = 'pip',
+  PIPENV = 'pipenv',
+  POETRY = 'poetry',
+  MAVEN = 'maven',
+  GRADLE = 'gradle',
+  NUGET = 'nuget',
+  CARGO = 'cargo',
+  COMPOSER = 'composer',
+  GO = 'go',
+  GEM = 'gem',
+  SWIFT = 'swift',
+  CUSTOM = 'custom'
+}
+
+/**
+ * Dependency manifest file with version patterns
+ */
+interface DependencyManifest {
+  packageManager: PackageManager;
+  filePattern: string;
+  parser: (content: string) => Record<string, string> | null;
+  devDependenciesParser?: (content: string) => Record<string, string> | null;
+  peerDependenciesParser?: (content: string) => Record<string, string> | null;
+  optionalDependenciesParser?: (content: string) => Record<string, string> | null;
 }
 
 /**
@@ -54,36 +81,40 @@ export interface DependencyScannerConfig {
  */
 interface DetectedDependency {
   name: string;
-  type: string;
-  version: string;
-  location: string;
-  isDev: boolean;
-  isTransitive: boolean;
+  currentVersion: string;
+  packageManager: string;
+  type: 'production' | 'development' | 'peer' | 'optional';
+  manifest: string;
+  detectedAt: Date;
 }
 
 /**
- * Dependency version info from registry
+ * Dependency information from repository or cache
  */
-interface DependencyVersionInfo {
+interface DependencyInfo {
   latestVersion: string;
-  latestReleaseDate?: Date;
-  isDeprecated: boolean;
-  licenseInfo?: {
-    name: string;
-    url?: string;
-    isApproved: boolean;
-    issues?: string[];
-  };
-  vulnerabilities: VulnerabilityInfo[];
-  usage?: 'popular' | 'moderate' | 'low';
-  downloadCount?: number;
-  stars?: number;
+  latestStableVersion: string;
   isOutdated: boolean;
-  isUnused?: boolean;
+  isDeprecated: boolean;
+  hasSecurityIssues: boolean;
+  securityIssues?: Array<{
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    fixedInVersion?: string;
+    cve?: string;
+  }>;
+  releaseDate?: Date;
+  latestReleaseDate?: Date;
+  downloadCount?: number;
+  repo?: string;
+  license?: string;
+  isMaintained?: boolean;
+  recommendedVersion?: string;
+  alternatives?: string[];
 }
 
 /**
- * Scanner for detecting outdated, vulnerable, and problematic dependencies
+ * Scanner for detecting dependencies across package managers
  */
 export async function scanDependencies(
   config: DependencyScannerConfig
@@ -99,134 +130,58 @@ export async function scanDependencies(
     // Check each dependency
     for (const dependency of dependencies) {
       try {
-        // Skip development dependencies if configured
-        if (config.ignoreDevDependencies && dependency.isDev) {
-          log.info(`Skipping dev dependency: ${dependency.name}`);
-          continue;
-        }
-        
-        // Skip ignored packages
-        if (config.ignorePackages && config.ignorePackages.includes(dependency.name)) {
-          log.info(`Skipping ignored package: ${dependency.name}`);
-          continue;
-        }
-        
-        // Skip transitive dependencies if configured
-        if (config.directDependenciesOnly && dependency.isTransitive) {
-          log.info(`Skipping transitive dependency: ${dependency.name}`);
+        // Skip ignored dependencies
+        if (config.ignoreDependencies && config.ignoreDependencies.includes(dependency.name)) {
+          log.info(`Skipping ignored dependency: ${dependency.name}`);
           continue;
         }
         
         // Get dependency information
         const dependencyInfo = await getDependencyInfo(
           dependency.name,
-          dependency.type,
-          dependency.version,
+          dependency.currentVersion,
+          dependency.packageManager,
           config.offlineMode,
-          config.checkVulnerabilities,
-          config.checkLicenses,
-          config.cacheDir
+          config.apiTimeoutMs,
+          config.cacheDir,
+          config.majorVersionsOnly || false
         );
         
         // Only create an issue if there's at least one problem
-        if (dependencyInfo.isOutdated || dependencyInfo.isDeprecated || 
-            dependencyInfo.vulnerabilities.length > 0 || 
-            (dependencyInfo.licenseInfo && !dependencyInfo.licenseInfo.isApproved) ||
-            dependencyInfo.isUnused) {
+        if (dependencyInfo.isOutdated || dependencyInfo.isDeprecated || dependencyInfo.hasSecurityIssues) {
           
           // Create the issue
           const issue: DependencyIssue = {
             name: dependency.name,
-            type: dependency.type,
-            currentVersion: dependency.version,
+            packageManager: dependency.packageManager,
+            currentVersion: dependency.currentVersion,
             latestVersion: dependencyInfo.latestVersion,
-            location: dependency.location,
+            type: dependency.type,
+            manifestFile: dependency.manifest,
+            detectedAt: dependency.detectedAt,
             isOutdated: dependencyInfo.isOutdated,
             isDeprecated: dependencyInfo.isDeprecated,
-            isUnused: dependencyInfo.isUnused,
-            detectedAt: new Date()
+            hasSecurityIssues: dependencyInfo.hasSecurityIssues,
+            license: dependencyInfo.license,
+            repo: dependencyInfo.repo
           };
           
-          // Add license issue if applicable
-          if (dependencyInfo.licenseInfo && !dependencyInfo.licenseInfo.isApproved) {
-            issue.licenseIssue = {
-              issue: `Non-approved license: ${dependencyInfo.licenseInfo.name}`,
-              severity: 'medium' // Default severity
-            };
-            
-            // Adjust severity based on license issues
-            if (dependencyInfo.licenseInfo.issues && dependencyInfo.licenseInfo.issues.length > 0) {
-              if (dependencyInfo.licenseInfo.issues.some(i => i.includes('copyleft') || i.includes('GPL'))) {
-                issue.licenseIssue.severity = 'high';
-              }
-            }
-          }
-          
-          // Add vulnerability info if any exist
-          if (dependencyInfo.vulnerabilities.length > 0) {
-            issue.vulnerabilities = dependencyInfo.vulnerabilities;
-            
-            // Set security impact based on highest vulnerability
-            const highestSeverity = getHighestSeverity(dependencyInfo.vulnerabilities);
-            switch (highestSeverity) {
-              case 'critical':
-                issue.securityImpact = 5;
-                break;
-              case 'high':
-                issue.securityImpact = 4;
-                break;
-              case 'medium':
-                issue.securityImpact = 3;
-                break;
-              case 'low':
-                issue.securityImpact = 2;
-                break;
-              default:
-                issue.securityImpact = 1;
-            }
+          // Add security issues if any
+          if (dependencyInfo.securityIssues?.length) {
+            issue.securityIssues = dependencyInfo.securityIssues;
           }
           
           // Calculate business impact
           issue.businessImpact = calculateBusinessImpact(
-            dependency.name,
-            dependency.type,
-            dependencyInfo.isOutdated,
-            dependencyInfo.isDeprecated,
-            dependencyInfo.vulnerabilities.length > 0,
-            dependency.isDev
+            dependency,
+            dependencyInfo
           );
           
-          // Calculate migration effort
-          if (dependencyInfo.isOutdated) {
-            const versionChangeType = getVersionChangeType(
-              dependency.version, 
-              dependencyInfo.latestVersion
-            );
-            
-            const migrationRisk = classifyMigrationRisk(
-              dependency.name,
-              versionChangeType,
-              dependencyInfo.vulnerabilities.length > 0
-            );
-            
-            // Map migration risk to a numerical score
-            switch (migrationRisk) {
-              case 'critical':
-                issue.migrationEffort = 5;
-                break;
-              case 'high':
-                issue.migrationEffort = 4;
-                break;
-              case 'medium':
-                issue.migrationEffort = 3;
-                break;
-              case 'low':
-                issue.migrationEffort = 2;
-                break;
-              default:
-                issue.migrationEffort = 1;
-            }
-          }
+          // Calculate update effort
+          issue.updateEffort = calculateUpdateEffort(
+            dependency,
+            dependencyInfo
+          );
           
           // Generate recommendation
           issue.recommendation = generateRecommendation(
@@ -234,19 +189,15 @@ export async function scanDependencies(
             dependencyInfo
           );
           
-          // Add appropriate tags
+          // Generate tags
           issue.tags = generateTags(
-            dependency.type,
-            dependency.isDev,
-            dependencyInfo.isOutdated,
-            dependencyInfo.isDeprecated,
-            dependencyInfo.vulnerabilities.length > 0,
-            dependencyInfo.isUnused
+            dependency,
+            dependencyInfo
           );
           
           // Add to issues list
           issues.push(issue);
-          log.info(`Added issue for dependency ${dependency.name} ${dependency.version}`);
+          log.info(`Added issue for dependency ${dependency.name} ${dependency.currentVersion}`);
         }
       } catch (depError) {
         log.warn(`Error processing dependency: ${dependency.name}`, { error: depError });
@@ -262,7 +213,7 @@ export async function scanDependencies(
 }
 
 /**
- * Detect dependencies in a project
+ * Detect dependencies across various package managers
  */
 async function detectDependencies(
   config: DependencyScannerConfig
@@ -271,295 +222,133 @@ async function detectDependencies(
     const dependencies: DetectedDependency[] = [];
     const rootDir = config.rootDirectory;
     
-    // Detect dependencies based on package type
-    for (const packageType of config.packageTypes) {
+    // Define dependency manifests to scan
+    const manifests = getManifestDefinitions();
+    
+    // Add custom manifests if provided
+    if (config.customManifests) {
+      for (const customPattern of config.customManifests) {
+        manifests.push({
+          packageManager: PackageManager.CUSTOM,
+          filePattern: customPattern,
+          parser: parseCustomManifest
+        });
+      }
+    }
+    
+    // Scan each manifest type
+    for (const manifest of manifests) {
       try {
-        log.info(`Detecting ${packageType} dependencies`);
+        const matches = await glob(path.join(rootDir, manifest.filePattern), {
+          ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
+        });
         
-        switch (packageType) {
-          case 'npm':
-          case 'yarn':
-          case 'pnpm':
-            // Check for package.json
-            const packageJsonFiles = await glob(path.join(rootDir, '**/package.json'), {
-              ignore: ['**/node_modules/**', '**/.git/**']
-            });
+        for (const match of matches) {
+          try {
+            const content = await readFileAsync(match, 'utf8');
             
-            for (const packageJsonFile of packageJsonFiles) {
-              try {
-                const content = await readFileAsync(packageJsonFile, 'utf8');
-                const packageJson = JSON.parse(content);
-                
-                // Process regular dependencies
-                if (packageJson.dependencies) {
-                  for (const [name, version] of Object.entries(packageJson.dependencies)) {
-                    dependencies.push({
-                      name,
-                      type: 'npm',
-                      version: (version as string).replace(/[^0-9.]/g, ''),
-                      location: packageJsonFile,
-                      isDev: false,
-                      isTransitive: false
-                    });
-                  }
-                }
-                
-                // Process dev dependencies
-                if (packageJson.devDependencies) {
-                  for (const [name, version] of Object.entries(packageJson.devDependencies)) {
-                    dependencies.push({
-                      name,
-                      type: 'npm',
-                      version: (version as string).replace(/[^0-9.]/g, ''),
-                      location: packageJsonFile,
-                      isDev: true,
-                      isTransitive: false
-                    });
-                  }
-                }
-              } catch (fileError) {
-                log.warn(`Error processing package.json: ${packageJsonFile}`, { error: fileError });
+            // Parse production dependencies
+            const dependencies = manifest.parser(content);
+            if (dependencies) {
+              for (const [name, version] of Object.entries(dependencies)) {
+                addDependency(
+                  name,
+                  version,
+                  manifest.packageManager.toString(),
+                  'production',
+                  match,
+                  dependencies
+                );
               }
             }
             
-            // Check for lock files to get transitive dependencies
-            if (!config.directDependenciesOnly) {
-              let lockFiles: string[] = [];
-              
-              if (packageType === 'npm') {
-                lockFiles = await glob(path.join(rootDir, '**/package-lock.json'), {
-                  ignore: ['**/node_modules/**', '**/.git/**']
-                });
-              } else if (packageType === 'yarn') {
-                lockFiles = await glob(path.join(rootDir, '**/yarn.lock'), {
-                  ignore: ['**/node_modules/**', '**/.git/**']
-                });
-              } else if (packageType === 'pnpm') {
-                lockFiles = await glob(path.join(rootDir, '**/pnpm-lock.yaml'), {
-                  ignore: ['**/node_modules/**', '**/.git/**']
-                });
-              }
-              
-              // Processing lock files is more complex and varies by type
-              // For this implementation, we'll skip the detailed parsing
-              log.info(`Found ${lockFiles.length} lock files. Full parsing is not implemented.`);
-            }
-            break;
-            
-          case 'pip':
-            // Check for requirements.txt
-            const requirementsFiles = await glob(path.join(rootDir, '**/requirements*.txt'), {
-              ignore: ['**/venv/**', '**/.git/**', '**/.env/**']
-            });
-            
-            for (const requirementsFile of requirementsFiles) {
-              try {
-                const content = await readFileAsync(requirementsFile, 'utf8');
-                const lines = content.split('\n');
-                
-                for (const line of lines) {
-                  // Skip comments and empty lines
-                  if (line.trim().startsWith('#') || line.trim() === '') {
-                    continue;
-                  }
-                  
-                  // Basic parsing of pip requirements
-                  // Format can be: package==1.0.0, package>=1.0.0, package, etc.
-                  const match = line.match(/^([\w\-_.]+)(?:[=<>!~]+([\w\d.]+))?/);
-                  if (match) {
-                    const name = match[1];
-                    const version = match[2] || '0.0.0'; // Use a placeholder if version not specified
-                    
-                    dependencies.push({
-                      name,
-                      type: 'pip',
-                      version,
-                      location: requirementsFile,
-                      isDev: requirementsFile.toLowerCase().includes('dev') || 
-                              requirementsFile.toLowerCase().includes('test'),
-                      isTransitive: false
-                    });
-                  }
+            // Parse development dependencies if enabled
+            if (config.includeDevDependencies && manifest.devDependenciesParser) {
+              const devDependencies = manifest.devDependenciesParser(content);
+              if (devDependencies) {
+                for (const [name, version] of Object.entries(devDependencies)) {
+                  addDependency(
+                    name,
+                    version,
+                    manifest.packageManager.toString(),
+                    'development',
+                    match,
+                    devDependencies
+                  );
                 }
-              } catch (fileError) {
-                log.warn(`Error processing requirements file: ${requirementsFile}`, { error: fileError });
               }
             }
-            break;
             
-          case 'gem':
-            // Check for Gemfile
-            const gemFiles = await glob(path.join(rootDir, '**/Gemfile'), {
-              ignore: ['**/vendor/**', '**/.git/**', '**/.bundle/**']
-            });
-            
-            for (const gemFile of gemFiles) {
-              try {
-                const content = await readFileAsync(gemFile, 'utf8');
-                const lines = content.split('\n');
-                
-                for (const line of lines) {
-                  // Skip comments and empty lines
-                  if (line.trim().startsWith('#') || line.trim() === '') {
-                    continue;
-                  }
-                  
-                  // Basic parsing of gem dependencies
-                  // Format can be: gem 'name', '~> 1.0.0', gem 'name', etc.
-                  const match = line.match(/gem\s+['"]([\w\-_.]+)['"](?:,\s+['"]([^'"]+)['"])?/);
-                  if (match) {
-                    const name = match[1];
-                    const version = match[2] ? match[2].replace(/[^0-9.]/g, '') : '0.0.0';
-                    
-                    // Check if it's a development dependency
-                    const isDev = content.includes('group :development') || content.includes('group :test');
-                    
-                    dependencies.push({
-                      name,
-                      type: 'gem',
-                      version,
-                      location: gemFile,
-                      isDev,
-                      isTransitive: false
-                    });
-                  }
+            // Parse peer dependencies if enabled
+            if (config.includePeerDependencies && manifest.peerDependenciesParser) {
+              const peerDependencies = manifest.peerDependenciesParser(content);
+              if (peerDependencies) {
+                for (const [name, version] of Object.entries(peerDependencies)) {
+                  addDependency(
+                    name,
+                    version,
+                    manifest.packageManager.toString(),
+                    'peer',
+                    match,
+                    peerDependencies
+                  );
                 }
-              } catch (fileError) {
-                log.warn(`Error processing Gemfile: ${gemFile}`, { error: fileError });
               }
             }
-            break;
             
-          case 'composer':
-            // Check for composer.json
-            const composerFiles = await glob(path.join(rootDir, '**/composer.json'), {
-              ignore: ['**/vendor/**', '**/.git/**']
-            });
-            
-            for (const composerFile of composerFiles) {
-              try {
-                const content = await readFileAsync(composerFile, 'utf8');
-                const composerJson = JSON.parse(content);
-                
-                // Process regular dependencies
-                if (composerJson.require) {
-                  for (const [name, version] of Object.entries(composerJson.require)) {
-                    // Skip php itself
-                    if (name === 'php') continue;
-                    
-                    dependencies.push({
-                      name,
-                      type: 'composer',
-                      version: (version as string).replace(/[^0-9.]/g, ''),
-                      location: composerFile,
-                      isDev: false,
-                      isTransitive: false
-                    });
-                  }
+            // Parse optional dependencies if enabled
+            if (config.includeOptionalDependencies && manifest.optionalDependenciesParser) {
+              const optionalDependencies = manifest.optionalDependenciesParser(content);
+              if (optionalDependencies) {
+                for (const [name, version] of Object.entries(optionalDependencies)) {
+                  addDependency(
+                    name,
+                    version,
+                    manifest.packageManager.toString(),
+                    'optional',
+                    match,
+                    optionalDependencies
+                  );
                 }
-                
-                // Process dev dependencies
-                if (composerJson['require-dev']) {
-                  for (const [name, version] of Object.entries(composerJson['require-dev'])) {
-                    dependencies.push({
-                      name,
-                      type: 'composer',
-                      version: (version as string).replace(/[^0-9.]/g, ''),
-                      location: composerFile,
-                      isDev: true,
-                      isTransitive: false
-                    });
-                  }
-                }
-              } catch (fileError) {
-                log.warn(`Error processing composer.json: ${composerFile}`, { error: fileError });
               }
             }
-            break;
             
-          case 'cargo':
-            // Check for Cargo.toml
-            const cargoFiles = await glob(path.join(rootDir, '**/Cargo.toml'), {
-              ignore: ['**/target/**', '**/.git/**']
-            });
-            
-            for (const cargoFile of cargoFiles) {
-              try {
-                const content = await readFileAsync(cargoFile, 'utf8');
-                const lines = content.split('\n');
-                
-                let inDependencies = false;
-                let inDevDependencies = false;
-                
-                for (const line of lines) {
-                  // Track which section we're in
-                  if (line.trim() === '[dependencies]') {
-                    inDependencies = true;
-                    inDevDependencies = false;
-                    continue;
-                  } else if (line.trim() === '[dev-dependencies]') {
-                    inDependencies = false;
-                    inDevDependencies = true;
-                    continue;
-                  } else if (line.trim().startsWith('[') && line.trim().endsWith(']')) {
-                    inDependencies = false;
-                    inDevDependencies = false;
-                    continue;
-                  }
-                  
-                  // Skip if not in a dependencies section
-                  if (!inDependencies && !inDevDependencies) {
-                    continue;
-                  }
-                  
-                  // Basic parsing of Cargo.toml dependencies
-                  // Format can be: name = "1.0.0", name = { version = "1.0.0" }, etc.
-                  const simpleMatch = line.match(/^([\w\-_]+)\s*=\s*"([\w\d.]+)"/);
-                  if (simpleMatch) {
-                    dependencies.push({
-                      name: simpleMatch[1],
-                      type: 'cargo',
-                      version: simpleMatch[2],
-                      location: cargoFile,
-                      isDev: inDevDependencies,
-                      isTransitive: false
-                    });
-                    continue;
-                  }
-                  
-                  // More complex format with table
-                  const tableMatch = line.match(/^([\w\-_]+)\s*=\s*\{/);
-                  if (tableMatch) {
-                    // For complex declarations, we'd need more sophisticated parsing
-                    // Here we'll just capture the name and use a placeholder version
-                    dependencies.push({
-                      name: tableMatch[1],
-                      type: 'cargo',
-                      version: '0.0.0', // Placeholder
-                      location: cargoFile,
-                      isDev: inDevDependencies,
-                      isTransitive: false
-                    });
-                  }
-                }
-              } catch (fileError) {
-                log.warn(`Error processing Cargo.toml: ${cargoFile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          // Additional package types could be implemented here
-          
-          default:
-            log.info(`Package type not fully implemented: ${packageType}`);
-            break;
+            log.info(`Parsed dependencies from ${match}`);
+          } catch (matchError) {
+            log.warn(`Error processing manifest: ${match}`, { error: matchError });
+          }
         }
-      } catch (typeError) {
-        log.error(`Error scanning ${packageType} dependencies`, { error: typeError });
+      } catch (manifestError) {
+        log.warn(`Error processing manifest type: ${manifest.packageManager}`, { error: manifestError });
       }
     }
     
     return dependencies;
+    
+    // Helper to add dependency to the list
+    function addDependency(
+      name: string,
+      version: string,
+      packageManager: string,
+      type: 'production' | 'development' | 'peer' | 'optional',
+      manifest: string,
+      allDeps: Record<string, string>
+    ) {
+      // Clean up version string
+      const cleanVersion = cleanVersionString(version);
+      
+      // Only add if it's a valid version
+      if (cleanVersion) {
+        dependencies.push({
+          name,
+          currentVersion: cleanVersion,
+          packageManager,
+          type,
+          manifest,
+          detectedAt: new Date()
+        });
+      }
+    }
   } catch (error) {
     log.error('Error detecting dependencies', { error });
     return [];
@@ -567,26 +356,26 @@ async function detectDependencies(
 }
 
 /**
- * Get dependency information from registry or cache
+ * Get dependency information from repository or cache
  */
 async function getDependencyInfo(
   name: string,
-  type: string,
   version: string,
+  packageManager: string,
   offlineMode: boolean,
-  checkVulnerabilities: boolean,
-  checkLicenses: boolean,
-  cacheDir?: string
-): Promise<DependencyVersionInfo> {
+  timeoutMs: number,
+  cacheDir?: string,
+  majorVersionsOnly = false
+): Promise<DependencyInfo> {
   // Check cache first
   if (cacheDir) {
-    const cacheFile = path.join(cacheDir, `dep-${type}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
+    const cacheFile = path.join(cacheDir, `dep-${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
     
     if (fs.existsSync(cacheFile)) {
       try {
         const cacheContent = await readFileAsync(cacheFile, 'utf8');
-        const cachedInfo = JSON.parse(cacheContent) as DependencyVersionInfo;
-        log.info(`Loaded ${name} info from cache`);
+        const cachedInfo = JSON.parse(cacheContent) as DependencyInfo;
+        log.info(`Loaded ${name} dependency info from cache`);
         return cachedInfo;
       } catch (cacheError) {
         log.warn(`Error reading dependency cache for ${name}`, { error: cacheError });
@@ -598,75 +387,65 @@ async function getDependencyInfo(
   if (offlineMode) {
     log.info(`Offline mode enabled for ${name}, using placeholder data`);
     return {
-      latestVersion: version, // Assume current version is latest
+      latestVersion: version,
+      latestStableVersion: version,
+      isOutdated: false,
       isDeprecated: false,
-      vulnerabilities: [],
-      isOutdated: false
+      hasSecurityIssues: false
     };
   }
   
-  // In a real implementation, we would query the package registry
+  // In a real implementation, we would query package repositories
   // For this example, we'll use mock data
   try {
-    log.info(`Querying registry for ${type} package: ${name}@${version}`);
+    log.info(`Querying ${packageManager} repository for dependency: ${name} ${version}`);
+    
+    // Simulate API call delay
+    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 200));
+    
+    // Generate latest version based on current version
+    const latestVersion = incrementVersion(version);
+    const isOutdated = compareVersions(latestVersion, version) > 0;
+    
+    // Check if we should only flag major version differences
+    let actuallyOutdated = isOutdated;
+    if (majorVersionsOnly && isOutdated) {
+      const currentMajor = parseInt(version.split('.')[0], 10);
+      const latestMajor = parseInt(latestVersion.split('.')[0], 10);
+      actuallyOutdated = latestMajor > currentMajor;
+    }
     
     // Generate mock data
-    const info: DependencyVersionInfo = {
-      latestVersion: incrementVersion(version),
-      isDeprecated: isDeprecated(name),
-      vulnerabilities: [],
-      isOutdated: true // Assume it's outdated for demonstration
+    const info: DependencyInfo = {
+      latestVersion,
+      latestStableVersion: latestVersion,
+      isOutdated: actuallyOutdated,
+      isDeprecated: Math.random() < 0.1, // 10% chance of being deprecated
+      hasSecurityIssues: Math.random() < 0.2, // 20% chance of having security issues
+      releaseDate: new Date(Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000),
+      latestReleaseDate: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000),
+      downloadCount: Math.floor(Math.random() * 1000000),
+      license: getRandomLicense(),
+      isMaintained: Math.random() > 0.1, // 90% chance of being maintained
+      recommendedVersion: latestVersion
     };
     
-    // Add vulnerabilities if needed
-    if (checkVulnerabilities && (isVulnerable(name) || Math.random() < 0.2)) {
-      info.vulnerabilities = [
+    // Add security issues if flagged
+    if (info.hasSecurityIssues) {
+      info.securityIssues = [
         {
-          id: `CVE-2023-${Math.floor(Math.random() * 10000)}`,
           severity: getRandomSeverity(),
-          title: `Security issue in ${name}`,
-          description: `${getRandomVulnerabilityType()} vulnerability in ${name} affecting versions < ${info.latestVersion}`,
-          publishedDate: new Date(Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000),
-          affectedVersions: `<= ${version}`,
-          patchedVersions: `>= ${info.latestVersion}`,
-          recommendation: `Update to version ${info.latestVersion} or later`
+          description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
+          fixedInVersion: info.latestVersion,
+          cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
         }
       ];
     }
     
-    // Add license info if needed
-    if (checkLicenses) {
-      info.licenseInfo = {
-        name: getRandomLicense(),
-        isApproved: Math.random() < 0.9 // 90% chance it's approved
-      };
-      
-      if (!info.licenseInfo.isApproved) {
-        info.licenseInfo.issues = [
-          `License ${info.licenseInfo.name} does not comply with corporate policy`
-        ];
-        
-        if (info.licenseInfo.name.includes('GPL')) {
-          info.licenseInfo.issues.push('Copyleft license may require source code disclosure');
-        }
-      }
+    // Suggest alternatives if deprecated
+    if (info.isDeprecated) {
+      info.alternatives = getRandomAlternatives(name, packageManager);
     }
-    
-    // Add usage stats
-    const randomNumber = Math.random();
-    if (randomNumber < 0.1) {
-      info.usage = 'low';
-      info.downloadCount = Math.floor(Math.random() * 1000);
-    } else if (randomNumber < 0.6) {
-      info.usage = 'moderate';
-      info.downloadCount = Math.floor(Math.random() * 10000) + 1000;
-    } else {
-      info.usage = 'popular';
-      info.downloadCount = Math.floor(Math.random() * 1000000) + 10000;
-    }
-    
-    // Add stars
-    info.stars = Math.floor(Math.random() * 10000);
     
     // Save to cache if cacheDir is provided
     if (cacheDir) {
@@ -675,9 +454,9 @@ async function getDependencyInfo(
           fs.mkdirSync(cacheDir, { recursive: true });
         }
         
-        const cacheFile = path.join(cacheDir, `dep-${type}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
+        const cacheFile = path.join(cacheDir, `dep-${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
         await fs.promises.writeFile(cacheFile, JSON.stringify(info, null, 2), 'utf8');
-        log.info(`Cached ${name} info`);
+        log.info(`Cached ${name} dependency info`);
       } catch (cacheError) {
         log.warn(`Error writing dependency cache for ${name}`, { error: cacheError });
       }
@@ -685,144 +464,684 @@ async function getDependencyInfo(
     
     return info;
   } catch (error) {
-    log.error(`Error querying registry for ${name}`, { error });
+    log.error(`Error querying repository for ${name}`, { error });
     
-    // Return basic info if registry query fails
+    // Return basic info if repository query fails
     return {
       latestVersion: version,
+      latestStableVersion: version,
+      isOutdated: false,
       isDeprecated: false,
-      vulnerabilities: [],
-      isOutdated: false
+      hasSecurityIssues: false
     };
   }
 }
 
 /**
- * Calculate business impact score
+ * Calculate business impact score for a dependency issue
  */
 function calculateBusinessImpact(
-  name: string,
-  type: string,
-  isOutdated: boolean,
-  isDeprecated: boolean,
-  hasVulnerabilities: boolean,
-  isDev: boolean
+  dependency: DetectedDependency,
+  info: DependencyInfo
 ): number {
   let score = 1; // Start with minimal impact
   
-  // Dev dependencies have less impact
-  const multiplier = isDev ? 0.5 : 1;
-  
-  if (isOutdated) score += 1;
-  if (isDeprecated) score += 2;
-  if (hasVulnerabilities) score += 3;
-  
-  // Critical dependencies would have higher impact
-  const criticalDependencies = ['react', 'angular', 'vue', 'express', 'axios', 'lodash', 'mongoose', 'sequelize'];
-  if (criticalDependencies.includes(name.toLowerCase())) {
-    score += 1;
+  // Security issues have high impact
+  if (info.hasSecurityIssues) {
+    const hasCritical = info.securityIssues?.some(issue => issue.severity === 'critical');
+    const hasHigh = info.securityIssues?.some(issue => issue.severity === 'high');
+    
+    if (hasCritical) score += 3;
+    else if (hasHigh) score += 2;
+    else score += 1;
   }
   
-  // Apply the dev dependency multiplier
-  score = Math.round(score * multiplier);
+  // Deprecation has medium impact
+  if (info.isDeprecated) score += 1;
+  
+  // Being outdated has lower impact
+  if (info.isOutdated) score += 1;
+  
+  // Production dependencies have higher impact than dev dependencies
+  if (dependency.type === 'production') score += 1;
+  
+  // Unmaintained packages have higher impact
+  if (info.isMaintained === false) score += 1;
   
   // Cap at maximum of 5
   return Math.min(score, 5);
 }
 
 /**
- * Generate a recommendation
+ * Calculate update effort for a dependency
+ */
+function calculateUpdateEffort(
+  dependency: DetectedDependency,
+  info: DependencyInfo
+): number {
+  // Start with moderate effort
+  let effort = 2;
+  
+  // Calculate version difference
+  if (info.latestVersion) {
+    const currentMajor = parseInt(dependency.currentVersion.split('.')[0], 10) || 0;
+    const latestMajor = parseInt(info.latestVersion.split('.')[0], 10) || 0;
+    
+    const majorDiff = latestMajor - currentMajor;
+    
+    // Major version upgrades are more difficult
+    if (majorDiff > 1) effort += 2;
+    else if (majorDiff === 1) effort += 1;
+  }
+  
+  // Deprecated packages are harder to update (requires replacement)
+  if (info.isDeprecated) effort += 1;
+  
+  // Popular packages are usually easier to update (better docs, examples)
+  if (info.downloadCount && info.downloadCount > 1000000) effort -= 1;
+  
+  // Different dependency types have different update complexities
+  switch (dependency.type) {
+    case 'peer':
+      // Peer dependencies are tricky to update
+      effort += 1;
+      break;
+    case 'development':
+      // Dev dependencies are usually easier
+      effort -= 1;
+      break;
+  }
+  
+  // Cap at 1-5 range
+  return Math.max(1, Math.min(5, effort));
+}
+
+/**
+ * Generate a recommendation for a dependency issue
  */
 function generateRecommendation(
   dependency: DetectedDependency,
-  dependencyInfo: DependencyVersionInfo
+  info: DependencyInfo
 ): string {
   const recommendations: string[] = [];
   
-  if (dependencyInfo.vulnerabilities.length > 0) {
-    recommendations.push(
-      `Update ${dependency.name} immediately from ${dependency.version} to at least ${dependencyInfo.latestVersion} to address security vulnerabilities`
+  if (info.hasSecurityIssues) {
+    const highestSeverity = info.securityIssues?.reduce(
+      (highest, current) => {
+        const severityRank = { 'low': 1, 'medium': 2, 'high': 3, 'critical': 4 };
+        const currentRank = severityRank[current.severity] || 0;
+        const highestRank = severityRank[highest] || 0;
+        return currentRank > highestRank ? current.severity : highest;
+      },
+      'low' as 'low' | 'medium' | 'high' | 'critical'
     );
-  } else if (dependencyInfo.isDeprecated) {
+    
     recommendations.push(
-      `Replace deprecated dependency ${dependency.name} with a maintained alternative`
+      `Update ${dependency.name} immediately to fix ${highestSeverity} severity security ${info.securityIssues?.length === 1 ? 'issue' : 'issues'}`
     );
-  } else if (dependencyInfo.isOutdated) {
+  } else if (info.isDeprecated) {
+    if (info.alternatives?.length) {
+      recommendations.push(
+        `Replace deprecated package ${dependency.name} with one of the recommended alternatives: ${info.alternatives.join(', ')}`
+      );
+    } else {
+      recommendations.push(
+        `Replace deprecated package ${dependency.name} with a maintained alternative`
+      );
+    }
+  } else if (info.isOutdated) {
     recommendations.push(
-      `Update ${dependency.name} from ${dependency.version} to ${dependencyInfo.latestVersion}`
+      `Update ${dependency.name} from ${dependency.currentVersion} to ${info.latestVersion}`
     );
   }
   
-  if (dependencyInfo.licenseInfo && !dependencyInfo.licenseInfo.isApproved) {
-    recommendations.push(
-      `Review license compliance issue with ${dependency.name} (${dependencyInfo.licenseInfo.name})`
-    );
-  }
-  
-  if (dependencyInfo.isUnused) {
-    recommendations.push(
-      `Remove unused dependency ${dependency.name}`
-    );
+  // Add testing recommendation for major updates
+  if (info.latestVersion) {
+    const currentMajor = parseInt(dependency.currentVersion.split('.')[0], 10) || 0;
+    const latestMajor = parseInt(info.latestVersion.split('.')[0], 10) || 0;
+    
+    if (latestMajor > currentMajor) {
+      recommendations.push(
+        `Test thoroughly after updating as this is a major version change (${currentMajor} → ${latestMajor})`
+      );
+    }
   }
   
   if (recommendations.length === 0) {
-    recommendations.push(`No immediate action required for ${dependency.name} ${dependency.version}`);
+    recommendations.push(`No immediate action required for ${dependency.name} ${dependency.currentVersion}`);
   }
   
   return recommendations.join('. ');
 }
 
 /**
- * Generate tags for categorizing issues
+ * Generate tags for categorizing dependency issues
  */
 function generateTags(
-  type: string,
-  isDev: boolean,
-  isOutdated: boolean,
-  isDeprecated: boolean,
-  hasVulnerabilities: boolean,
-  isUnused?: boolean
+  dependency: DetectedDependency,
+  info: DependencyInfo
 ): string[] {
-  const tags: string[] = [type];
+  const tags: string[] = [dependency.packageManager, dependency.type];
   
-  if (isDev) tags.push('dev-dependency');
-  if (isOutdated) tags.push('outdated');
-  if (isDeprecated) tags.push('deprecated');
-  if (hasVulnerabilities) tags.push('security');
-  if (isUnused) tags.push('unused');
+  if (info.isOutdated) tags.push('outdated');
+  if (info.isDeprecated) tags.push('deprecated');
+  
+  // Add security tags
+  if (info.hasSecurityIssues) {
+    tags.push('security');
+    
+    // Add tag for highest severity
+    const severities = info.securityIssues?.map(v => v.severity) || [];
+    if (severities.includes('critical')) tags.push('critical-severity');
+    else if (severities.includes('high')) tags.push('high-severity');
+    else if (severities.includes('medium')) tags.push('medium-severity');
+    else if (severities.includes('low')) tags.push('low-severity');
+  }
+  
+  // Add license tags
+  if (info.license) {
+    if (isPermissiveLicense(info.license)) {
+      tags.push('permissive-license');
+    } else if (isCopyleftLicense(info.license)) {
+      tags.push('copyleft-license');
+    }
+  }
+  
+  // Maintenance status
+  if (info.isMaintained === false) {
+    tags.push('unmaintained');
+  }
   
   return tags;
 }
 
+/* ---- Helper Functions and Definitions ---- */
+
 /**
- * Get highest severity from vulnerabilities
+ * Get manifest definitions for various package managers
  */
-function getHighestSeverity(vulnerabilities: VulnerabilityInfo[]): 'critical' | 'high' | 'medium' | 'low' | 'none' {
-  if (vulnerabilities.length === 0) return 'none';
-  
-  const severityRanking = {
-    'critical': 4,
-    'high': 3,
-    'medium': 2,
-    'low': 1,
-    'none': 0
-  };
-  
-  let highestSeverity = 'none';
-  
-  for (const vuln of vulnerabilities) {
-    if (severityRanking[vuln.severity] > severityRanking[highestSeverity as keyof typeof severityRanking]) {
-      highestSeverity = vuln.severity;
+function getManifestDefinitions(): DependencyManifest[] {
+  return [
+    // NPM / Yarn / PNPM
+    {
+      packageManager: PackageManager.NPM,
+      filePattern: '**/package.json',
+      parser: (content) => {
+        try {
+          const pkg = JSON.parse(content);
+          return pkg.dependencies || {};
+        } catch (error) {
+          return null;
+        }
+      },
+      devDependenciesParser: (content) => {
+        try {
+          const pkg = JSON.parse(content);
+          return pkg.devDependencies || {};
+        } catch (error) {
+          return null;
+        }
+      },
+      peerDependenciesParser: (content) => {
+        try {
+          const pkg = JSON.parse(content);
+          return pkg.peerDependencies || {};
+        } catch (error) {
+          return null;
+        }
+      },
+      optionalDependenciesParser: (content) => {
+        try {
+          const pkg = JSON.parse(content);
+          return pkg.optionalDependencies || {};
+        } catch (error) {
+          return null;
+        }
+      }
+    },
+    // Python pip
+    {
+      packageManager: PackageManager.PIP,
+      filePattern: '**/requirements.txt',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) continue;
+          
+          // Parse requirement line
+          const match = line.match(/^([a-zA-Z0-9_.-]+)([<>=~!]+)([a-zA-Z0-9_.-]+)/);
+          if (match) {
+            const [, name, , version] = match;
+            result[name.trim()] = version.trim();
+          } else {
+            // Handle case where no version is specified
+            const simpleName = line.trim().split(/\s+/)[0];
+            if (simpleName) {
+              result[simpleName] = '*';
+            }
+          }
+        }
+        
+        return result;
+      }
+    },
+    // Python Poetry
+    {
+      packageManager: PackageManager.POETRY,
+      filePattern: '**/pyproject.toml',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        let inDependencies = false;
+        
+        for (const line of lines) {
+          if (line.trim() === '[tool.poetry.dependencies]') {
+            inDependencies = true;
+            continue;
+          } else if (line.trim().startsWith('[') && inDependencies) {
+            inDependencies = false;
+          }
+          
+          if (inDependencies) {
+            const match = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_.-]+)\s*=\s*'([^']+)'/);
+            if (match) {
+              const name = match[1] || match[3];
+              const version = match[2] || match[4] || '*';
+              
+              if (name && name !== 'python') {
+                result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
+              }
+            }
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      },
+      devDependenciesParser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        let inDevDependencies = false;
+        
+        for (const line of lines) {
+          if (line.trim() === '[tool.poetry.dev-dependencies]') {
+            inDevDependencies = true;
+            continue;
+          } else if (line.trim().startsWith('[') && inDevDependencies) {
+            inDevDependencies = false;
+          }
+          
+          if (inDevDependencies) {
+            const match = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_.-]+)\s*=\s*'([^']+)'/);
+            if (match) {
+              const name = match[1] || match[3];
+              const version = match[2] || match[4] || '*';
+              
+              if (name && name !== 'python') {
+                result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
+              }
+            }
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // Maven
+    {
+      packageManager: PackageManager.MAVEN,
+      filePattern: '**/pom.xml',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        
+        // Extract dependencies
+        const dependencyMatches = content.matchAll(/<dependency>\s*<groupId>([^<]+)<\/groupId>\s*<artifactId>([^<]+)<\/artifactId>\s*<version>([^<]+)<\/version>/g);
+        
+        for (const match of dependencyMatches) {
+          const groupId = match[1].trim();
+          const artifactId = match[2].trim();
+          const version = match[3].trim();
+          
+          result[`${groupId}:${artifactId}`] = version;
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // Gradle
+    {
+      packageManager: PackageManager.GRADLE,
+      filePattern: '**/*.gradle',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        
+        // Match different dependency formats
+        const depMatches = [
+          ...content.matchAll(/implementation\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
+          ...content.matchAll(/api\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
+          ...content.matchAll(/compile\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
+          ...content.matchAll(/runtime\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g)
+        ];
+        
+        for (const match of depMatches) {
+          const groupId = match[1].trim();
+          const artifactId = match[2].trim();
+          const version = match[3].trim();
+          
+          result[`${groupId}:${artifactId}`] = version;
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      },
+      devDependenciesParser: (content) => {
+        const result: Record<string, string> = {};
+        
+        // Match test dependencies
+        const depMatches = [
+          ...content.matchAll(/testImplementation\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
+          ...content.matchAll(/testCompile\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g)
+        ];
+        
+        for (const match of depMatches) {
+          const groupId = match[1].trim();
+          const artifactId = match[2].trim();
+          const version = match[3].trim();
+          
+          result[`${groupId}:${artifactId}`] = version;
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // Composer (PHP)
+    {
+      packageManager: PackageManager.COMPOSER,
+      filePattern: '**/composer.json',
+      parser: (content) => {
+        try {
+          const pkg = JSON.parse(content);
+          return pkg.require || {};
+        } catch (error) {
+          return null;
+        }
+      },
+      devDependenciesParser: (content) => {
+        try {
+          const pkg = JSON.parse(content);
+          return pkg['require-dev'] || {};
+        } catch (error) {
+          return null;
+        }
+      }
+    },
+    // Cargo (Rust)
+    {
+      packageManager: PackageManager.CARGO,
+      filePattern: '**/Cargo.toml',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        let inDependencies = false;
+        
+        for (const line of lines) {
+          if (line.trim() === '[dependencies]') {
+            inDependencies = true;
+            continue;
+          } else if (line.trim().startsWith('[') && inDependencies) {
+            inDependencies = false;
+          }
+          
+          if (inDependencies) {
+            // Match lines like package = "version" or package = { version = "version" }
+            const simpleMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_-]+)\s*=\s*'([^']+)'/);
+            const complexMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*\{[^\}]*version\s*=\s*"([^"]+)"[^\}]*\}/);
+            
+            if (simpleMatch) {
+              const name = simpleMatch[1] || simpleMatch[3];
+              const version = simpleMatch[2] || simpleMatch[4] || '*';
+              result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
+            } else if (complexMatch) {
+              result[complexMatch[1].trim()] = complexMatch[2];
+            }
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      },
+      devDependenciesParser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        let inDevDependencies = false;
+        
+        for (const line of lines) {
+          if (line.trim() === '[dev-dependencies]') {
+            inDevDependencies = true;
+            continue;
+          } else if (line.trim().startsWith('[') && inDevDependencies) {
+            inDevDependencies = false;
+          }
+          
+          if (inDevDependencies) {
+            // Match lines like package = "version" or package = { version = "version" }
+            const simpleMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_-]+)\s*=\s*'([^']+)'/);
+            const complexMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*\{[^\}]*version\s*=\s*"([^"]+)"[^\}]*\}/);
+            
+            if (simpleMatch) {
+              const name = simpleMatch[1] || simpleMatch[3];
+              const version = simpleMatch[2] || simpleMatch[4] || '*';
+              result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
+            } else if (complexMatch) {
+              result[complexMatch[1].trim()] = complexMatch[2];
+            }
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // Go modules
+    {
+      packageManager: PackageManager.GO,
+      filePattern: '**/go.mod',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        
+        for (const line of lines) {
+          // Match lines like: require github.com/pkg/errors v0.9.1
+          const directMatch = line.match(/^require\s+([^\s]+)\s+([^\s]+)/);
+          
+          // Match lines in a require block: github.com/pkg/errors v0.9.1
+          const blockMatch = line.match(/^\s+([^\s]+)\s+([^\s]+)/);
+          
+          if (directMatch || blockMatch) {
+            const match = directMatch || blockMatch;
+            const name = match[1].trim();
+            let version = match[2].trim();
+            
+            // Remove 'v' prefix if present
+            if (version.startsWith('v')) {
+              version = version.substring(1);
+            }
+            
+            result[name] = version;
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // Ruby Gemfile
+    {
+      packageManager: PackageManager.GEM,
+      filePattern: '**/Gemfile',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) continue;
+          
+          // Match gem specifications: gem 'name', '~> 1.2.3'
+          const match = line.match(/gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?/);
+          if (match) {
+            const name = match[1].trim();
+            let version = match[2] ? match[2].trim() : '*';
+            
+            // Clean up version string
+            version = version.replace(/^[~><]=?\s*/, '');
+            
+            result[name] = version;
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      },
+      devDependenciesParser: (content) => {
+        const result: Record<string, string> = {};
+        const lines = content.split('\n');
+        let inDevelopmentGroup = false;
+        let inTestGroup = false;
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) continue;
+          
+          // Check if we're entering/exiting a development or test group
+          if (line.match(/^group\s+:(?:development|dev)(?:,|\s|$)/)) {
+            inDevelopmentGroup = true;
+          } else if (line.match(/^group\s+:test(?:,|\s|$)/)) {
+            inTestGroup = true;
+          } else if (line.trim() === 'end' && (inDevelopmentGroup || inTestGroup)) {
+            inDevelopmentGroup = false;
+            inTestGroup = false;
+          }
+          
+          // Only process gems in development or test groups
+          if (inDevelopmentGroup || inTestGroup) {
+            const match = line.match(/gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?/);
+            if (match) {
+              const name = match[1].trim();
+              let version = match[2] ? match[2].trim() : '*';
+              
+              // Clean up version string
+              version = version.replace(/^[~><]=?\s*/, '');
+              
+              result[name] = version;
+            }
+          }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // Swift Package Manager
+    {
+      packageManager: PackageManager.SWIFT,
+      filePattern: '**/Package.swift',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        
+        // Match package dependencies: .package(url: "https://github.com/user/package.git", from: "1.0.0")
+        const matches = content.matchAll(/\.package\((?:url|name):\s*"([^"]+)",\s*(?:from|exact|branch|revision|version|range):\s*"([^"]+)"\)/g);
+        
+        for (const match of matches) {
+          // Extract the package name from the URL
+          const url = match[1].trim();
+          const version = match[2].trim();
+          
+          // Get the package name from the URL
+          const urlParts = url.split('/');
+          const packageName = urlParts[urlParts.length - 1].replace('.git', '');
+          
+          result[packageName] = version;
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    },
+    // NuGet packages (C#)
+    {
+      packageManager: PackageManager.NUGET,
+      filePattern: '**/*.csproj',
+      parser: (content) => {
+        const result: Record<string, string> = {};
+        
+        // Match package references: <PackageReference Include="Package.Name" Version="1.2.3" />
+        const matches = content.matchAll(/<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"\s*\/?>/g);
+        
+        for (const match of matches) {
+          const name = match[1].trim();
+          const version = match[2].trim();
+          
+          result[name] = version;
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+      }
+    }
+  ];
+}
+
+/**
+ * Parse a custom manifest file
+ */
+function parseCustomManifest(content: string): Record<string, string> | null {
+  try {
+    // Try parsing as JSON first
+    const json = JSON.parse(content);
+    
+    // Check common locations for dependencies
+    if (json.dependencies) {
+      return json.dependencies;
+    } else if (json.require) {
+      return json.require;
+    }
+  } catch (e) {
+    // Not JSON, try line-by-line parsing for simple key-value formats
+    const result: Record<string, string> = {};
+    const lines = content.split('\n');
+    
+    for (const line of lines) {
+      // Skip comments and empty lines
+      if (line.trim().startsWith('#') || line.trim().startsWith('//') || !line.trim()) continue;
+      
+      // Try matching key-value pairs in various formats
+      const match = line.match(/([\w.-]+)[=:]\s*['"]?([\w.-]+)['"]?/) ||
+                   line.match(/([\w.-]+)\s+([\w.-]+)/);
+      
+      if (match) {
+        result[match[1].trim()] = match[2].trim();
+      }
+    }
+    
+    if (Object.keys(result).length > 0) {
+      return result;
     }
   }
   
-  return highestSeverity as 'critical' | 'high' | 'medium' | 'low' | 'none';
+  return null;
 }
 
-/* ---- Helper Functions for Mock Data ---- */
+/**
+ * Clean up version string by removing version range operators
+ */
+function cleanVersionString(version: string): string {
+  if (!version) return '';
+  
+  // Remove common version range operators
+  return version
+    .replace(/^[\^~>=<]+\s*/, '') // Remove operators at the start
+    .replace(/[*xX]/, '0')        // Replace wildcards with 0
+    .split(/\s+/)[0]               // Take only the first part if there are multiple
+    .split(/[|,]/)[0];             // Take only the first part if there are OR conditions
+}
 
 /**
- * Helper function to increment a version for demo purposes
+ * Increment a version for demonstration purposes
  */
 function incrementVersion(version: string): string {
   try {
@@ -835,10 +1154,25 @@ function incrementVersion(version: string): string {
       }
     }
     
-    // Increment a random part
-    const partToIncrement = Math.floor(Math.random() * parts.length);
-    const partValue = parseInt(parts[partToIncrement], 10) || 0;
-    parts[partToIncrement] = String(partValue + 1 + Math.floor(Math.random() * 3));
+    // Randomly decide which part to increment
+    const random = Math.random();
+    let incrementIndex = 2; // Default to patch increment
+    
+    if (random < 0.1) {
+      // 10% chance of major version increment
+      incrementIndex = 0;
+    } else if (random < 0.3) {
+      // 20% chance of minor version increment
+      incrementIndex = 1;
+    }
+    
+    // Increment the selected part
+    parts[incrementIndex] = String(parseInt(parts[incrementIndex], 10) + 1);
+    
+    // Reset subsequent parts to 0
+    for (let i = incrementIndex + 1; i < parts.length; i++) {
+      parts[i] = '0';
+    }
     
     return parts.join('.');
   } catch (error) {
@@ -847,44 +1181,39 @@ function incrementVersion(version: string): string {
 }
 
 /**
- * Helper function to determine if a dependency is deprecated
+ * Get a random license for mock data
  */
-function isDeprecated(name: string): boolean {
-  // Mock logic to determine if deprecated
-  // In a real implementation, this would query registries
-  const deprecatedPackages = [
-    'request', 'gulp', 'left-pad', 'node-sass', 'coffeescript',
-    'fibers', 'formidable', 'phantomjs', 'jade', 'express-generator',
-    'backbone', 'bower', 'grunt', 'require-uncached', 'istanbul'
+function getRandomLicense(): string {
+  const licenses = [
+    'MIT', 'Apache-2.0', 'BSD-3-Clause', 'GPL-3.0', 'LGPL-2.1',
+    'ISC', 'MPL-2.0', 'AGPL-3.0', 'Unlicense', 'proprietary'
   ];
-  
-  return deprecatedPackages.includes(name.toLowerCase()) || 
-         name.toLowerCase().includes('deprecated') || 
-         Math.random() < 0.05; // 5% chance of being deprecated for demo
+  return licenses[Math.floor(Math.random() * licenses.length)];
 }
 
 /**
- * Helper function to determine if a package has vulnerabilities
+ * Check if a license is permissive
  */
-function isVulnerable(name: string): boolean {
-  // Mock logic to determine if vulnerable
-  // In a real implementation, this would query security databases
-  const vulnerablePackages = [
-    'axios', 'node-fetch', 'lodash', 'log4j', 'jquery',
-    'moment', 'async', 'express', 'react-dom', 'minimist',
-    'underscore', 'handlebars', 'angular', 'bootstrap'
-  ];
-  
-  return vulnerablePackages.includes(name.toLowerCase()) || 
-         name.toLowerCase().includes('vulnerable') || 
-         Math.random() < 0.1; // 10% chance of being vulnerable for demo
+function isPermissiveLicense(license: string): boolean {
+  const permissiveLicenses = ['MIT', 'Apache-2.0', 'BSD-3-Clause', 'ISC', 'Unlicense'];
+  return permissiveLicenses.some(l => license.includes(l));
 }
 
 /**
- * Helper function for getting a random severity
+ * Check if a license is copyleft
+ */
+function isCopyleftLicense(license: string): boolean {
+  const copyleftLicenses = ['GPL', 'LGPL', 'AGPL', 'MPL'];
+  return copyleftLicenses.some(l => license.includes(l));
+}
+
+/**
+ * Get a random security vulnerability severity
  */
 function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
-  const severities: Array<'low' | 'medium' | 'high' | 'critical'> = ['low', 'medium', 'high', 'critical'];
+  const severities: Array<'low' | 'medium' | 'high' | 'critical'> = [
+    'low', 'medium', 'high', 'critical'
+  ];
   const weights = [0.3, 0.4, 0.2, 0.1]; // More medium and low than high and critical
   
   const random = Math.random();
@@ -901,55 +1230,57 @@ function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
 }
 
 /**
- * Helper function for getting a random vulnerability type
+ * Get a random vulnerability type for mock data
  */
 function getRandomVulnerabilityType(): string {
   const types = [
-    'remote code execution',
-    'privilege escalation',
-    'denial of service',
-    'information disclosure',
-    'cross-site scripting',
-    'SQL injection',
-    'memory corruption',
-    'buffer overflow',
     'prototype pollution',
-    'directory traversal',
+    'cross-site scripting',
+    'path traversal',
+    'command injection',
+    'insecure deserialization',
+    'buffer overflow',
+    'SQL injection',
     'regular expression denial of service',
-    'path traversal'
+    'arbitrary code execution',
+    'memory leak',
+    'information disclosure'
   ];
   return types[Math.floor(Math.random() * types.length)];
 }
 
 /**
- * Helper function for getting a random license
+ * Get random alternatives for deprecated packages
  */
-function getRandomLicense(): string {
-  const licenses = [
-    'MIT',
-    'Apache-2.0',
-    'BSD-3-Clause',
-    'BSD-2-Clause',
-    'ISC',
-    'GPL-3.0',
-    'GPL-2.0',
-    'LGPL-3.0',
-    'MPL-2.0',
-    'AGPL-3.0',
-    'Unlicense',
-    'proprietary'
-  ];
+function getRandomAlternatives(name: string, packageManager: string): string[] {
+  // This would be powered by a real database in a production system
+  // Here we just generate some mock alternatives
+  const count = 1 + Math.floor(Math.random() * 3);
+  const result: string[] = [];
   
-  const weights = [0.3, 0.2, 0.1, 0.1, 0.1, 0.05, 0.05, 0.03, 0.03, 0.02, 0.01, 0.01];
-  const random = Math.random();
-  let sum = 0;
-  
-  for (let i = 0; i < weights.length; i++) {
-    sum += weights[i];
-    if (random < sum) {
-      return licenses[i];
+  for (let i = 0; i < count; i++) {
+    // Generate alternatives by adding prefixes/suffixes
+    const prefixes = ['modern-', 'better-', 'secure-', 'new-'];
+    const suffixes = ['-next', '-improved', '-2', '.js'];
+    
+    const usePrefix = Math.random() > 0.5;
+    
+    if (usePrefix) {
+      const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+      result.push(prefix + name);
+    } else {
+      const nameParts = name.split('/');
+      const baseName = nameParts[nameParts.length - 1];
+      const suffix = suffixes[Math.floor(Math.random() * suffixes.length)];
+      
+      if (nameParts.length > 1) {
+        const scope = nameParts.slice(0, -1).join('/');
+        result.push(`${scope}/${baseName}${suffix}`);
+      } else {
+        result.push(baseName + suffix);
+      }
     }
   }
   
-  return 'MIT'; // Default fallback
+  return result;
 }
