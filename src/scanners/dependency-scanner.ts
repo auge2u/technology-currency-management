@@ -2,12 +2,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import { glob } from 'glob';
-import axios from 'axios';
 import * as semver from 'semver';
+import * as child_process from 'child_process';
 import { log } from '../utils/logging';
 import { DependencyIssue } from '../types/scanning';
 
 const readFileAsync = promisify(fs.readFile);
+const execAsync = promisify(child_process.exec);
 
 /**
  * Configuration for dependency scanning
@@ -16,104 +17,161 @@ export interface DependencyScannerConfig {
   // Root directory to scan
   rootDir: string;
   
-  // Package manager manifests to scan for (glob patterns)
-  manifests: string[];
-  
-  // Whether to include dev dependencies
-  includeDev: boolean;
-  
-  // Whether to include peer dependencies
-  includePeer: boolean;
-  
-  // Whether to include optional dependencies
-  includeOptional: boolean;
-  
-  // Packages to ignore (exact names)
-  ignorePackages?: string[];
-  
-  // Version difference threshold to consider outdated (major.minor.patch)
-  outdatedThreshold: {
-    major: number;
-    minor: number;
-    patch: number;
+  // Package manager specific configs
+  npm?: {
+    // Whether to scan npm dependencies
+    enabled: boolean;
+    // Whether to include dev dependencies
+    includeDevDependencies: boolean;
+    // Registry URL (defaults to npm registry)
+    registryUrl?: string;
+    // Auth token for private registries
+    authToken?: string;
+    // Custom npm vulnerabilities database path
+    customVulnDbPath?: string;
   };
   
-  // API timeout in milliseconds
-  apiTimeoutMs: number;
+  python?: {
+    // Whether to scan Python dependencies
+    enabled: boolean;
+    // Custom vulnerability database for Python packages
+    customVulnDbPath?: string;
+  };
   
-  // Directory to store cached data
+  java?: {
+    // Whether to scan Maven/Gradle dependencies
+    enabled: boolean;
+    // Custom vulnerability database for Java packages
+    customVulnDbPath?: string;
+  };
+  
+  nuget?: {
+    // Whether to scan .NET dependencies
+    enabled: boolean;
+    // Custom vulnerability database for .NET packages
+    customVulnDbPath?: string;
+  };
+  
+  // Optional specific packages to focus on or ignore
+  includePackages?: string[];
+  excludePackages?: string[];
+  
+  // Maximum depth for transitive dependency scanning
+  maxTransitiveDepth?: number;
+  
+  // Maximum file size to scan
+  maxFileSizeBytes?: number;
+  
+  // Cache settings
+  cacheResults?: boolean;
+  cacheTtlMinutes?: number;
   cacheDir?: string;
   
-  // Custom vulnerability database file
-  customVulnerabilityDb?: string;
+  // Offline mode (won't fetch latest versions from registries)
+  offlineMode?: boolean;
   
-  // Registry URLs by package manager
-  registryUrls?: {
-    npm?: string;
-    composer?: string;
-    pypi?: string;
-    maven?: string;
-    gradle?: string;
-    cargo?: string;
-    gem?: string;
-    nuget?: string;
-  };
-}
-
-/**
- * Interface for dependency metadata from registries
- */
-interface DependencyMetadata {
-  name: string;
-  latestVersion: string;
-  isDeprecated: boolean;
-  hasSecurityIssues: boolean;
-  license?: string;
-  repo?: string;
-  securityIssues?: Array<{
+  // Whether to use local security advisories only
+  localSecurityCheckOnly?: boolean;
+  
+  // Custom severity overrides for specific packages or versions
+  severityOverrides?: Array<{
+    packageName: string;
+    versionRange?: string;
     severity: 'low' | 'medium' | 'high' | 'critical';
-    description: string;
-    fixedInVersion?: string;
-    cve?: string;
   }>;
-  deprecationReason?: string;
-  alternatives?: string[];
-  downloadCount?: number;
-  lastPublishedAt?: Date;
-  maintainedBy?: string[];
 }
 
 /**
- * Dependency information parsed from a manifest file
+ * Dependency package with vulnerability information
  */
-interface ParsedDependency {
+interface DependencyPackage {
   name: string;
   version: string;
-  type: 'production' | 'development' | 'peer' | 'optional';
-  packageManager: string;
-  manifestFile: string;
+  isDev: boolean;
+  source: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget';
+  filePath: string;
+  latestVersion?: string;
+  vulnerabilities: Array<{
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    cveIds?: string[];
+    fixedInVersion?: string;
+    url?: string;
+  }>;
+  isDirect: boolean;
+  dependencies?: DependencyPackage[];
+  dependencyDepth: number;
 }
 
 /**
- * Map of package manager to file patterns
+ * Utility functions for semver operations with safety fallbacks
  */
-const PACKAGE_MANAGER_PATTERNS: Record<string, string[]> = {
-  npm: ['package.json'],
-  yarn: ['package.json', 'yarn.lock'],
-  pnpm: ['package.json', 'pnpm-lock.yaml'],
-  bun: ['package.json', 'bun.lockb'],
-  composer: ['composer.json'],
-  pip: ['requirements.txt', 'pyproject.toml', 'setup.py'],
-  poetry: ['pyproject.toml'],
-  maven: ['pom.xml'],
-  gradle: ['build.gradle', 'build.gradle.kts'],
-  cargo: ['Cargo.toml'],
-  bundler: ['Gemfile'],
-  nuget: ['*.csproj', '*.fsproj', 'packages.config']
+const versionUtils = {
+  isGreaterThan: (v1: string, v2: string): boolean => {
+    try {
+      const sv1 = semver.coerce(v1);
+      const sv2 = semver.coerce(v2);
+      
+      if (sv1 && sv2) {
+        return semver.gt(sv1, sv2);
+      }
+      
+      // Simple fallback for non-semver strings
+      const parts1 = v1.split('.').map(p => parseInt(p, 10) || 0);
+      const parts2 = v2.split('.').map(p => parseInt(p, 10) || 0);
+      
+      for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+        const p1 = i < parts1.length ? parts1[i] : 0;
+        const p2 = i < parts2.length ? parts2[i] : 0;
+        
+        if (p1 > p2) return true;
+        if (p1 < p2) return false;
+      }
+      
+      return false;
+    } catch {
+      // If all else fails, string comparison
+      return v1 > v2;
+    }
+  },
+  
+  satisfies: (version: string, range: string): boolean => {
+    try {
+      const sv = semver.coerce(version);
+      return sv ? semver.satisfies(sv, range) : false;
+    } catch {
+      // If semver fails, try simple string matching
+      if (range.startsWith('<')) {
+        const targetVersion = range.substring(1);
+        return !versionUtils.isGreaterThan(version, targetVersion) && version !== targetVersion;
+      }
+      if (range.startsWith('<=')) {
+        const targetVersion = range.substring(2);
+        return !versionUtils.isGreaterThan(version, targetVersion);
+      }
+      if (range.startsWith('>')) {
+        const targetVersion = range.substring(1);
+        return versionUtils.isGreaterThan(version, targetVersion);
+      }
+      if (range.startsWith('>=')) {
+        const targetVersion = range.substring(2);
+        return versionUtils.isGreaterThan(version, targetVersion) || version === targetVersion;
+      }
+      if (range.includes(' - ')) {
+        const [min, max] = range.split(' - ');
+        const gtMin = versionUtils.isGreaterThan(version, min) || version === min;
+        const ltMax = !versionUtils.isGreaterThan(version, max);
+        return gtMin && ltMax;
+      }
+      
+      // Exact match
+      return version === range;
+    }
+  }
 };
 
 /**
- * Scanner for detecting outdated or vulnerable dependencies
+ * Scanner for detecting outdated and vulnerable dependencies
  */
 export async function scanDependencies(
   config: DependencyScannerConfig
@@ -122,95 +180,57 @@ export async function scanDependencies(
     log.info('Starting dependency scanner');
     const issues: DependencyIssue[] = [];
     
-    // Find manifest files to scan
-    const manifestFiles = await findManifestFiles(config);
-    log.info(`Found ${manifestFiles.length} manifest files to scan`);
+    // Detect package manifests
+    const packageManifests = await detectPackageManifests(config);
+    log.info(`Found ${packageManifests.length} package manifests`);
     
-    // Process each manifest file
-    for (const manifestFile of manifestFiles) {
+    // Parse all dependencies
+    const allDependencies: DependencyPackage[] = [];
+    
+    for (const manifest of packageManifests) {
       try {
-        // Read the manifest file
-        const content = await readFileAsync(manifestFile, 'utf8');
-        
-        // Determine package manager from file name
-        const packageManager = determinePackageManager(manifestFile);
-        
-        if (!packageManager) {
-          log.warn(`Could not determine package manager for ${manifestFile}, skipping`);
-          continue;
-        }
-        
-        // Parse dependencies from the manifest
-        const dependencies = await parseDependencies(
-          manifestFile,
-          content,
-          packageManager,
-          config
-        );
-        
-        log.info(`Found ${dependencies.length} dependencies in ${manifestFile}`);
-        
-        // Check each dependency
-        for (const dep of dependencies) {
-          // Skip ignored packages
-          if (config.ignorePackages?.includes(dep.name)) {
-            log.info(`Skipping ignored package: ${dep.name}`);
-            continue;
-          }
-          
-          try {
-            // Get metadata from registry
-            const metadata = await getDependencyMetadata(
-              dep.name,
-              dep.version,
-              dep.packageManager,
-              config
-            );
-            
-            // Check if dependency has issues
-            const isOutdated = isOutdatedVersion(
-              dep.version,
-              metadata.latestVersion,
-              config.outdatedThreshold
-            );
-            
-            if (isOutdated || metadata.isDeprecated || metadata.hasSecurityIssues) {
-              // Create dependency issue
-              const issue: DependencyIssue = {
-                detectedAt: new Date(),
-                name: dep.name,
-                currentVersion: dep.version,
-                latestVersion: metadata.latestVersion,
-                packageManager: dep.packageManager,
-                type: dep.type,
-                manifestFile: dep.manifestFile,
-                isOutdated,
-                isDeprecated: metadata.isDeprecated,
-                hasSecurityIssues: metadata.hasSecurityIssues,
-                license: metadata.license,
-                repo: metadata.repo,
-                tags: generateTags(dep, metadata, isOutdated),
-                recommendation: generateRecommendation(dep, metadata, isOutdated)
-              };
-              
-              // Add security issues if any
-              if (metadata.securityIssues?.length) {
-                issue.securityIssues = metadata.securityIssues;
-              }
-              
-              // Add business impact and update effort scores
-              issue.businessImpact = calculateBusinessImpact(dep, metadata);
-              issue.updateEffort = calculateUpdateEffort(dep, metadata);
-              
-              issues.push(issue);
-              log.info(`Added issue for dependency ${dep.name} ${dep.version}`);
-            }
-          } catch (depError) {
-            log.warn(`Error checking dependency ${dep.name}`, { error: depError });
-          }
-        }
+        const deps = await parseDependencies(manifest, config);
+        allDependencies.push(...deps);
+        log.info(`Parsed ${deps.length} dependencies from ${manifest.filePath}`);
       } catch (manifestError) {
-        log.warn(`Error processing manifest file: ${manifestFile}`, { error: manifestError });
+        log.error(`Error parsing manifest ${manifest.filePath}`, { error: manifestError });
+      }
+    }
+    
+    log.info(`Found a total of ${allDependencies.length} dependencies`);
+    
+    // Check for latest versions and vulnerabilities
+    const enrichedDependencies = await enrichDependencyInfo(allDependencies, config);
+    
+    // Convert to issues
+    for (const dep of enrichedDependencies) {
+      const isOutdated = dep.latestVersion && 
+                          versionUtils.isGreaterThan(dep.latestVersion, dep.version);
+      
+      if (isOutdated || dep.vulnerabilities.length > 0) {
+        // Calculate risk level
+        const riskLevel = calculateRiskLevel(dep);
+        
+        // Create issue
+        const issue: DependencyIssue = {
+          detectedAt: new Date(),
+          packageName: dep.name,
+          currentVersion: dep.version,
+          latestVersion: dep.latestVersion,
+          packageManager: dep.source,
+          isDirect: dep.isDirect,
+          isOutdated: !!isOutdated,
+          isVulnerable: dep.vulnerabilities.length > 0,
+          vulnerabilities: dep.vulnerabilities,
+          riskLevel,
+          tags: generateTags(dep),
+          recommendation: generateRecommendation(dep),
+          dependentFiles: [dep.filePath],
+          updateImpact: assessUpdateImpact(dep, isOutdated)
+        };
+        
+        issues.push(issue);
+        log.info(`Added issue for dependency ${dep.name}@${dep.version}`);
       }
     }
     
@@ -223,910 +243,1143 @@ export async function scanDependencies(
 }
 
 /**
- * Find manifest files to scan based on configuration
+ * Interface representing a detected package manifest
  */
-async function findManifestFiles(
+interface PackageManifest {
+  type: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget';
+  filePath: string;
+}
+
+/**
+ * Detect package manifests in the specified directory
+ */
+async function detectPackageManifests(
   config: DependencyScannerConfig
-): Promise<string[]> {
-  try {
-    const allFiles: string[] = [];
-    
-    for (const pattern of config.manifests) {
-      const matchedFiles = await glob(
-        pattern, 
-        { 
-          cwd: config.rootDir,
-          absolute: true
-        }
-      );
+): Promise<PackageManifest[]> {
+  const manifests: PackageManifest[] = [];
+  const patterns = [];
+  
+  // Configure patterns based on enabled package managers
+  if (config.npm?.enabled !== false) {
+    patterns.push('**/package.json');
+  }
+  
+  if (config.python?.enabled) {
+    patterns.push('**/requirements.txt', '**/pyproject.toml', '**/setup.py', '**/Pipfile');
+  }
+  
+  if (config.java?.enabled) {
+    patterns.push('**/pom.xml', '**/build.gradle', '**/build.gradle.kts');
+  }
+  
+  if (config.nuget?.enabled) {
+    patterns.push('**/*.csproj', '**/packages.config');
+  }
+  
+  // Find all matching files
+  for (const pattern of patterns) {
+    try {
+      const files = await glob(pattern, {
+        cwd: config.rootDir,
+        absolute: true,
+        ignore: ['**/node_modules/**', '**/.git/**', '**/venv/**']
+      });
       
-      allFiles.push(...matchedFiles);
+      for (const file of files) {
+        try {
+          // Check file size if max size is specified
+          if (config.maxFileSizeBytes) {
+            const stats = await fs.promises.stat(file);
+            if (stats.size > config.maxFileSizeBytes) {
+              log.info(`Skipping file exceeding size limit: ${file} (${stats.size} bytes)`);
+              continue;
+            }
+          }
+          
+          // Determine manifest type
+          let type: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget';
+          
+          if (file.endsWith('package.json')) {
+            type = 'npm';
+          } else if (file.endsWith('requirements.txt') || file.endsWith('setup.py') ||
+                     file.endsWith('pyproject.toml') || file.endsWith('Pipfile')) {
+            type = 'pip';
+          } else if (file.endsWith('pom.xml')) {
+            type = 'maven';
+          } else if (file.endsWith('build.gradle') || file.endsWith('build.gradle.kts')) {
+            type = 'gradle';
+          } else if (file.endsWith('.csproj') || file.endsWith('packages.config')) {
+            type = 'nuget';
+          } else {
+            continue; // Unrecognized file type
+          }
+          
+          manifests.push({
+            type,
+            filePath: file
+          });
+          
+          log.info(`Found ${type} manifest at ${file}`);
+        } catch (fileError) {
+          log.warn(`Error processing file ${file}`, { error: fileError });
+        }
+      }
+    } catch (globError) {
+      log.warn(`Error searching for pattern ${pattern}`, { error: globError });
     }
+  }
+  
+  return manifests;
+}
+
+/**
+ * Parse dependencies from a package manifest
+ */
+async function parseDependencies(
+  manifest: PackageManifest,
+  config: DependencyScannerConfig
+): Promise<DependencyPackage[]> {
+  const dependencies: DependencyPackage[] = [];
+  
+  try {
+    const content = await readFileAsync(manifest.filePath, 'utf8');
     
-    return [...new Set(allFiles)]; // Remove duplicates
+    switch (manifest.type) {
+      case 'npm':
+        return parseNpmDependencies(content, manifest.filePath, config);
+      case 'pip':
+        return parsePipDependencies(content, manifest.filePath, config);
+      case 'maven':
+        return parseMavenDependencies(content, manifest.filePath, config);
+      case 'gradle':
+        return parseGradleDependencies(content, manifest.filePath, config);
+      case 'nuget':
+        return parseNugetDependencies(content, manifest.filePath, config);
+      default:
+        return [];
+    }
   } catch (error) {
-    log.error('Error finding manifest files', { error });
+    log.error(`Error parsing dependencies from ${manifest.filePath}`, { error });
     return [];
   }
 }
 
 /**
- * Determine package manager from manifest file name
+ * Parse NPM dependencies from package.json
  */
-function determinePackageManager(manifestFile: string): string | null {
-  const fileName = path.basename(manifestFile).toLowerCase();
-  
-  for (const [manager, patterns] of Object.entries(PACKAGE_MANAGER_PATTERNS)) {
-    if (patterns.some(pattern => {
-      if (pattern.includes('*')) {
-        return new RegExp('^' + pattern.replace(/\*/g, '.*') + '$').test(fileName);
-      }
-      return fileName === pattern.toLowerCase();
-    })) {
-      return manager;
-    }
-  }
-  
-  return null;
-}
-
-/**
- * Parse dependencies from a manifest file
- */
-async function parseDependencies(
-  manifestFile: string,
+async function parseNpmDependencies(
   content: string,
-  packageManager: string,
+  filePath: string,
   config: DependencyScannerConfig
-): Promise<ParsedDependency[]> {
-  const fileName = path.basename(manifestFile).toLowerCase();
-  const dependencies: ParsedDependency[] = [];
+): Promise<DependencyPackage[]> {
+  const dependencies: DependencyPackage[] = [];
   
   try {
-    // Handle different manifest formats
-    if (fileName === 'package.json') {
-      // Parse npm/yarn/pnpm package.json
-      const packageJson = JSON.parse(content);
-      
-      // Production dependencies
-      if (packageJson.dependencies) {
-        for (const [name, version] of Object.entries(packageJson.dependencies)) {
-          dependencies.push({
-            name,
-            version: version.toString().replace(/[^0-9.]/g, ''),
-            type: 'production',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-      
-      // Development dependencies
-      if (config.includeDev && packageJson.devDependencies) {
-        for (const [name, version] of Object.entries(packageJson.devDependencies)) {
-          dependencies.push({
-            name,
-            version: version.toString().replace(/[^0-9.]/g, ''),
-            type: 'development',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-      
-      // Peer dependencies
-      if (config.includePeer && packageJson.peerDependencies) {
-        for (const [name, version] of Object.entries(packageJson.peerDependencies)) {
-          dependencies.push({
-            name,
-            version: version.toString().replace(/[^0-9.]/g, ''),
-            type: 'peer',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-      
-      // Optional dependencies
-      if (config.includeOptional && packageJson.optionalDependencies) {
-        for (const [name, version] of Object.entries(packageJson.optionalDependencies)) {
-          dependencies.push({
-            name,
-            version: version.toString().replace(/[^0-9.]/g, ''),
-            type: 'optional',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-    } else if (fileName === 'composer.json') {
-      // Parse PHP composer.json
-      const composerJson = JSON.parse(content);
-      
-      // Production dependencies
-      if (composerJson.require) {
-        for (const [name, version] of Object.entries(composerJson.require)) {
-          if (name !== 'php') { // Skip PHP itself
-            dependencies.push({
-              name,
-              version: version.toString().replace(/[^0-9.]/g, ''),
-              type: 'production',
-              packageManager,
-              manifestFile
-            });
-          }
-        }
-      }
-      
-      // Development dependencies
-      if (config.includeDev && composerJson['require-dev']) {
-        for (const [name, version] of Object.entries(composerJson['require-dev'])) {
-          dependencies.push({
-            name,
-            version: version.toString().replace(/[^0-9.]/g, ''),
-            type: 'development',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-    } else if (fileName === 'requirements.txt') {
-      // Parse Python requirements.txt
-      const lines = content.split('\n').map(line => line.trim())
-        .filter(line => line && !line.startsWith('#'));
-      
-      for (const line of lines) {
-        // Basic format: package==version or package>=version
-        const match = line.match(/^([a-zA-Z0-9_.-]+)\s*([=><~!]+)\s*([0-9a-zA-Z.-]+)/);
-        if (match) {
-          const [_, name, operator, version] = match;
-          dependencies.push({
-            name,
-            version,
-            type: 'production',
-            packageManager,
-            manifestFile
-          });
-        } else if (!line.includes('=')) {
-          // Handle package with no version specified
-          dependencies.push({
-            name: line,
-            version: 'latest',
-            type: 'production',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-    } else if (fileName === 'pyproject.toml') {
-      // Very basic TOML parsing for Python projects
-      const lines = content.split('\n');
-      let currentSection = '';
-      
-      for (const line of lines) {
-        // Section headers are in [brackets]
-        const sectionMatch = line.match(/^\[([^\]]+)\]/);
-        if (sectionMatch) {
-          currentSection = sectionMatch[1];
+    const packageJson = JSON.parse(content);
+    
+    // Parse regular dependencies
+    if (packageJson.dependencies) {
+      for (const [name, versionRange] of Object.entries(packageJson.dependencies)) {
+        // Skip if package should be excluded
+        if (config.excludePackages?.includes(name)) {
           continue;
         }
         
-        // Look for dependencies in various sections
-        const isDevSection = currentSection.includes('dev-dependencies') ||
-                             currentSection.includes('development-dependencies');
-        
-        if (['project', 'tool.poetry.dependencies', 'dependencies', 'build-system.requires'].some(s => currentSection.includes(s))) {
-          const depMatch = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*["']?([0-9a-zA-Z.-]+)["']?/);
-          if (depMatch) {
-            const [_, name, version] = depMatch;
-            dependencies.push({
-              name,
-              version,
-              type: isDevSection && config.includeDev ? 'development' : 'production',
-              packageManager,
-              manifestFile
-            });
-          }
-        }
-      }
-    } else if (fileName === 'cargo.toml') {
-      // Very basic TOML parsing for Rust projects
-      const lines = content.split('\n');
-      let currentSection = '';
-      
-      for (const line of lines) {
-        // Section headers
-        const sectionMatch = line.match(/^\[([^\]]+)\]/);
-        if (sectionMatch) {
-          currentSection = sectionMatch[1];
+        // Include only specific packages if configured
+        if (config.includePackages && !config.includePackages.includes(name)) {
           continue;
         }
         
-        const isDevSection = currentSection === 'dev-dependencies';
-        if (currentSection === 'dependencies' || isDevSection) {
-          // Simple key = "version"
-          const simpleDepMatch = line.match(/^([a-zA-Z0-9_-]+)\s*=\s*["']([^"']+)["']/);
-          if (simpleDepMatch) {
-            dependencies.push({
-              name: simpleDepMatch[1],
-              version: simpleDepMatch[2],
-              type: isDevSection && config.includeDev ? 'development' : 'production',
-              packageManager,
-              manifestFile
-            });
-          }
-          
-          // Table format with version
-          const tableDepMatch = line.match(/^([a-zA-Z0-9_-]+)\s*\.version\s*=\s*["']([^"']+)["']/);
-          if (tableDepMatch) {
-            dependencies.push({
-              name: tableDepMatch[1],
-              version: tableDepMatch[2],
-              type: isDevSection && config.includeDev ? 'development' : 'production',
-              packageManager,
-              manifestFile
-            });
-          }
-        }
-      }
-    } else if (fileName === 'gemfile') {
-      // Parse Ruby Gemfile
-      const lines = content.split('\n').map(line => line.trim())
-        .filter(line => line && !line.startsWith('#'));
-      
-      for (const line of lines) {
-        // Match gem 'name', '~> version'
-        const gemMatch = line.match(/gem\s+['"]([^'"]*)['"](,\s*['"]([^'"]*)['"])?/);
-        if (gemMatch) {
-          const name = gemMatch[1];
-          const version = gemMatch[3] ? gemMatch[3].replace(/[^0-9.]/g, '') : 'latest';
-          
-          dependencies.push({
-            name,
-            version,
-            type: 'production',
-            packageManager,
-            manifestFile
-          });
-        }
-      }
-    } else if (fileName.endsWith('.csproj') || fileName.endsWith('.fsproj')) {
-      // Very simplistic handling of .NET project files
-      // For a real scanner, you'd use an XML parser
-      const packageRefRegex = /<PackageReference\s+Include=["']([^"']+)["']\s+Version=["']([^"']+)["']\s*\/>/g;
-      let match;
-      
-      while ((match = packageRefRegex.exec(content)) !== null) {
+        // Extract version from semver range
+        const version = extractVersionFromRange(versionRange as string);
+        
         dependencies.push({
-          name: match[1],
-          version: match[2],
-          type: 'production',
-          packageManager,
-          manifestFile
+          name,
+          version,
+          isDev: false,
+          source: 'npm',
+          filePath,
+          vulnerabilities: [],
+          isDirect: true,
+          dependencyDepth: 0
+        });
+      }
+    }
+    
+    // Parse dev dependencies if configured
+    if (config.npm?.includeDevDependencies && packageJson.devDependencies) {
+      for (const [name, versionRange] of Object.entries(packageJson.devDependencies)) {
+        // Skip if package should be excluded
+        if (config.excludePackages?.includes(name)) {
+          continue;
+        }
+        
+        // Include only specific packages if configured
+        if (config.includePackages && !config.includePackages.includes(name)) {
+          continue;
+        }
+        
+        // Extract version from semver range
+        const version = extractVersionFromRange(versionRange as string);
+        
+        dependencies.push({
+          name,
+          version,
+          isDev: true,
+          source: 'npm',
+          filePath,
+          vulnerabilities: [],
+          isDirect: true,
+          dependencyDepth: 0
         });
       }
     }
     
     return dependencies;
   } catch (error) {
-    log.warn(`Error parsing dependencies from ${manifestFile}`, { error });
+    log.error(`Error parsing NPM dependencies from ${filePath}`, { error });
     return [];
   }
 }
 
 /**
- * Get dependency metadata from appropriate registry
+ * Extract a specific version from a semver range
  */
-async function getDependencyMetadata(
-  name: string,
-  version: string,
-  packageManager: string,
-  config: DependencyScannerConfig
-): Promise<DependencyMetadata> {
-  // Check cache first
-  if (config.cacheDir) {
-    const cacheFile = path.join(
-      config.cacheDir, 
-      `${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`
-    );
-    
-    if (fs.existsSync(cacheFile)) {
-      try {
-        const cacheContent = await readFileAsync(cacheFile, 'utf8');
-        const cachedInfo = JSON.parse(cacheContent) as DependencyMetadata;
-        log.info(`Loaded ${name} dependency info from cache`);
-        return cachedInfo;
-      } catch (cacheError) {
-        log.warn(`Error reading dependency cache for ${name}`, { error: cacheError });
-      }
-    }
+function extractVersionFromRange(range: string): string {
+  // Handle npm version ranges like ^1.2.3, ~1.2.3, etc.
+  if (typeof range !== 'string') {
+    return 'unknown';
   }
   
-  // In a real implementation, we would query package registries
-  // For this example, we'll use mock data to simulate API responses
+  // Remove any leading comparison operators
+  const cleanRange = range.replace(/^[\^~>=<]+/, '');
+  
+  // Handle version ranges like 1.2.3 - 2.3.4
+  if (cleanRange.includes(' - ')) {
+    return cleanRange.split(' - ')[0].trim();
+  }
+  
+  // Handle || expressions by taking the first part
+  if (cleanRange.includes('||')) {
+    return cleanRange.split('||')[0].trim();
+  }
+  
+  // Handle git URLs, etc.
+  if (cleanRange.includes('#')) {
+    const parts = cleanRange.split('#');
+    return parts[parts.length - 1];
+  }
+  
+  // If we get this far, assume this is a simple version
+  return cleanRange;
+}
+
+/**
+ * Parse Python dependencies from various files
+ */
+async function parsePipDependencies(
+  content: string,
+  filePath: string,
+  config: DependencyScannerConfig
+): Promise<DependencyPackage[]> {
+  const dependencies: DependencyPackage[] = [];
+  
   try {
-    log.info(`Querying info for dependency: ${name} ${version} (${packageManager})`);
-    
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 100));
-    
-    // Construct metadata based on the package manager and name
-    // This is mock data for demonstration purposes
-    const metadata: DependencyMetadata = {
-      name,
-      latestVersion: incrementVersion(version),
-      isDeprecated: Math.random() < 0.1, // 10% chance of being deprecated
-      hasSecurityIssues: Math.random() < 0.15, // 15% chance of having security issues
-      license: getRandomLicense(),
-      repo: `https://github.com/org/${name.toLowerCase()}`,
-      lastPublishedAt: new Date(Date.now() - Math.random() * 180 * 24 * 60 * 60 * 1000), // Up to 180 days ago
-      downloadCount: Math.floor(Math.random() * 10000000), // Random download count
-      maintainedBy: ['developer1', 'developer2']
-    };
-    
-    // Set deprecation reason if deprecated
-    if (metadata.isDeprecated) {
-      metadata.deprecationReason = getRandomDeprecationReason();
-      metadata.alternatives = getRandomAlternatives(name, packageManager);
+    // Simple parsing for requirements.txt
+    if (filePath.endsWith('requirements.txt')) {
+      const lines = content.split('\n');
+      
+      for (const line of lines) {
+        // Skip comments and empty lines
+        if (line.trim().startsWith('#') || !line.trim()) {
+          continue;
+        }
+        
+        // Handle common formats: package==1.2.3, package>=1.2.3, etc.
+        const matches = line.match(/^([a-zA-Z0-9_\-\.]+)(?:[=<>~!]{1,2})([\d\.]+)/);
+        if (matches && matches.length >= 3) {
+          const name = matches[1];
+          const version = matches[2];
+          
+          // Skip if package should be excluded
+          if (config.excludePackages?.includes(name)) {
+            continue;
+          }
+          
+          // Include only specific packages if configured
+          if (config.includePackages && !config.includePackages.includes(name)) {
+            continue;
+          }
+          
+          dependencies.push({
+            name,
+            version,
+            isDev: false, // Assuming all requirements.txt dependencies are prod
+            source: 'pip',
+            filePath,
+            vulnerabilities: [],
+            isDirect: true,
+            dependencyDepth: 0
+          });
+        }
+      }
     }
     
-    // Add security issues if flagged
-    if (metadata.hasSecurityIssues) {
-      metadata.securityIssues = [
-        {
-          severity: getRandomSeverity(),
-          description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
-          fixedInVersion: metadata.latestVersion,
-          cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
-        }
-      ];
+    // For other Python files (setup.py, etc.), we'd need more complex parsing...
+    // This is a simplified implementation
+    
+    return dependencies;
+  } catch (error) {
+    log.error(`Error parsing Python dependencies from ${filePath}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Parse Maven dependencies from pom.xml
+ */
+async function parseMavenDependencies(
+  content: string,
+  filePath: string,
+  config: DependencyScannerConfig
+): Promise<DependencyPackage[]> {
+  const dependencies: DependencyPackage[] = [];
+  
+  try {
+    // Basic regex-based parsing for Maven dependencies
+    // In a real implementation, use a proper XML parser
+    const dependencyRegex = /<dependency>[\s\S]*?<groupId>([^<]+)<\/groupId>[\s\S]*?<artifactId>([^<]+)<\/artifactId>[\s\S]*?<version>([^<]+)<\/version>[\s\S]*?<\/dependency>/g;
+    let match;
+    
+    while ((match = dependencyRegex.exec(content)) !== null) {
+      const groupId = match[1].trim();
+      const artifactId = match[2].trim();
+      const version = match[3].trim();
+      const name = `${groupId}:${artifactId}`;
       
-      // Sometimes add a second vulnerability
-      if (Math.random() < 0.3) {
-        metadata.securityIssues.push({
-          severity: getRandomSeverity(),
-          description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
-          fixedInVersion: metadata.latestVersion,
-          cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
+      // Skip if package should be excluded
+      if (config.excludePackages?.includes(name)) {
+        continue;
+      }
+      
+      // Include only specific packages if configured
+      if (config.includePackages && !config.includePackages.includes(name)) {
+        continue;
+      }
+      
+      // Check for scope to determine if it's a dev dependency
+      const scopeMatch = /<scope>([^<]+)<\/scope>/g.exec(match[0]);
+      const scope = scopeMatch ? scopeMatch[1].trim() : 'compile';
+      const isDev = scope === 'test' || scope === 'provided';
+      
+      dependencies.push({
+        name,
+        version,
+        isDev,
+        source: 'maven',
+        filePath,
+        vulnerabilities: [],
+        isDirect: true,
+        dependencyDepth: 0
+      });
+    }
+    
+    return dependencies;
+  } catch (error) {
+    log.error(`Error parsing Maven dependencies from ${filePath}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Parse Gradle dependencies from build.gradle
+ */
+async function parseGradleDependencies(
+  content: string,
+  filePath: string,
+  config: DependencyScannerConfig
+): Promise<DependencyPackage[]> {
+  const dependencies: DependencyPackage[] = [];
+  
+  try {
+    // Basic regex-based parsing for Gradle dependencies
+    // This is simplified and won't handle all Gradle build files correctly
+    const dependencyRegex = /(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testCompileOnly)\s*['"]([^:]+):([^:]+):([^'"]+)['"]|(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testCompileOnly)\s*group:\s*['"]([^'"]+)['"],\s*name:\s*['"]([^'"]+)['"],\s*version:\s*['"]([^'"]+)['"]|(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testCompileOnly)\s*\(['"]([^:]+):([^:]+):([^'"]+)['"]\)/g;
+    let match;
+    
+    while ((match = dependencyRegex.exec(content)) !== null) {
+      let groupId, artifactId, version;
+      
+      if (match[1] && match[2] && match[3]) {
+        groupId = match[1];
+        artifactId = match[2];
+        version = match[3];
+      } else if (match[4] && match[5] && match[6]) {
+        groupId = match[4];
+        artifactId = match[5];
+        version = match[6];
+      } else if (match[7] && match[8] && match[9]) {
+        groupId = match[7];
+        artifactId = match[8];
+        version = match[9];
+      } else {
+        continue;
+      }
+      
+      const name = `${groupId}:${artifactId}`;
+      
+      // Skip if package should be excluded
+      if (config.excludePackages?.includes(name)) {
+        continue;
+      }
+      
+      // Include only specific packages if configured
+      if (config.includePackages && !config.includePackages.includes(name)) {
+        continue;
+      }
+      
+      // Check configuration to determine if it's a dev dependency
+      const isDev = match[0].includes('test') || match[0].includes('compileOnly');
+      
+      dependencies.push({
+        name,
+        version,
+        isDev,
+        source: 'gradle',
+        filePath,
+        vulnerabilities: [],
+        isDirect: true,
+        dependencyDepth: 0
+      });
+    }
+    
+    return dependencies;
+  } catch (error) {
+    log.error(`Error parsing Gradle dependencies from ${filePath}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Parse .NET dependencies from project files
+ */
+async function parseNugetDependencies(
+  content: string,
+  filePath: string,
+  config: DependencyScannerConfig
+): Promise<DependencyPackage[]> {
+  const dependencies: DependencyPackage[] = [];
+  
+  try {
+    if (filePath.endsWith('.csproj')) {
+      // Parse modern .NET project format
+      const packageRefRegex = /<PackageReference\s+Include=['"]([^'"]+)['"]\s+Version=['"]([^'"]+)['"]|<PackageReference\s+Include=['"]([^'"]+)['"]>[\s\S]*?<Version>([^<]+)<\/Version>/g;
+      let match;
+      
+      while ((match = packageRefRegex.exec(content)) !== null) {
+        const name = match[1] || match[3];
+        const version = match[2] || match[4];
+        
+        // Skip if package should be excluded
+        if (config.excludePackages?.includes(name)) {
+          continue;
+        }
+        
+        // Include only specific packages if configured
+        if (config.includePackages && !config.includePackages.includes(name)) {
+          continue;
+        }
+        
+        dependencies.push({
+          name,
+          version,
+          isDev: false, // Can't easily determine this from .csproj files
+          source: 'nuget',
+          filePath,
+          vulnerabilities: [],
+          isDirect: true,
+          dependencyDepth: 0
+        });
+      }
+    } else if (filePath.endsWith('packages.config')) {
+      // Parse legacy packages.config format
+      const packageRegex = /<package\s+id=['"]([^'"]+)['"]\s+version=['"]([^'"]+)['"]|<package\s+version=['"]([^'"]+)['"]\s+id=['"]([^'"]+)['"][^>]*>/g;
+      let match;
+      
+      while ((match = packageRegex.exec(content)) !== null) {
+        const name = match[1] || match[4];
+        const version = match[2] || match[3];
+        
+        // Skip if package should be excluded
+        if (config.excludePackages?.includes(name)) {
+          continue;
+        }
+        
+        // Include only specific packages if configured
+        if (config.includePackages && !config.includePackages.includes(name)) {
+          continue;
+        }
+        
+        dependencies.push({
+          name,
+          version,
+          isDev: false, // Can't determine this from packages.config
+          source: 'nuget',
+          filePath,
+          vulnerabilities: [],
+          isDirect: true,
+          dependencyDepth: 0
         });
       }
     }
     
-    // Customize based on some known package names for more realistic examples
-    customizeMockMetadata(metadata, name, version, packageManager);
+    return dependencies;
+  } catch (error) {
+    log.error(`Error parsing NuGet dependencies from ${filePath}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Enrich dependency information with latest versions and vulnerabilities
+ */
+async function enrichDependencyInfo(
+  dependencies: DependencyPackage[],
+  config: DependencyScannerConfig
+): Promise<DependencyPackage[]> {
+  const enrichedDeps = [...dependencies];
+  
+  // Process each dependency
+  for (const dep of enrichedDeps) {
+    try {
+      // Skip offline mode checks for latest versions
+      if (!config.offlineMode) {
+        await fetchLatestVersion(dep, config);
+      }
+      
+      // Check for vulnerabilities
+      await checkVulnerabilities(dep, config);
+      
+      log.info(`Enriched dependency info for ${dep.name}@${dep.version}`);
+    } catch (error) {
+      log.warn(`Error enriching dependency info for ${dep.name}@${dep.version}`, { error });
+    }
+  }
+  
+  return enrichedDeps;
+}
+
+/**
+ * Fetch the latest version for a dependency
+ */
+async function fetchLatestVersion(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    switch (dependency.source) {
+      case 'npm':
+        await fetchNpmLatestVersion(dependency, config);
+        break;
+      case 'pip':
+        await fetchPipLatestVersion(dependency, config);
+        break;
+      case 'maven':
+      case 'gradle':
+        await fetchMavenLatestVersion(dependency, config);
+        break;
+      case 'nuget':
+        await fetchNugetLatestVersion(dependency, config);
+        break;
+    }
+  } catch (error) {
+    log.warn(`Error fetching latest version for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Fetch the latest version for an NPM package
+ */
+async function fetchNpmLatestVersion(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For a real implementation, use npm registry API
+    // This is a simplified example using npm view command
+    const registryUrl = config.npm?.registryUrl || 'https://registry.npmjs.org';
+    const npmCommand = `npm view ${dependency.name} version --registry=${registryUrl} --json`;
     
-    // Save to cache if cacheDir is provided
-    if (config.cacheDir) {
-      try {
-        if (!fs.existsSync(config.cacheDir)) {
-          fs.mkdirSync(config.cacheDir, { recursive: true });
+    const { stdout } = await execAsync(npmCommand);
+    const latestVersion = JSON.parse(stdout.trim());
+    
+    dependency.latestVersion = latestVersion;
+    log.info(`Fetched latest version for ${dependency.name}: ${latestVersion}`);
+  } catch (error) {
+    log.warn(`Error fetching latest NPM version for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Fetch the latest version for a Python package
+ */
+async function fetchPipLatestVersion(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For a real implementation, use PyPI API
+    // This is a simplified example using pip index command
+    const pipCommand = `pip index versions ${dependency.name} --no-python-version-warning`;
+    
+    const { stdout } = await execAsync(pipCommand);
+    const versionMatch = stdout.match(/Available versions:\s+([\d\.]+)/);
+    
+    if (versionMatch && versionMatch[1]) {
+      dependency.latestVersion = versionMatch[1];
+      log.info(`Fetched latest version for ${dependency.name}: ${dependency.latestVersion}`);
+    }
+  } catch (error) {
+    log.warn(`Error fetching latest Python version for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Fetch the latest version for a Maven/Gradle package
+ */
+async function fetchMavenLatestVersion(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // In a real implementation, use Maven Central API
+    // For now, we'll set a mock version
+    const [groupId, artifactId] = dependency.name.split(':');
+    
+    if (!groupId || !artifactId) {
+      log.warn(`Invalid Maven dependency format: ${dependency.name}`);
+      return;
+    }
+    
+    // Mock implementation - would query Maven Central in a real implementation
+    const version = dependency.version;
+    const parts = version.split('.');
+    if (parts.length >= 3) {
+      const major = parseInt(parts[0], 10);
+      const minor = parseInt(parts[1], 10);
+      const patch = parseInt(parts[2], 10);
+      
+      // Simulate latest version by incrementing patch
+      dependency.latestVersion = `${major}.${minor}.${patch + 1}`;
+      log.info(`Mock latest version for ${dependency.name}: ${dependency.latestVersion}`);
+    }
+  } catch (error) {
+    log.warn(`Error fetching latest Maven version for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Fetch the latest version for a NuGet package
+ */
+async function fetchNugetLatestVersion(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // In a real implementation, use NuGet API
+    // For now, we'll set a mock version
+    
+    // Mock implementation - would query NuGet API in a real implementation
+    const version = dependency.version;
+    const parts = version.split('.');
+    if (parts.length >= 3) {
+      const major = parseInt(parts[0], 10);
+      const minor = parseInt(parts[1], 10);
+      const patch = parseInt(parts[2], 10);
+      
+      // Simulate latest version by incrementing patch
+      dependency.latestVersion = `${major}.${minor}.${patch + 1}`;
+      log.info(`Mock latest version for ${dependency.name}: ${dependency.latestVersion}`);
+    }
+  } catch (error) {
+    log.warn(`Error fetching latest NuGet version for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Check for vulnerabilities in a dependency
+ */
+async function checkVulnerabilities(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    switch (dependency.source) {
+      case 'npm':
+        await checkNpmVulnerabilities(dependency, config);
+        break;
+      case 'pip':
+        await checkPipVulnerabilities(dependency, config);
+        break;
+      case 'maven':
+      case 'gradle':
+        await checkMavenVulnerabilities(dependency, config);
+        break;
+      case 'nuget':
+        await checkNugetVulnerabilities(dependency, config);
+        break;
+    }
+    
+    // Apply custom severity overrides if configured
+    applyCustomSeverityOverrides(dependency, config);
+  } catch (error) {
+    log.warn(`Error checking vulnerabilities for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Check for vulnerabilities in an NPM package
+ */
+async function checkNpmVulnerabilities(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For a real implementation, use npm audit or an advisory database API
+    // Here we're using a simplified approach with mock data
+    if (config.npm?.customVulnDbPath && fs.existsSync(config.npm.customVulnDbPath)) {
+      // Read from custom database
+      const customDb = JSON.parse(await readFileAsync(config.npm.customVulnDbPath, 'utf8'));
+      const vulns = customDb[dependency.name] || [];
+      
+      for (const vuln of vulns) {
+        if (versionUtils.satisfies(dependency.version, vuln.versionRange)) {
+          dependency.vulnerabilities.push({
+            severity: vuln.severity,
+            description: vuln.description,
+            cveIds: vuln.cveIds,
+            fixedInVersion: vuln.fixedInVersion,
+            url: vuln.url
+          });
         }
-        
-        const cacheFile = path.join(
-          config.cacheDir, 
-          `${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`
-        );
-        
-        await fs.promises.writeFile(
-          cacheFile, 
-          JSON.stringify(metadata, null, 2), 
-          'utf8'
-        );
-        
-        log.info(`Cached ${name} dependency info`);
-      } catch (cacheError) {
-        log.warn(`Error writing dependency cache for ${name}`, { error: cacheError });
+      }
+    } else if (!config.localSecurityCheckOnly) {
+      // In a real implementation, use npm audit
+      // For example:
+      // const { stdout } = await execAsync(`npm audit --json ${dependency.name}@${dependency.version}`);
+      // const auditResults = JSON.parse(stdout);
+      // ... process audit results ...
+      
+      // Using mock data for this example
+      if (dependency.name === 'lodash' && dependency.version.startsWith('4.17.') && parseInt(dependency.version.split('.')[2], 10) < 21) {
+        dependency.vulnerabilities.push({
+          severity: 'high',
+          description: 'Prototype pollution vulnerability in lodash before 4.17.21',
+          cveIds: ['CVE-2021-23337'],
+          fixedInVersion: '4.17.21',
+          url: 'https://nvd.nist.gov/vuln/detail/CVE-2021-23337'
+        });
       }
     }
     
-    return metadata;
+    log.info(`Checked vulnerabilities for ${dependency.name}@${dependency.version}, found ${dependency.vulnerabilities.length}`);
   } catch (error) {
-    log.error(`Error querying info for dependency ${name}`, { error });
-    
-    // Return default info if query fails
-    return {
-      name,
-      latestVersion: version,
-      isDeprecated: false,
-      hasSecurityIssues: false
-    };
+    log.warn(`Error checking NPM vulnerabilities for ${dependency.name}`, { error });
   }
 }
 
 /**
- * Customize mock metadata for more realistic examples
+ * Check for vulnerabilities in a Python package
  */
-function customizeMockMetadata(
-  metadata: DependencyMetadata,
-  name: string,
-  version: string,
-  packageManager: string
+async function checkPipVulnerabilities(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For a real implementation, use safety or PyUp database
+    // Here we're using a simplified approach with mock data
+    
+    // Using mock data for this example
+    if (dependency.name === 'django' && dependency.version.startsWith('2.2.') && parseInt(dependency.version.split('.')[2], 10) < 20) {
+      dependency.vulnerabilities.push({
+        severity: 'high',
+        description: 'Potential SQL injection via QuerySet.order_by() in Django before 2.2.20',
+        cveIds: ['CVE-2021-28658'],
+        fixedInVersion: '2.2.20',
+        url: 'https://nvd.nist.gov/vuln/detail/CVE-2021-28658'
+      });
+    }
+    
+    log.info(`Checked vulnerabilities for ${dependency.name}@${dependency.version}, found ${dependency.vulnerabilities.length}`);
+  } catch (error) {
+    log.warn(`Error checking Python vulnerabilities for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Check for vulnerabilities in a Maven/Gradle package
+ */
+async function checkMavenVulnerabilities(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For a real implementation, use OWASP dependency check or a vulnerability database
+    // Here we're using a simplified approach with mock data
+    
+    // Using mock data for this example
+    if (dependency.name.includes('spring-core') && dependency.version.startsWith('5.3.') && parseInt(dependency.version.split('.')[2], 10) < 18) {
+      dependency.vulnerabilities.push({
+        severity: 'high',
+        description: 'RCE in Spring Framework',
+        cveIds: ['CVE-2022-22965'],
+        fixedInVersion: '5.3.18',
+        url: 'https://nvd.nist.gov/vuln/detail/CVE-2022-22965'
+      });
+    }
+    
+    log.info(`Checked vulnerabilities for ${dependency.name}@${dependency.version}, found ${dependency.vulnerabilities.length}`);
+  } catch (error) {
+    log.warn(`Error checking Maven vulnerabilities for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Check for vulnerabilities in a NuGet package
+ */
+async function checkNugetVulnerabilities(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For a real implementation, use NuGet security advisories
+    // Here we're using a simplified approach with mock data
+    
+    // Using mock data for this example
+    if (dependency.name === 'Newtonsoft.Json' && dependency.version.startsWith('12.0.') && parseInt(dependency.version.split('.')[2], 10) < 3) {
+      dependency.vulnerabilities.push({
+        severity: 'medium',
+        description: 'Denial of Service in Newtonsoft.Json before 12.0.3',
+        cveIds: ['CVE-2020-10204'],
+        fixedInVersion: '12.0.3',
+        url: 'https://nvd.nist.gov/vuln/detail/CVE-2020-10204'
+      });
+    }
+    
+    log.info(`Checked vulnerabilities for ${dependency.name}@${dependency.version}, found ${dependency.vulnerabilities.length}`);
+  } catch (error) {
+    log.warn(`Error checking NuGet vulnerabilities for ${dependency.name}`, { error });
+  }
+}
+
+/**
+ * Apply custom severity overrides from configuration
+ */
+function applyCustomSeverityOverrides(
+  dependency: DependencyPackage,
+  config: DependencyScannerConfig
 ): void {
-  // Well-known vulnerable packages
-  const knownVulnerablePackages: Record<string, {
-    description: string;
-    severity: 'low' | 'medium' | 'high' | 'critical';
-    fixedInVersion: string;
-    affectedVersions: string;
-    cve?: string;
-  }[]> = {
-    'log4j-core': [{
-      description: 'Remote code execution vulnerability in log4j',
-      severity: 'critical',
-      fixedInVersion: '2.15.0',
-      affectedVersions: '<2.15.0',
-      cve: 'CVE-2021-44228'
-    }],
-    'lodash': [{
-      description: 'Prototype pollution vulnerability in lodash',
-      severity: 'high',
-      fixedInVersion: '4.17.21',
-      affectedVersions: '<4.17.21',
-      cve: 'CVE-2021-23337'
-    }],
-    'express': [{
-      description: 'Open redirect vulnerability in express',
-      severity: 'medium',
-      fixedInVersion: '4.17.3',
-      affectedVersions: '<4.17.3',
-      cve: 'CVE-2022-24999'
-    }],
-    'moment': [{
-      description: 'Regular expression denial of service',
-      severity: 'medium',
-      fixedInVersion: '2.29.2',
-      affectedVersions: '<2.29.2',
-      cve: 'CVE-2022-24785'
-    }]
-  };
+  // Skip if no overrides configured
+  if (!config.severityOverrides || config.severityOverrides.length === 0) {
+    return;
+  }
   
-  // Known deprecated packages
-  const knownDeprecatedPackages: Record<string, {
-    reason: string;
-    alternatives: string[];
-  }> = {
-    'request': {
-      reason: 'Package is no longer maintained',
-      alternatives: ['node-fetch', 'axios', 'got', 'superagent']
-    },
-    'moment': {
-      reason: 'Project is now in maintenance mode',
-      alternatives: ['date-fns', 'dayjs', 'luxon']
-    },
-    'gulp': {
-      reason: 'Modern JavaScript build tools have superseded this package',
-      alternatives: ['webpack', 'parcel', 'vite', 'esbuild']
-    },
-    'coffeescript': {
-      reason: 'No longer actively developed',
-      alternatives: ['TypeScript', 'modern JavaScript']
+  // Find matching override for this package
+  const matchingOverrides = config.severityOverrides.filter(override => {
+    if (override.packageName !== dependency.name) {
+      return false;
     }
-  };
-  
-  // Apply known vulnerabilities
-  if (name.toLowerCase() in knownVulnerablePackages) {
-    const vulns = knownVulnerablePackages[name.toLowerCase()];
-    metadata.hasSecurityIssues = true;
-    metadata.securityIssues = vulns.map(v => ({
-      severity: v.severity,
-      description: v.description,
-      fixedInVersion: v.fixedInVersion,
-      cve: v.cve
-    }));
-    metadata.latestVersion = vulns[0].fixedInVersion;
-  }
-  
-  // Apply known deprecations
-  if (name.toLowerCase() in knownDeprecatedPackages) {
-    const depInfo = knownDeprecatedPackages[name.toLowerCase()];
-    metadata.isDeprecated = true;
-    metadata.deprecationReason = depInfo.reason;
-    metadata.alternatives = depInfo.alternatives;
-  }
-  
-  // Update other metadata fields for specific packages
-  if (name.toLowerCase() === 'jquery') {
-    metadata.latestVersion = '3.6.4';
-    metadata.isDeprecated = true;
-    metadata.deprecationReason = 'Modern browsers have native APIs that make jQuery unnecessary';
-    metadata.alternatives = ['Vanilla JavaScript', 'Alpine.js'];
-    metadata.downloadCount = 100000000; // Very popular
-  } else if (name.toLowerCase() === 'react') {
-    metadata.latestVersion = '18.2.0';
-    metadata.isDeprecated = false;
-    metadata.downloadCount = 80000000; // Very popular
-    metadata.license = 'MIT';
-  } else if (name.toLowerCase() === 'vue') {
-    metadata.latestVersion = '3.3.4';
-    metadata.isDeprecated = false;
-    metadata.downloadCount = 45000000; // Very popular
-    metadata.license = 'MIT';
-  } else if (name.toLowerCase() === 'express') {
-    metadata.latestVersion = '4.18.2';
-    metadata.isDeprecated = false;
-    metadata.downloadCount = 50000000; // Very popular
-    metadata.license = 'MIT';
-  } else if (name.toLowerCase() === 'webpack') {
-    metadata.latestVersion = '5.88.2';
-    metadata.isDeprecated = false;
-    metadata.downloadCount = 40000000; // Very popular
-    metadata.license = 'MIT';
-  }
-}
-
-/**
- * Check if a version is outdated based on threshold
- */
-function isOutdatedVersion(
-  currentVersion: string,
-  latestVersion: string,
-  threshold: { major: number; minor: number; patch: number }
-): boolean {
-  try {
-    // Parse versions
-    const current = parseVersion(currentVersion);
-    const latest = parseVersion(latestVersion);
     
-    // Compare based on threshold
-    if (latest.major - current.major > threshold.major) return true;
-    if (latest.major === current.major && latest.minor - current.minor > threshold.minor) return true;
-    if (latest.major === current.major && latest.minor === current.minor && 
-        latest.patch - current.patch > threshold.patch) return true;
-    
-    return false;
-  } catch (error) {
-    log.warn(`Error comparing versions: ${currentVersion} vs ${latestVersion}`, { error });
-    return false;
-  }
-}
-
-/**
- * Parse version string into components
- */
-function parseVersion(version: string): { major: number; minor: number; patch: number } {
-  // Try using semver first
-  try {
-    const parsed = semver.coerce(version);
-    if (parsed) {
-      return {
-        major: parsed.major,
-        minor: parsed.minor,
-        patch: parsed.patch
-      };
+    if (!override.versionRange) {
+      return true; // Applies to all versions
     }
-  } catch (error) {
-    // Proceed to fallback parsing
+    
+    return versionUtils.satisfies(dependency.version, override.versionRange);
+  });
+  
+  if (matchingOverrides.length > 0) {
+    // Apply the first matching override to all vulnerabilities
+    const override = matchingOverrides[0];
+    
+    for (const vuln of dependency.vulnerabilities) {
+      vuln.severity = override.severity;
+      log.info(`Applied custom severity override for ${dependency.name}@${dependency.version}: ${override.severity}`);
+    }
   }
-  
-  // Fallback version parsing
-  const parts = version.split('.').map(p => parseInt(p, 10) || 0);
-  
-  return {
-    major: parts[0] || 0,
-    minor: parts[1] || 0,
-    patch: parts[2] || 0
-  };
 }
 
 /**
- * Calculate business impact score for a dependency
+ * Calculate risk level for a dependency issue
  */
-function calculateBusinessImpact(dep: ParsedDependency, metadata: DependencyMetadata): number {
-  let score = 3; // Default medium impact
+function calculateRiskLevel(
+  dependency: DependencyPackage
+): 'low' | 'medium' | 'high' | 'critical' {
+  // Start with a base risk level
+  let riskLevel: 'low' | 'medium' | 'high' | 'critical' = 'low';
   
-  // Higher impact for production dependencies
-  if (dep.type === 'production') score += 1;
-  
-  // Security issues raise impact significantly
-  if (metadata.hasSecurityIssues) {
-    // Find the highest severity
-    const highestSeverity = metadata.securityIssues?.reduce(
-      (highest, current) => {
-        const severityRank = { 'low': 1, 'medium': 2, 'high': 3, 'critical': 4 };
-        const currentRank = severityRank[current.severity] || 0;
-        const highestRank = severityRank[highest] || 0;
-        return currentRank > highestRank ? current.severity : highest;
-      },
-      'low' as 'low' | 'medium' | 'high' | 'critical'
-    );
+  // Check for vulnerabilities first
+  if (dependency.vulnerabilities.length > 0) {
+    // Find the highest severity vulnerability
+    for (const vuln of dependency.vulnerabilities) {
+      switch (vuln.severity) {
+        case 'critical':
+          return 'critical'; // Immediately return critical for any critical vulnerability
+        case 'high':
+          riskLevel = 'high';
+          break;
+        case 'medium':
+          if (riskLevel !== 'high') riskLevel = 'medium';
+          break;
+        case 'low':
+          if (riskLevel === 'low') riskLevel = 'low';
+          break;
+      }
+    }
+  } else if (dependency.latestVersion && 
+             versionUtils.isGreaterThan(dependency.latestVersion, dependency.version)) {
+    // For outdated dependencies without vulnerabilities, check how outdated they are
+    // This is a simple heuristic and would be more nuanced in a real implementation
+    const versionParts = dependency.version.split('.');
+    const latestParts = dependency.latestVersion.split('.');
     
-    if (highestSeverity === 'critical') score += 2;
-    else if (highestSeverity === 'high') score += 1.5;
-    else if (highestSeverity === 'medium') score += 1;
-    else score += 0.5;
-  }
-  
-  // Very popular packages may have higher impact
-  if (metadata.downloadCount && metadata.downloadCount > 10000000) score += 0.5;
-  
-  // Deprecated packages without alternatives are concerning
-  if (metadata.isDeprecated && !metadata.alternatives?.length) score += 0.5;
-  
-  // Bound the score between 1 and 5
-  return Math.max(1, Math.min(5, score));
-}
-
-/**
- * Calculate update effort score for a dependency
- */
-function calculateUpdateEffort(dep: ParsedDependency, metadata: DependencyMetadata): number {
-  let score = 2; // Default somewhat easy to update
-  
-  // Version jump size
-  if (dep.version && metadata.latestVersion) {
-    const current = parseVersion(dep.version);
-    const latest = parseVersion(metadata.latestVersion);
-    
-    if (latest.major !== current.major) {
-      // Major version changes are harder
-      score += latest.major - current.major;
-    } else if (latest.minor - current.minor > 5) {
-      // Many minor versions behind
-      score += 0.5;
+    if (versionParts[0] !== latestParts[0]) {
+      // Major version difference
+      riskLevel = 'medium';
+    } else if (versionParts[1] !== latestParts[1]) {
+      // Minor version difference
+      riskLevel = 'low';
     }
   }
   
-  // Deprecated packages without clear alternatives are harder to update
-  if (metadata.isDeprecated) {
-    score += metadata.alternatives?.length ? 1 : 2;
+  // Adjust risk for direct vs transitive dependencies
+  if (riskLevel !== 'critical' && !dependency.isDirect) {
+    // Slightly downgrade risk for transitive dependencies
+    if (riskLevel === 'high') riskLevel = 'medium';
+    else if (riskLevel === 'medium') riskLevel = 'low';
   }
   
-  // Dependencies used in production code are generally harder to update
-  if (dep.type === 'production') score += 0.5;
+  // Adjust risk based on dependency type (dev vs prod)
+  if (riskLevel !== 'critical' && dependency.isDev) {
+    // Slightly downgrade risk for dev dependencies
+    if (riskLevel === 'high') riskLevel = 'medium';
+    else if (riskLevel === 'medium') riskLevel = 'low';
+  }
   
-  // Bound the score between 1 and 5
-  return Math.max(1, Math.min(5, score));
+  return riskLevel;
 }
 
 /**
  * Generate tags for a dependency issue
  */
-function generateTags(
-  dep: ParsedDependency, 
-  metadata: DependencyMetadata, 
-  isOutdated: boolean
-): string[] {
-  const tags: string[] = [dep.packageManager, dep.type];
+function generateTags(dependency: DependencyPackage): string[] {
+  const tags = [dependency.source];
   
-  if (isOutdated) tags.push('outdated');
-  if (metadata.isDeprecated) tags.push('deprecated');
-  if (metadata.hasSecurityIssues) tags.push('security-issue');
-  
-  // Add severity tag for security issues
-  if (metadata.securityIssues?.length) {
-    const severities = metadata.securityIssues.map(issue => issue.severity);
-    if (severities.includes('critical')) tags.push('critical-severity');
-    else if (severities.includes('high')) tags.push('high-severity');
-    else if (severities.includes('medium')) tags.push('medium-severity');
-    else if (severities.includes('low')) tags.push('low-severity');
+  if (dependency.isDev) {
+    tags.push('dev-dependency');
+  } else {
+    tags.push('prod-dependency');
   }
   
-  // Add license tag if available
-  if (metadata.license) {
-    tags.push(`license-${metadata.license.toLowerCase().replace(/[^a-z0-9]/g, '-')}`);
+  if (dependency.isDirect) {
+    tags.push('direct');
+  } else {
+    tags.push('transitive');
   }
   
-  // Add popularity tag
-  if (metadata.downloadCount) {
-    if (metadata.downloadCount > 10000000) tags.push('very-popular');
-    else if (metadata.downloadCount > 1000000) tags.push('popular');
-    else if (metadata.downloadCount > 100000) tags.push('moderately-popular');
-    else tags.push('niche');
+  if (dependency.latestVersion && 
+      versionUtils.isGreaterThan(dependency.latestVersion, dependency.version)) {
+    tags.push('outdated');
+    
+    // Check if it's a major, minor, or patch version difference
+    const versionParts = dependency.version.split('.');
+    const latestParts = dependency.latestVersion.split('.');
+    
+    if (versionParts[0] !== latestParts[0]) {
+      tags.push('major-update');
+    } else if (versionParts[1] !== latestParts[1]) {
+      tags.push('minor-update');
+    } else {
+      tags.push('patch-update');
+    }
+  }
+  
+  if (dependency.vulnerabilities.length > 0) {
+    tags.push('vulnerable');
+    
+    // Add tags for vulnerability severity
+    const severities = new Set(dependency.vulnerabilities.map(v => v.severity));
+    severities.forEach(severity => tags.push(`${severity}-severity`));
+    
+    // Add CVE tags
+    const cveIds = dependency.vulnerabilities
+      .filter(v => v.cveIds && v.cveIds.length > 0)
+      .flatMap(v => v.cveIds);
+    
+    if (cveIds.length > 0) {
+      // Add up to 3 CVE tags to avoid tag explosion
+      const uniqueCves = [...new Set(cveIds)].slice(0, 3);
+      tags.push(...uniqueCves.map(cve => cve.toLowerCase().replace(/-/g, '')));
+    }
   }
   
   return tags;
 }
 
 /**
- * Generate a recommendation for the dependency issue
+ * Generate recommendation for a dependency issue
  */
-function generateRecommendation(
-  dep: ParsedDependency, 
-  metadata: DependencyMetadata, 
-  isOutdated: boolean
-): string {
+function generateRecommendation(dependency: DependencyPackage): string {
   const recommendations: string[] = [];
   
-  if (metadata.hasSecurityIssues) {
-    // Find the highest severity
-    const highestSeverity = metadata.securityIssues?.reduce(
-      (highest, current) => {
-        const severityRank = { 'low': 1, 'medium': 2, 'high': 3, 'critical': 4 };
-        const currentRank = severityRank[current.severity] || 0;
-        const highestRank = severityRank[highest] || 0;
-        return currentRank > highestRank ? current.severity : highest;
-      },
-      'low' as 'low' | 'medium' | 'high' | 'critical'
-    );
+  // Handle vulnerabilities first
+  if (dependency.vulnerabilities.length > 0) {
+    // Find the version that fixes all vulnerabilities
+    const fixVersions = dependency.vulnerabilities
+      .filter(v => v.fixedInVersion)
+      .map(v => v.fixedInVersion);
     
-    const issueCount = metadata.securityIssues?.length || 0;
+    const latestFixVersion = fixVersions.length > 0 ?
+      fixVersions.reduce((latest, current) => {
+        return versionUtils.isGreaterThan(current, latest) ? current : latest;
+      }, fixVersions[0]) :
+      dependency.latestVersion;
     
-    recommendations.push(
-      `Update ${dep.name} immediately from ${dep.version} to ${metadata.latestVersion} to fix ${issueCount} ${highestSeverity} severity security ${issueCount === 1 ? 'issue' : 'issues'}`
-    );
-  } else if (metadata.isDeprecated) {
-    recommendations.push(
-      `Replace deprecated dependency ${dep.name} ${dep.version}`
-    );
-    
-    if (metadata.deprecationReason) {
-      recommendations.push(`Reason: ${metadata.deprecationReason}`);
-    }
-    
-    if (metadata.alternatives?.length) {
+    if (latestFixVersion) {
       recommendations.push(
-        `Consider these alternatives: ${metadata.alternatives.join(', ')}`
+        `Update ${dependency.name} from ${dependency.version} to ${latestFixVersion} to address ${dependency.vulnerabilities.length} security ${dependency.vulnerabilities.length === 1 ? 'vulnerability' : 'vulnerabilities'}`
+      );
+    } else {
+      recommendations.push(
+        `Urgent: Review security vulnerabilities in ${dependency.name} ${dependency.version}`
       );
     }
-  } else if (isOutdated) {
-    recommendations.push(
-      `Update ${dep.name} from ${dep.version} to ${metadata.latestVersion}`
-    );
+    
+    // List the vulnerabilities
+    dependency.vulnerabilities.forEach(vuln => {
+      let desc = `- ${vuln.severity.toUpperCase()}: ${vuln.description}`;
+      if (vuln.cveIds && vuln.cveIds.length > 0) {
+        desc += ` (${vuln.cveIds.join(', ')})`;
+      }
+      if (vuln.fixedInVersion) {
+        desc += ` - Fixed in version ${vuln.fixedInVersion}`;
+      }
+      recommendations.push(desc);
+    });
+  }
+  // Handle outdated dependencies
+  else if (dependency.latestVersion && 
+           versionUtils.isGreaterThan(dependency.latestVersion, dependency.version)) {
+    // Determine if it's a major, minor, or patch version update
+    const versionParts = dependency.version.split('.');
+    const latestParts = dependency.latestVersion.split('.');
+    
+    if (versionParts[0] !== latestParts[0]) {
+      recommendations.push(
+        `Consider updating ${dependency.name} from ${dependency.version} to ${dependency.latestVersion}. This is a major version upgrade and may include breaking changes.`
+      );
+    } else if (versionParts[1] !== latestParts[1]) {
+      recommendations.push(
+        `Update ${dependency.name} from ${dependency.version} to ${dependency.latestVersion} to get new features and improvements.`
+      );
+    } else {
+      recommendations.push(
+        `Update ${dependency.name} from ${dependency.version} to ${dependency.latestVersion} for bug fixes and patches.`
+      );
+    }
   }
   
-  // If we have no recommendations yet, add a general one
+  // Suggest package manager specific commands
+  if (recommendations.length > 0) {
+    switch (dependency.source) {
+      case 'npm':
+        recommendations.push(
+          `Use 'npm install ${dependency.name}${dependency.isDev ? ' --save-dev' : ''}' to update this package.`
+        );
+        break;
+      case 'pip':
+        recommendations.push(
+          `Use 'pip install --upgrade ${dependency.name}' to update this package.`
+        );
+        break;
+      case 'maven':
+        recommendations.push(
+          `Update the version in your pom.xml file.`
+        );
+        break;
+      case 'gradle':
+        recommendations.push(
+          `Update the version in your build.gradle file.`
+        );
+        break;
+      case 'nuget':
+        recommendations.push(
+          `Use 'dotnet add package ${dependency.name}' to update this package.`
+        );
+        break;
+    }
+  }
+  
+  // If no recommendations were generated, provide a default
   if (recommendations.length === 0) {
     recommendations.push(
-      `No immediate actions needed for ${dep.name} ${dep.version}`
+      `No immediate actions required for ${dependency.name} ${dependency.version}.`
     );
   }
   
-  return recommendations.join('. ');
-}
-
-/* ---- Helper Functions ---- */
-
-/**
- * Increment a version for demonstration purposes
- */
-function incrementVersion(version: string): string {
-  try {
-    // Clean up version string to ensure it's parseable
-    const cleanVersion = version.replace(/[^0-9.]/g, '');
-    
-    // Handle 'latest' or empty versions
-    if (!cleanVersion || cleanVersion === 'latest') {
-      return '1.0.0';
-    }
-    
-    const parts = cleanVersion.split('.');
-    
-    if (parts.length < 3) {
-      // Ensure we have at least 3 parts
-      while (parts.length < 3) {
-        parts.push('0');
-      }
-    }
-    
-    // Randomly decide which part to increment
-    const random = Math.random();
-    let incrementIndex = 2; // Default to patch increment
-    
-    if (random < 0.1) {
-      // 10% chance of major version increment
-      incrementIndex = 0;
-    } else if (random < 0.3) {
-      // 20% chance of minor version increment
-      incrementIndex = 1;
-    }
-    
-    // Increment the selected part
-    parts[incrementIndex] = String(parseInt(parts[incrementIndex], 10) + 1);
-    
-    // Reset subsequent parts to 0
-    for (let i = incrementIndex + 1; i < parts.length; i++) {
-      parts[i] = '0';
-    }
-    
-    return parts.join('.');
-  } catch (error) {
-    return `${version || '1.0.0'}.1`; // Fallback
-  }
+  return recommendations.join('\n');
 }
 
 /**
- * Get a random severity level
+ * Assess impact of updating a dependency
  */
-function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
-  const severities: Array<'low' | 'medium' | 'high' | 'critical'> = [
-    'low', 'medium', 'high', 'critical'
-  ];
-  const weights = [0.3, 0.4, 0.2, 0.1]; // More medium and low than high and critical
-  
-  const random = Math.random();
-  let sum = 0;
-  
-  for (let i = 0; i < weights.length; i++) {
-    sum += weights[i];
-    if (random < sum) {
-      return severities[i];
-    }
-  }
-  
-  return 'medium'; // Default fallback
-}
-
-/**
- * Get a random vulnerability type
- */
-function getRandomVulnerabilityType(): string {
-  const types = [
-    'SQL injection',
-    'cross-site scripting',
-    'remote code execution',
-    'denial of service',
-    'buffer overflow',
-    'path traversal',
-    'privilege escalation',
-    'open redirect',
-    'insecure deserialization',
-    'information disclosure',
-    'authentication bypass',
-    'memory corruption',
-    'prototype pollution',
-    'regular expression denial of service',
-    'stack overflow',
-    'injection',
-    'race condition'
-  ];
-  return types[Math.floor(Math.random() * types.length)];
-}
-
-/**
- * Get random deprecation reason
- */
-function getRandomDeprecationReason(): string {
-  const reasons = [
-    'Package is no longer maintained',
-    'Package has been superseded by newer alternatives',
-    'Security concerns that cannot be fixed',
-    'Functionality now included in the language/framework',
-    'API fundamentally flawed',
-    'Project merged into another package',
-    'Author has discontinued development',
-    'Performance issues that cannot be resolved',
-    'Deprecated by the platform/language',
-    'Unmaintained and contains security issues'
-  ];
-  return reasons[Math.floor(Math.random() * reasons.length)];
-}
-
-/**
- * Get random alternatives based on package manager
- */
-function getRandomAlternatives(name: string, packageManager: string): string[] {
-  // Default alternatives by package manager
-  const defaultAlternatives: Record<string, string[]> = {
-    npm: ['newer-lib', 'modern-package', 'maintained-tool'],
-    composer: ['better-php-lib', 'modern-php-package'],
-    pip: ['better-python-lib', 'modern-python-tool'],
-    maven: ['better-java-lib', 'modern-java-tool'],
-    cargo: ['better-rust-lib', 'modern-rust-tool'],
-    bundler: ['better-ruby-gem', 'modern-ruby-tool']
+function assessUpdateImpact(
+  dependency: DependencyPackage,
+  isOutdated: boolean
+): {
+  breakingChanges: boolean;
+  affectedComponents?: string[];
+  estimatedEffort: 'low' | 'medium' | 'high';
+} {
+  // Default impact assessment
+  const impact = {
+    breakingChanges: false,
+    estimatedEffort: 'low' as 'low' | 'medium' | 'high'
   };
   
-  // Use defaults or generate random count of alternatives
-  const count = 1 + Math.floor(Math.random() * 3);
-  const alternatives = defaultAlternatives[packageManager] || ['alternative-lib'];
+  if (!isOutdated || !dependency.latestVersion) {
+    return impact;
+  }
   
-  // Return a subset of alternatives
-  return alternatives.slice(0, count);
-}
-
-/**
- * Get a random license
- */
-function getRandomLicense(): string {
-  const licenses = [
-    'MIT',
-    'Apache-2.0',
-    'GPL-3.0',
-    'BSD-3-Clause',
-    'ISC',
-    'LGPL-2.1',
-    'MPL-2.0',
-    'AGPL-3.0',
-    'Proprietary'
-  ];
-  return licenses[Math.floor(Math.random() * licenses.length)];
+  // Determine if breaking changes are likely
+  const versionParts = dependency.version.split('.');
+  const latestParts = dependency.latestVersion.split('.');
+  
+  // Major version bump typically means breaking changes
+  if (versionParts[0] !== latestParts[0]) {
+    impact.breakingChanges = true;
+    impact.estimatedEffort = 'high';
+  } 
+  // Multiple minor version jumps may require moderate effort
+  else if (versionParts[1] !== latestParts[1]) {
+    const minorVersionDiff = parseInt(latestParts[1], 10) - parseInt(versionParts[1], 10);
+    
+    if (minorVersionDiff > 2) {
+      impact.estimatedEffort = 'medium';
+    }
+  }
+  
+  // If dependency has vulnerabilities, increase estimated effort
+  if (dependency.vulnerabilities.length > 0) {
+    // Severity-based effort estimation
+    const hasCritical = dependency.vulnerabilities.some(v => v.severity === 'critical');
+    const hasHigh = dependency.vulnerabilities.some(v => v.severity === 'high');
+    
+    if (hasCritical) {
+      impact.estimatedEffort = 'high';
+    } else if (hasHigh && impact.estimatedEffort !== 'high') {
+      impact.estimatedEffort = 'medium';
+    }
+  }
+  
+  return impact;
 }
