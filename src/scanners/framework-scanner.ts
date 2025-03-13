@@ -1,12 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import { exec } from 'child_process';
+import { glob } from 'glob';
 import { FrameworkIssue, VulnerabilityInfo } from '../types/scanning';
-import { compareVersions, daysBetween } from '../utils/scanner-utils';
+import { compareVersions, formatDate, estimateBusinessImpact } from '../utils/scanner-utils';
 import { log } from '../utils/logging';
 
-const execAsync = promisify(exec);
+const readFileAsync = promisify(fs.readFile);
 
 /**
  * Configuration for framework scanning
@@ -39,174 +39,297 @@ export interface FrameworkScannerConfig {
   // Skip frameworks matching specific patterns
   ignorePatterns?: string[];
   
-  // Custom framework version files locations
-  customVersionLocations?: Record<string, string[]>;
-  
   // API timeout in milliseconds
   apiTimeoutMs: number;
+  
+  // Path to custom framework database (if any)
+  customFrameworkDbPath?: string;
 }
 
 /**
- * Framework definition structure used for detection
+ * Database of known frameworks with their version detection methods
  */
-interface FrameworkDefinition {
-  name: string;
-  category: 'frontend' | 'backend' | 'mobile' | 'database' | 'devops' | 'system' | 'other';
-  type: string;
-  detectionPatterns: {
-    // File patterns to look for
-    filePatterns: string[];
-    // Content patterns to match in the files
-    contentPatterns?: string[];
-    // Package patterns to look for in package.json
-    packagePatterns?: string[];
-    // Custom detection function
-    customDetection?: (fileContent: string, filePath: string) => boolean;
-  };
-  versionDetection: {
-    // How to detect the version
-    strategy: 'file' | 'package' | 'command' | 'api' | 'content';
-    // Details based on the strategy
-    details: any;
-  };
-  // URL to check latest version
-  latestVersionUrl?: string;
-  // End of life information URL
-  endOfLifeUrl?: string;
-  // Known security vulnerabilities URL
-  securityAdvisoriesUrl?: string;
-  // Migration path information
-  migrationPath?: string;
+interface FrameworkDatabase {
+  // Map of framework name to detection rules
+  frameworks: Record<string, FrameworkDetectionRule>;
+  
+  // Map of framework name to known vulnerabilities
+  vulnerabilities: Record<string, FrameworkVulnerability[]>;
+  
+  // Map of framework name to end-of-life/support information
+  lifecycleInfo: Record<string, FrameworkLifecycleInfo>;
+  
+  // Last updated timestamp
+  lastUpdated: Date;
 }
 
 /**
- * Framework version information
+ * Rules for detecting a framework and its version
  */
-interface FrameworkInfo {
+interface FrameworkDetectionRule {
+  // Framework name
   name: string;
+  
+  // Framework category
   category: 'frontend' | 'backend' | 'mobile' | 'database' | 'devops' | 'system' | 'other';
+  
+  // Framework type (e.g., 'js-framework', 'php-cms', 'database')
   type: string;
-  version: string;
-  detectedAt: string;
-  latestVersion?: string;
+  
+  // File patterns to search for (glob patterns)
+  filePatterns: string[];
+  
+  // Files to ignore (glob patterns)
+  ignorePatterns?: string[];
+  
+  // Regular expressions to use for version detection
+  versionDetectionRegexes: {
+    // File pattern to match
+    filePattern: string;
+    // Regex to extract version
+    regex: string;
+    // Regex group index for version
+    versionGroup: number;
+  }[];
+  
+  // Package.json dependencies to check (for JavaScript frameworks)
+  packageJsonDependencies?: string[];
+  
+  // Composer.json dependencies to check (for PHP frameworks)
+  composerJsonDependencies?: string[];
+  
+  // Gemfile dependencies to check (for Ruby frameworks)
+  gemfileDependencies?: string[];
+  
+  // Requirements.txt dependencies to check (for Python frameworks)
+  requirementsTxtDependencies?: string[];
+  
+  // Latest known version
+  latestVersion: string;
+  
+  // URL for version information
+  versionInfoUrl?: string;
+  
+  // Migration guide URL
+  migrationGuideUrl?: string;
+}
+
+/**
+ * Vulnerability information for a framework
+ */
+interface FrameworkVulnerability {
+  // Framework name
+  frameworkName: string;
+  
+  // Affected versions
+  affectedVersions: string;
+  
+  // Patched versions
+  patchedVersions?: string;
+  
+  // CVE ID
+  cveId?: string;
+  
+  // Vulnerability title
+  title: string;
+  
+  // Detailed description
+  description: string;
+  
+  // CVSS score
+  cvssScore?: number;
+  
+  // Severity
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  
+  // URL for more information
+  infoUrl?: string;
+  
+  // Published date
+  publishedDate?: Date;
+  
+  // Recommendation to fix
+  recommendation?: string;
+}
+
+/**
+ * Lifecycle information for a framework
+ */
+interface FrameworkLifecycleInfo {
+  // Framework name
+  frameworkName: string;
+  
+  // End of life date
   endOfLifeDate?: Date;
+  
+  // End of support date
   endOfSupportDate?: Date;
+  
+  // Whether the framework is deprecated
+  isDeprecated: boolean;
+  
+  // Date when framework was deprecated
+  deprecatedDate?: Date;
+  
+  // Recommended alternative
+  recommendedAlternative?: string;
+  
+  // Migration difficulty (1-5)
+  migrationDifficulty?: number;
+  
+  // URL for more information
+  infoUrl?: string;
 }
 
 /**
- * Scan project for outdated frameworks and technologies
+ * Scanner for detecting outdated frameworks and technologies
  */
 export async function scanFrameworks(
   config: FrameworkScannerConfig
 ): Promise<FrameworkIssue[]> {
   try {
     log.info('Starting framework scanner');
-    
     const issues: FrameworkIssue[] = [];
     
-    // Get all framework definitions that match requested categories
-    const frameworkDefinitions = getFrameworkDefinitions(config.frameworkCategories);
-    log.info(`Loaded ${frameworkDefinitions.length} framework definitions for detection`);
+    // Load framework database
+    const frameworkDb = await loadFrameworkDatabase(config);
     
-    // Detect frameworks in use
-    const detectedFrameworks = await detectFrameworks(frameworkDefinitions, config);
-    log.info(`Detected ${detectedFrameworks.length} frameworks in use`);
+    log.info(`Loaded framework database with ${Object.keys(frameworkDb.frameworks).length} frameworks`);
     
-    // Check each framework for issues
-    for (const framework of detectedFrameworks) {
+    // Detect frameworks for each category
+    for (const category of config.frameworkCategories) {
       try {
-        // Skip ignored frameworks
-        if (config.ignoreFrameworks && config.ignoreFrameworks.includes(framework.name)) {
-          continue;
-        }
+        log.info(`Scanning for ${category} frameworks`);
         
-        // Skip frameworks matching ignore patterns
-        if (config.ignorePatterns && 
-            config.ignorePatterns.some(pattern => new RegExp(pattern).test(framework.name))) {
-          continue;
-        }
+        // Get frameworks for this category
+        const categoryFrameworks = Object.values(frameworkDb.frameworks)
+          .filter(f => f.category === category);
         
-        // Get the latest version
-        const latestVersion = framework.latestVersion || 
-          await getLatestFrameworkVersion(framework.name, framework.type);
+        log.info(`Found ${categoryFrameworks.length} framework definitions for category ${category}`);
         
-        if (!latestVersion) {
-          continue; // Skip if we can't determine the latest version
-        }
-        
-        const isOutdated = compareVersions(framework.version, latestVersion) < 0;
-        
-        // Only report if outdated or meets the minimum age requirement
-        if (isOutdated || 
-            daysBetween(new Date(framework.detectedAt), new Date()) >= config.minimumAgeInDays) {
-          
-          // Gather additional information
-          let endOfLifeDate = framework.endOfLifeDate;
-          let endOfSupportDate = framework.endOfSupportDate;
-          
-          if (config.checkEndOfLife && (!endOfLifeDate || !endOfSupportDate)) {
-            const eolInfo = await getFrameworkEOLInfo(framework.name, framework.version, framework.type);
-            endOfLifeDate = eolInfo.endOfLifeDate || undefined;
-            endOfSupportDate = eolInfo.endOfSupportDate || undefined;
-          }
-          
-          // Get vulnerabilities if enabled
-          let vulnerabilities: VulnerabilityInfo[] = [];
-          if (config.checkVulnerabilities) {
-            vulnerabilities = await getFrameworkVulnerabilities(
-              framework.name, 
-              framework.version, 
-              framework.type
-            );
-          }
-          
-          // Create the issue record
-          const issue: FrameworkIssue = {
-            name: framework.name,
-            currentVersion: framework.version,
-            latestVersion: latestVersion,
-            isOutdated,
-            isDeprecated: !!endOfLifeDate && endOfLifeDate < new Date(),
-            category: framework.category,
-            type: framework.type,
-            location: framework.detectedAt,
-            endOfLifeDate,
-            endOfSupportDate,
-            vulnerabilities,
-            detectedAt: new Date(),
-          };
-          
-          // Add migration information if requested
-          if (config.estimateMigrationEffort) {
-            issue.migrationPath = await getFrameworkMigrationPath(framework.name, framework.version, latestVersion);
-            issue.migrationEffort = estimateMigrationEffort(framework.name, framework.version, latestVersion);
-          }
-          
-          // Add business impact if requested
-          if (config.estimateBusinessImpact) {
-            issue.businessImpact = estimateBusinessImpact(
-              framework.name, 
-              isOutdated, 
-              !!vulnerabilities.length,
-              endOfLifeDate
-            );
+        // Detect each framework
+        for (const framework of categoryFrameworks) {
+          try {
+            // Skip ignored frameworks
+            if (config.ignoreFrameworks && config.ignoreFrameworks.includes(framework.name)) {
+              log.info(`Skipping ignored framework: ${framework.name}`);
+              continue;
+            }
             
-            // Also estimate security impact
-            issue.securityImpact = estimateSecurityImpact(
-              framework.name,
-              vulnerabilities,
-              endOfLifeDate
-            );
+            // Skip frameworks matching ignore patterns
+            if (config.ignorePatterns && 
+                config.ignorePatterns.some(pattern => new RegExp(pattern).test(framework.name))) {
+              log.info(`Skipping framework matching ignore pattern: ${framework.name}`);
+              continue;
+            }
+            
+            // Detect this framework
+            log.info(`Detecting framework: ${framework.name}`);
+            const detectedVersions = await detectFrameworkVersion(config.rootDirectory, framework);
+            
+            if (detectedVersions.length === 0) {
+              log.info(`Framework not detected: ${framework.name}`);
+              continue;
+            }
+            
+            log.info(`Framework detected: ${framework.name}, versions: ${detectedVersions.join(', ')}`);
+            
+            // Process each detected version
+            for (const detected of detectedVersions) {
+              try {
+                const { version, location } = detected;
+                
+                // Check if outdated
+                const isOutdated = compareVersions(version, framework.latestVersion) < 0;
+                
+                // Get lifecycle information
+                const lifecycleInfo = frameworkDb.lifecycleInfo[framework.name];
+                const isDeprecated = lifecycleInfo?.isDeprecated || false;
+                
+                // Get vulnerabilities
+                let vulnerabilities: VulnerabilityInfo[] = [];
+                if (config.checkVulnerabilities) {
+                  vulnerabilities = await getFrameworkVulnerabilities(
+                    framework.name, 
+                    version, 
+                    frameworkDb.vulnerabilities
+                  );
+                }
+                
+                // Skip if not outdated, not deprecated, and no vulnerabilities
+                if (!isOutdated && !isDeprecated && vulnerabilities.length === 0) {
+                  log.info(`Framework ${framework.name} version ${version} is current and has no issues`);
+                  continue;
+                }
+                
+                // Create issue
+                const issue: FrameworkIssue = {
+                  name: framework.name,
+                  currentVersion: version,
+                  latestVersion: framework.latestVersion,
+                  isOutdated,
+                  isDeprecated,
+                  category: framework.category,
+                  type: framework.type,
+                  location,
+                  vulnerabilities,
+                  detectedAt: new Date()
+                };
+                
+                // Add lifecycle information if configured
+                if (config.checkEndOfLife && lifecycleInfo) {
+                  issue.endOfLifeDate = lifecycleInfo.endOfLifeDate;
+                  issue.endOfSupportDate = lifecycleInfo.endOfSupportDate;
+                  
+                  if (lifecycleInfo.recommendedAlternative) {
+                    issue.migrationPath = `Migrate to ${lifecycleInfo.recommendedAlternative}. `;
+                    
+                    if (framework.migrationGuideUrl) {
+                      issue.migrationPath += `See migration guide: ${framework.migrationGuideUrl}`;
+                    }
+                  }
+                }
+                
+                // Estimate migration effort if configured
+                if (config.estimateMigrationEffort && lifecycleInfo) {
+                  issue.migrationEffort = lifecycleInfo.migrationDifficulty || estimateMigrationEffort(
+                    framework.name,
+                    isOutdated,
+                    isDeprecated,
+                    vulnerabilities.length > 0
+                  );
+                }
+                
+                // Estimate business impact if configured
+                if (config.estimateBusinessImpact) {
+                  issue.businessImpact = estimateBusinessImpact(
+                    isOutdated,
+                    isDeprecated,
+                    vulnerabilities.length > 0,
+                    framework.category === 'system' || framework.type.includes('core')
+                  );
+                  
+                  issue.securityImpact = vulnerabilities.length > 0 ? 
+                    Math.max(...vulnerabilities.map(v => securityImpactFromSeverity(v.severity))) : 1;
+                }
+                
+                // Add to issues list
+                issues.push(issue);
+                log.info(`Added issue for framework ${framework.name} version ${version}`);
+              } catch (versionError) {
+                log.warn(`Error processing framework version: ${framework.name}`, { error: versionError });
+              }
+            }
+          } catch (frameworkError) {
+            log.warn(`Error detecting framework: ${framework.name}`, { error: frameworkError });
           }
-          
-          issues.push(issue);
         }
-      } catch (frameworkError) {
-        log.warn(`Error checking framework ${framework.name}@${framework.version}`, { error: frameworkError });
+      } catch (categoryError) {
+        log.error(`Error scanning ${category} frameworks`, { error: categoryError });
       }
     }
     
-    log.info(`Completed framework scanning. Found ${issues.length} issues`);
+    log.info(`Completed framework scanning. Found ${issues.length} total issues`);
     return issues;
   } catch (error) {
     log.error('Error during framework scanning', { error });
@@ -215,729 +338,379 @@ export async function scanFrameworks(
 }
 
 /**
- * Get framework definitions for the given categories
+ * Load the framework database
  */
-function getFrameworkDefinitions(
-  categories: Array<'frontend' | 'backend' | 'mobile' | 'database' | 'devops' | 'system' | 'other'>
-): FrameworkDefinition[] {
-  // In a real implementation, this would come from a database or configuration file
-  // Here we'll define a few examples manually
-  const allDefinitions: FrameworkDefinition[] = [
-    // Frontend frameworks
-    {
-      name: 'React',
-      category: 'frontend',
-      type: 'UI Framework',
-      detectionPatterns: {
-        filePatterns: ['package.json'],
-        packagePatterns: ['react', 'react-dom']
-      },
-      versionDetection: {
-        strategy: 'package',
-        details: {
-          packageName: 'react'
-        }
-      },
-      latestVersionUrl: 'https://api.github.com/repos/facebook/react/releases/latest',
-      endOfLifeUrl: 'https://reactjs.org/blog/',
-      securityAdvisoriesUrl: 'https://github.com/facebook/react/security/advisories'
-    },
-    {
-      name: 'Angular',
-      category: 'frontend',
-      type: 'UI Framework',
-      detectionPatterns: {
-        filePatterns: ['package.json', 'angular.json'],
-        packagePatterns: ['@angular/core']
-      },
-      versionDetection: {
-        strategy: 'package',
-        details: {
-          packageName: '@angular/core'
-        }
-      },
-      latestVersionUrl: 'https://api.github.com/repos/angular/angular/releases/latest',
-      endOfLifeUrl: 'https://angular.io/guide/releases',
-      securityAdvisoriesUrl: 'https://github.com/angular/angular/security/advisories',
-      migrationPath: 'https://update.angular.io/'
-    },
-    {
-      name: 'Vue.js',
-      category: 'frontend',
-      type: 'UI Framework',
-      detectionPatterns: {
-        filePatterns: ['package.json'],
-        packagePatterns: ['vue']
-      },
-      versionDetection: {
-        strategy: 'package',
-        details: {
-          packageName: 'vue'
-        }
-      },
-      latestVersionUrl: 'https://api.github.com/repos/vuejs/vue/releases/latest',
-      endOfLifeUrl: 'https://v3.vuejs.org/guide/migration/introduction.html',
-      securityAdvisoriesUrl: 'https://github.com/vuejs/vue/security/advisories'
-    },
-    
-    // Backend frameworks
-    {
-      name: 'Express.js',
-      category: 'backend',
-      type: 'Web Framework',
-      detectionPatterns: {
-        filePatterns: ['package.json'],
-        packagePatterns: ['express']
-      },
-      versionDetection: {
-        strategy: 'package',
-        details: {
-          packageName: 'express'
-        }
-      },
-      latestVersionUrl: 'https://api.github.com/repos/expressjs/express/releases/latest',
-      securityAdvisoriesUrl: 'https://github.com/expressjs/express/security/advisories'
-    },
-    {
-      name: 'Django',
-      category: 'backend',
-      type: 'Web Framework',
-      detectionPatterns: {
-        filePatterns: ['requirements.txt', 'Pipfile', 'setup.py', 'pyproject.toml'],
-        contentPatterns: ['django', 'Django']
-      },
-      versionDetection: {
-        strategy: 'command',
-        details: {
-          command: 'python -c "import django; print(django.get_version())"'
-        }
-      },
-      latestVersionUrl: 'https://www.djangoproject.com/download/',
-      endOfLifeUrl: 'https://www.djangoproject.com/download/#supported-versions',
-      securityAdvisoriesUrl: 'https://docs.djangoproject.com/en/stable/releases/security/'
-    },
-    {
-      name: 'Spring Boot',
-      category: 'backend',
-      type: 'Application Framework',
-      detectionPatterns: {
-        filePatterns: ['pom.xml', 'build.gradle'],
-        contentPatterns: ['org.springframework.boot', 'spring-boot']
-      },
-      versionDetection: {
-        strategy: 'content',
-        details: {
-          filePattern: 'pom.xml',
-          regex: '<spring-boot\.version>([\d\.]+)<\/spring-boot\.version>'
-        }
-      },
-      latestVersionUrl: 'https://api.github.com/repos/spring-projects/spring-boot/releases/latest',
-      endOfLifeUrl: 'https://spring.io/projects/spring-boot#support',
-      securityAdvisoriesUrl: 'https://spring.io/security'
-    },
-    
-    // Database technologies
-    {
-      name: 'MongoDB',
-      category: 'database',
-      type: 'NoSQL Database',
-      detectionPatterns: {
-        filePatterns: ['package.json'],
-        packagePatterns: ['mongodb', 'mongoose']
-      },
-      versionDetection: {
-        strategy: 'command',
-        details: {
-          command: 'mongod --version'
-        }
-      },
-      latestVersionUrl: 'https://www.mongodb.com/try/download/community',
-      endOfLifeUrl: 'https://www.mongodb.com/support-policy',
-      securityAdvisoriesUrl: 'https://www.mongodb.com/alerts'
-    }
-    // Additional framework definitions would be defined here
-  ];
-  
-  // Filter by requested categories
-  return allDefinitions.filter(def => categories.includes(def.category));
-}
-
-/**
- * Detect frameworks used in the project
- */
-async function detectFrameworks(
-  frameworkDefinitions: FrameworkDefinition[],
+async function loadFrameworkDatabase(
   config: FrameworkScannerConfig
-): Promise<FrameworkInfo[]> {
-  const detectedFrameworks: FrameworkInfo[] = [];
+): Promise<FrameworkDatabase> {
+  // In a real implementation, this would load from a file or API
+  // For this example, we'll return a small hardcoded database
   
-  // For each framework definition, check if it's used in the project
-  for (const definition of frameworkDefinitions) {
-    try {
-      // First check if any of the file patterns exist
-      const matchingFiles: string[] = [];
-      
-      for (const pattern of definition.detectionPatterns.filePatterns) {
-        const foundFiles = await globFiles(path.join(config.rootDirectory, '**', pattern));
-        matchingFiles.push(...foundFiles);
-      }
-      
-      if (matchingFiles.length === 0) {
-        continue; // No matching files found, skip to next framework
-      }
-      
-      // Check content patterns if defined
-      let contentMatched = !definition.detectionPatterns.contentPatterns || 
-        definition.detectionPatterns.contentPatterns.length === 0;
-      
-      if (!contentMatched) {
-        for (const filePath of matchingFiles) {
-          const content = fs.readFileSync(filePath, 'utf8');
-          
-          if (definition.detectionPatterns.contentPatterns!.some(pattern => 
-              content.includes(pattern) || new RegExp(pattern).test(content))) {
-            contentMatched = true;
-            break;
+  return {
+    frameworks: {
+      'react': {
+        name: 'React',
+        category: 'frontend',
+        type: 'js-framework',
+        filePatterns: ['**/package.json', '**/node_modules/react/package.json'],
+        versionDetectionRegexes: [
+          {
+            filePattern: '**/package.json',
+            regex: '"react"\s*:\s*"([^"]+)"',
+            versionGroup: 1
           }
-        }
-      }
-      
-      if (!contentMatched) {
-        continue; // Content patterns didn't match, skip to next framework
-      }
-      
-      // Check package patterns if defined
-      let packageMatched = !definition.detectionPatterns.packagePatterns || 
-        definition.detectionPatterns.packagePatterns.length === 0;
-      
-      if (!packageMatched) {
-        const packageJsonFiles = matchingFiles.filter(file => path.basename(file) === 'package.json');
-        
-        for (const packagePath of packageJsonFiles) {
-          try {
-            const packageContent = fs.readFileSync(packagePath, 'utf8');
-            const packageJson = JSON.parse(packageContent);
-            
-            const dependencies = {
-              ...packageJson.dependencies,
-              ...packageJson.devDependencies
-            };
-            
-            if (definition.detectionPatterns.packagePatterns!.some(pattern => 
-                Object.keys(dependencies).includes(pattern) || 
-                Object.keys(dependencies).some(dep => dep.includes(pattern)))) {
-              packageMatched = true;
-              break;
-            }
-          } catch (packageError) {
-            log.warn(`Error parsing package.json at ${packagePath}`, { error: packageError });
+        ],
+        packageJsonDependencies: ['react'],
+        latestVersion: '18.2.0',
+        versionInfoUrl: 'https://reactjs.org/versions',
+        migrationGuideUrl: 'https://reactjs.org/blog/2022/03/08/react-18-upgrade-guide.html'
+      },
+      'angular': {
+        name: 'Angular',
+        category: 'frontend',
+        type: 'js-framework',
+        filePatterns: ['**/package.json', '**/angular.json'],
+        versionDetectionRegexes: [
+          {
+            filePattern: '**/package.json',
+            regex: '"@angular/core"\s*:\s*"([^"]+)"',
+            versionGroup: 1
           }
+        ],
+        packageJsonDependencies: ['@angular/core'],
+        latestVersion: '17.0.0',
+        versionInfoUrl: 'https://angular.io/guide/versions',
+        migrationGuideUrl: 'https://update.angular.io/'
+      },
+      'vue': {
+        name: 'Vue.js',
+        category: 'frontend',
+        type: 'js-framework',
+        filePatterns: ['**/package.json'],
+        versionDetectionRegexes: [
+          {
+            filePattern: '**/package.json',
+            regex: '"vue"\s*:\s*"([^"]+)"',
+            versionGroup: 1
+          }
+        ],
+        packageJsonDependencies: ['vue'],
+        latestVersion: '3.3.4',
+        versionInfoUrl: 'https://github.com/vuejs/vue/releases',
+        migrationGuideUrl: 'https://v3-migration.vuejs.org/'
+      },
+      'django': {
+        name: 'Django',
+        category: 'backend',
+        type: 'python-framework',
+        filePatterns: ['**/requirements.txt', '**/requirements/*.txt', '**/setup.py', '**/pyproject.toml'],
+        versionDetectionRegexes: [
+          {
+            filePattern: '**/requirements.txt',
+            regex: 'django==([\d.]+)',
+            versionGroup: 1
+          },
+          {
+            filePattern: '**/setup.py',
+            regex: 'django[>=~]=([\d.]+)',
+            versionGroup: 1
+          }
+        ],
+        requirementsTxtDependencies: ['django'],
+        latestVersion: '4.2.7',
+        versionInfoUrl: 'https://www.djangoproject.com/download/',
+        migrationGuideUrl: 'https://docs.djangoproject.com/en/4.2/howto/upgrade-version/'
+      },
+      'node': {
+        name: 'Node.js',
+        category: 'backend',
+        type: 'js-runtime',
+        filePatterns: ['**/package.json', '**/.nvmrc', '**/.node-version'],
+        versionDetectionRegexes: [
+          {
+            filePattern: '**/.nvmrc',
+            regex: '([\d.]+)',
+            versionGroup: 1
+          },
+          {
+            filePattern: '**/.node-version',
+            regex: '([\d.]+)',
+            versionGroup: 1
+          },
+          {
+            filePattern: '**/package.json',
+            regex: '"node"\s*:\s*"([^"]+)"',
+            versionGroup: 1
+          }
+        ],
+        latestVersion: '20.5.0',
+        versionInfoUrl: 'https://nodejs.org/en/download/releases/'
+      },
+      'express': {
+        name: 'Express',
+        category: 'backend',
+        type: 'js-framework',
+        filePatterns: ['**/package.json'],
+        versionDetectionRegexes: [
+          {
+            filePattern: '**/package.json',
+            regex: '"express"\s*:\s*"([^"]+)"',
+            versionGroup: 1
+          }
+        ],
+        packageJsonDependencies: ['express'],
+        latestVersion: '4.18.2',
+        versionInfoUrl: 'https://expressjs.com/'
+      }
+    },
+    vulnerabilities: {
+      'react': [
+        {
+          frameworkName: 'React',
+          affectedVersions: '<16.5.0',
+          patchedVersions: '>=16.5.0',
+          cveId: 'CVE-2018-6341',
+          title: 'React XSS vulnerability through attributes',
+          description: 'A vulnerability in React DOM allowed passing malicious attributes through to HTML elements.',
+          cvssScore: 7.2,
+          severity: 'high',
+          infoUrl: 'https://github.com/facebook/react/releases/tag/v16.5.0',
+          publishedDate: new Date('2018-08-01'),
+          recommendation: 'Upgrade to React 16.5.0 or newer'
         }
+      ],
+      'django': [
+        {
+          frameworkName: 'Django',
+          affectedVersions: '<3.2.16',
+          patchedVersions: '>=3.2.16',
+          cveId: 'CVE-2022-41323',
+          title: 'Potential denial-of-service vulnerability in internationalized URLs',
+          description: 'A vulnerability in Django could allow an attacker to cause an infinite loop in certain URL processing.',
+          cvssScore: 7.5,
+          severity: 'high',
+          infoUrl: 'https://www.djangoproject.com/weblog/2022/oct/04/security-releases/',
+          publishedDate: new Date('2022-10-04'),
+          recommendation: 'Upgrade to Django 3.2.16, 4.0.8, or 4.1.2 or newer'
+        }
+      ]
+    },
+    lifecycleInfo: {
+      'django': {
+        frameworkName: 'Django',
+        endOfLifeDate: new Date('2025-04-01'),
+        endOfSupportDate: new Date('2024-04-01'),
+        isDeprecated: false,
+        migrationDifficulty: 3,
+        infoUrl: 'https://www.djangoproject.com/download/#supported-versions'
+      },
+      'node': {
+        frameworkName: 'Node.js',
+        endOfLifeDate: new Date('2023-09-30'),
+        endOfSupportDate: new Date('2023-06-01'),
+        isDeprecated: false,
+        migrationDifficulty: 2,
+        infoUrl: 'https://nodejs.org/en/about/releases/'
+      },
+      'angular.js': {
+        frameworkName: 'AngularJS',
+        endOfLifeDate: new Date('2022-01-01'),
+        endOfSupportDate: new Date('2021-12-31'),
+        isDeprecated: true,
+        deprecatedDate: new Date('2021-12-31'),
+        recommendedAlternative: 'Angular (Angular 2+)',
+        migrationDifficulty: 4,
+        infoUrl: 'https://blog.angular.io/discontinued-long-term-support-for-angularjs-1-67a8c73710e1'
       }
-      
-      if (!packageMatched) {
-        continue; // Package patterns didn't match, skip to next framework
-      }
-      
-      // If we got here, the framework is detected - now get its version
-      const version = await detectFrameworkVersion(definition, matchingFiles, config);
-      
-      if (version) {
-        detectedFrameworks.push({
-          name: definition.name,
-          category: definition.category,
-          type: definition.type,
-          version,
-          detectedAt: matchingFiles[0] // Use the first matching file as the detection point
-        });
-      }
-    } catch (detectionError) {
-      log.warn(`Error detecting framework ${definition.name}`, { error: detectionError });
-    }
-  }
-  
-  return detectedFrameworks;
+    },
+    lastUpdated: new Date()
+  };
 }
 
 /**
- * Find files matching a glob pattern
+ * Result of framework version detection
  */
-async function globFiles(pattern: string): Promise<string[]> {
-  // Using a dynamic import for glob as it's an ESM module in newer versions
-  const { glob } = await import('glob');
-  return glob(pattern);
+interface DetectedFrameworkVersion {
+  version: string;
+  location: string;
 }
 
 /**
- * Detect the version of a framework
+ * Detect framework versions in the project
  */
 async function detectFrameworkVersion(
-  definition: FrameworkDefinition,
-  matchingFiles: string[],
-  config: FrameworkScannerConfig
-): Promise<string | null> {
-  try {
-    // Check if there are custom version locations defined
-    if (config.customVersionLocations && config.customVersionLocations[definition.name]) {
-      for (const versionPath of config.customVersionLocations[definition.name]) {
-        if (fs.existsSync(versionPath)) {
-          const content = fs.readFileSync(versionPath, 'utf8');
-          // Try to extract version with a simple regex - this would need to be improved
-          const versionMatch = content.match(/(version|Version)\s*[=:]\s*[\'"](\d+\.\d+\.\d+)[\'"]/i);
-          if (versionMatch && versionMatch[2]) {
-            return versionMatch[2];
+  rootDirectory: string,
+  framework: FrameworkDetectionRule
+): Promise<DetectedFrameworkVersion[]> {
+  const results: DetectedFrameworkVersion[] = [];
+  
+  // Process each file pattern
+  for (const pattern of framework.filePatterns) {
+    try {
+      // Build the full pattern with the root directory
+      const fullPattern = path.join(rootDirectory, pattern);
+      
+      // Get ignore patterns
+      const ignorePatterns = framework.ignorePatterns?.map(p => path.join(rootDirectory, p)) || [];
+      
+      // Find matching files
+      const files = await glob(fullPattern, {
+        ignore: [...ignorePatterns, '**/node_modules/**'],
+        nodir: true
+      });
+      
+      // Process each file
+      for (const file of files) {
+        try {
+          // Read file content
+          const content = await readFileAsync(file, 'utf8');
+          
+          // Look for version using regex
+          for (const versionRule of framework.versionDetectionRegexes) {
+            try {
+              // Check if this rule applies to this file
+              const filePatternRegex = new RegExp(versionRule.filePattern.replace(/\*\*/g, '.*'));
+              if (!filePatternRegex.test(file)) {
+                continue;
+              }
+              
+              // Apply regex to extract version
+              const versionRegex = new RegExp(versionRule.regex, 'i');
+              const match = content.match(versionRegex);
+              
+              if (match && match[versionRule.versionGroup]) {
+                const version = match[versionRule.versionGroup].trim();
+                
+                results.push({
+                  version,
+                  location: file
+                });
+                
+                // Break after first successful detection for this file
+                break;
+              }
+            } catch (ruleError) {
+              log.warn(`Error applying version detection rule for ${framework.name}`, { error: ruleError });
+            }
           }
+          
+          // Special case for package.json dependencies
+          if (path.basename(file) === 'package.json' && framework.packageJsonDependencies) {
+            try {
+              const packageJson = JSON.parse(content);
+              
+              // Check dependencies
+              for (const dep of framework.packageJsonDependencies) {
+                if (packageJson.dependencies && packageJson.dependencies[dep]) {
+                  const version = packageJson.dependencies[dep].replace(/^[^\d]+/, '');
+                  
+                  results.push({
+                    version,
+                    location: file
+                  });
+                }
+                
+                // Also check devDependencies
+                if (packageJson.devDependencies && packageJson.devDependencies[dep]) {
+                  const version = packageJson.devDependencies[dep].replace(/^[^\d]+/, '');
+                  
+                  results.push({
+                    version,
+                    location: file
+                  });
+                }
+              }
+            } catch (jsonError) {
+              log.warn(`Error parsing package.json at ${file}`, { error: jsonError });
+            }
+          }
+        } catch (fileError) {
+          log.warn(`Error reading file ${file}`, { error: fileError });
         }
       }
-    }
-    
-    // Use the framework's version detection strategy
-    switch (definition.versionDetection.strategy) {
-      case 'package':
-        return detectVersionFromPackage(
-          definition.versionDetection.details.packageName,
-          matchingFiles
-        );
-        
-      case 'command':
-        return detectVersionFromCommand(
-          definition.versionDetection.details.command,
-          config.apiTimeoutMs
-        );
-        
-      case 'file':
-        return detectVersionFromFile(
-          definition.versionDetection.details.filePath,
-          definition.versionDetection.details.regex
-        );
-        
-      case 'content':
-        return detectVersionFromContent(
-          definition.versionDetection.details.filePattern,
-          definition.versionDetection.details.regex,
-          matchingFiles
-        );
-        
-      // Add other strategies as needed
-        
-      default:
-        log.warn(`Unsupported version detection strategy: ${definition.versionDetection.strategy}`);
-        return null;
-    }
-  } catch (error) {
-    log.warn(`Error detecting version for ${definition.name}`, { error });
-    return null;
-  }
-}
-
-/**
- * Detect version from package.json dependencies
- */
-async function detectVersionFromPackage(
-  packageName: string,
-  matchingFiles: string[]
-): Promise<string | null> {
-  const packageJsonFiles = matchingFiles.filter(file => path.basename(file) === 'package.json');
-  
-  for (const packagePath of packageJsonFiles) {
-    try {
-      const packageContent = fs.readFileSync(packagePath, 'utf8');
-      const packageJson = JSON.parse(packageContent);
-      
-      const dependencies = {
-        ...packageJson.dependencies,
-        ...packageJson.devDependencies
-      };
-      
-      if (dependencies[packageName]) {
-        // Clean the version (remove ^, ~, etc.)
-        return dependencies[packageName].replace(/^[^\d]+/, '');
-      }
-    } catch (packageError) {
-      log.warn(`Error parsing package.json at ${packagePath}`, { error: packageError });
+    } catch (patternError) {
+      log.warn(`Error processing file pattern ${pattern}`, { error: patternError });
     }
   }
   
-  return null;
+  return results;
 }
 
 /**
- * Detect version by executing a command
- */
-async function detectVersionFromCommand(
-  command: string,
-  timeoutMs: number
-): Promise<string | null> {
-  try {
-    const { stdout } = await execAsync(command, { timeout: timeoutMs });
-    
-    // Try to extract version with a regex
-    const versionMatch = stdout.match(/(\d+\.\d+\.\d+)/);
-    if (versionMatch && versionMatch[1]) {
-      return versionMatch[1];
-    }
-    
-    return null;
-  } catch (commandError) {
-    log.warn(`Error executing command: ${command}`, { error: commandError });
-    return null;
-  }
-}
-
-/**
- * Detect version from a specific file
- */
-async function detectVersionFromFile(
-  filePath: string,
-  regexPattern: string
-): Promise<string | null> {
-  try {
-    if (fs.existsSync(filePath)) {
-      const content = fs.readFileSync(filePath, 'utf8');
-      const regex = new RegExp(regexPattern);
-      const match = content.match(regex);
-      
-      if (match && match[1]) {
-        return match[1];
-      }
-    }
-    
-    return null;
-  } catch (fileError) {
-    log.warn(`Error reading file: ${filePath}`, { error: fileError });
-    return null;
-  }
-}
-
-/**
- * Detect version from file content
- */
-async function detectVersionFromContent(
-  filePattern: string,
-  regexPattern: string,
-  matchingFiles: string[]
-): Promise<string | null> {
-  const relevantFiles = matchingFiles.filter(file => 
-    filePattern === '*' || path.basename(file) === filePattern);
-  
-  for (const filePath of relevantFiles) {
-    try {
-      const content = fs.readFileSync(filePath, 'utf8');
-      const regex = new RegExp(regexPattern);
-      const match = content.match(regex);
-      
-      if (match && match[1]) {
-        return match[1];
-      }
-    } catch (contentError) {
-      log.warn(`Error reading file: ${filePath}`, { error: contentError });
-    }
-  }
-  
-  return null;
-}
-
-/**
- * Get the latest version of a framework
- */
-async function getLatestFrameworkVersion(
-  frameworkName: string,
-  frameworkType: string
-): Promise<string | null> {
-  // In a real implementation, this would query the appropriate sources
-  // For this example, we'll return mock data
-  switch (frameworkName) {
-    case 'React':
-      return '18.2.0';
-    case 'Angular':
-      return '16.0.0';
-    case 'Vue.js':
-      return '3.3.4';
-    case 'Express.js':
-      return '4.18.2';
-    case 'Django':
-      return '4.2.0';
-    case 'Spring Boot':
-      return '3.1.0';
-    case 'MongoDB':
-      return '6.0.0';
-    default:
-      return null;
-  }
-}
-
-/**
- * Get framework end-of-life information
- */
-async function getFrameworkEOLInfo(
-  frameworkName: string,
-  version: string,
-  frameworkType: string
-): Promise<{ endOfLifeDate?: Date; endOfSupportDate?: Date }> {
-  // In a real implementation, this would query appropriate sources
-  // For this example, we'll return mock data
-  const today = new Date();
-  const sixMonthsAhead = new Date(today);
-  sixMonthsAhead.setMonth(today.getMonth() + 6);
-  
-  const oneYearAhead = new Date(today);
-  oneYearAhead.setFullYear(today.getFullYear() + 1);
-  
-  const sixMonthsAgo = new Date(today);
-  sixMonthsAgo.setMonth(today.getMonth() - 6);
-  
-  switch (frameworkName) {
-    case 'Angular':
-      // Old versions are considered EOL
-      if (version.startsWith('7.') || version.startsWith('8.')) {
-        return {
-          endOfLifeDate: sixMonthsAgo,
-          endOfSupportDate: sixMonthsAgo
-        };
-      }
-      break;
-    case 'Django':
-      // Old versions have approaching EOL
-      if (version.startsWith('2.')) {
-        return {
-          endOfLifeDate: sixMonthsAhead,
-          endOfSupportDate: sixMonthsAhead
-        };
-      }
-      break;
-  }
-  
-  // Default - no EOL dates
-  return {};
-}
-
-/**
- * Get framework vulnerabilities
+ * Get vulnerabilities for a framework version
  */
 async function getFrameworkVulnerabilities(
   frameworkName: string,
   version: string,
-  frameworkType: string
+  vulnerabilityDatabase: Record<string, FrameworkVulnerability[]>
 ): Promise<VulnerabilityInfo[]> {
-  // In a real implementation, this would query security advisories
-  // For this example, we'll return mock data for one framework
-  if (frameworkName === 'Spring Boot' && version.startsWith('2.')) {
-    return [{
-      id: 'CVE-2022-22965',
-      cvssScore: 9.8,
-      severity: 'critical',
-      title: 'Spring Framework RCE via Data Binding',
-      description: 'A Spring MVC or Spring WebFlux application running on JDK 9+ may be vulnerable to remote code execution (RCE) via data binding.',
-      infoUrl: 'https://spring.io/blog/2022/03/31/spring-framework-rce-early-announcement',
-      publishedDate: new Date('2022-03-31'),
-      affectedVersions: '2.5.11+, 2.6.0-2.6.5',
-      patchedVersions: '2.5.12+, 2.6.6+',
-      recommendation: 'Upgrade to Spring Boot 2.6.6 or 2.5.12'
-    }];
+  try {
+    // Get vulnerabilities for this framework
+    const frameworkVulnerabilities = vulnerabilityDatabase[frameworkName] || [];
+    
+    // Filter to those affecting this version
+    const affectingVulnerabilities = frameworkVulnerabilities.filter(v => {
+      // Check if this version is in the affected range
+      // In a real implementation, this would use proper semver range checking
+      return v.affectedVersions.includes(version) || 
+             (v.affectedVersions.includes('<') && compareVersions(version, v.affectedVersions.replace('<', '')) < 0);
+    });
+    
+    // Map to VulnerabilityInfo format
+    return affectingVulnerabilities.map(v => ({
+      id: v.cveId || `${frameworkName}-${v.title.replace(/\s+/g, '-').toLowerCase()}`,
+      severity: v.severity,
+      cvssScore: v.cvssScore,
+      title: v.title,
+      description: v.description,
+      infoUrl: v.infoUrl,
+      publishedDate: v.publishedDate,
+      affectedVersions: v.affectedVersions,
+      patchedVersions: v.patchedVersions,
+      recommendation: v.recommendation
+    }));
+  } catch (error) {
+    log.warn(`Error getting vulnerabilities for ${frameworkName} ${version}`, { error });
+    return [];
   }
-  
-  return [];
 }
 
 /**
- * Get framework migration path information
- */
-async function getFrameworkMigrationPath(
-  frameworkName: string,
-  currentVersion: string,
-  targetVersion: string
-): Promise<string | undefined> {
-  // In a real implementation, this would provide actual migration guides
-  // For this example, we'll return mock data
-  switch (frameworkName) {
-    case 'Angular':
-      return `https://update.angular.io/?v=${currentVersion}-${targetVersion}`;
-    case 'React':
-      return 'https://reactjs.org/blog/2022/03/08/react-18-upgrade-guide.html';
-    case 'Vue.js':
-      if (currentVersion.startsWith('2.') && targetVersion.startsWith('3.')) {
-        return 'https://v3.vuejs.org/guide/migration/introduction.html';
-      }
-      break;
-    case 'Django':
-      return `https://docs.djangoproject.com/en/${targetVersion.split('.')[0]}.${targetVersion.split('.')[1]}/howto/upgrade-version/`;
-  }
-  
-  return undefined;
-}
-
-/**
- * Estimate the effort required to migrate a framework
+ * Estimate migration effort based on framework and its state
  */
 function estimateMigrationEffort(
   frameworkName: string,
-  currentVersion: string,
-  targetVersion: string
-): number {
-  // Effort on a scale of 1-5
-  // 1: Simple dependency update, minimal code changes
-  // 2: Some code changes but straightforward
-  // 3: Moderate refactoring needed
-  // 4: Significant refactoring needed
-  // 5: Major rewrite or architectural changes
-  
-  // Major version upgrades typically require more effort
-  const currentMajor = parseInt(currentVersion.split('.')[0], 10);
-  const targetMajor = parseInt(targetVersion.split('.')[0], 10);
-  
-  if (isNaN(currentMajor) || isNaN(targetMajor)) {
-    return 3; // Default to moderate if version parsing fails
-  }
-  
-  const majorVersionJump = targetMajor - currentMajor;
-  
-  if (majorVersionJump === 0) {
-    return 1; // Minor or patch version upgrade
-  }
-  
-  if (majorVersionJump === 1) {
-    // One major version jump
-    switch (frameworkName) {
-      case 'Angular': return 4; // Angular major upgrades are significant
-      case 'React': return 2; // React typically maintains better backward compatibility
-      case 'Vue.js': return 3; // Vue 2 to 3 had breaking changes
-      case 'Django': return 2; // Django has good upgrade paths
-      case 'Spring Boot': return 3;
-      default: return 2;
-    }
-  }
-  
-  if (majorVersionJump > 1) {
-    // Multiple major version jumps
-    switch (frameworkName) {
-      case 'Angular': return 5; // Multiple Angular major upgrades are very difficult
-      case 'React': return 3; // Multiple React versions still manageable
-      case 'Vue.js': return 4; // Multiple Vue versions more challenging
-      case 'Django': return 3; // Multiple Django versions require attention
-      case 'Spring Boot': return 4;
-      default: return 3;
-    }
-  }
-  
-  return 3; // Default to moderate
-}
-
-/**
- * Estimate the business impact of not updating a framework
- */
-function estimateBusinessImpact(
-  frameworkName: string,
   isOutdated: boolean,
-  hasVulnerabilities: boolean,
-  endOfLifeDate?: Date
+  isDeprecated: boolean,
+  hasVulnerabilities: boolean
 ): number {
-  // Business impact on a scale of 1-5
-  // 1: Minimal impact
-  // 2: Minor impact
-  // 3: Moderate impact
-  // 4: Significant impact
-  // 5: Critical business impact
+  // Start with a base effort level
+  let effort = 2;
   
-  let score = 1;
+  // Adjust based on conditions
+  if (isDeprecated) effort += 2;
+  if (isOutdated) effort += 1;
+  if (hasVulnerabilities) effort += 1;
   
-  // Frameworks that have reached end of life
-  if (endOfLifeDate && endOfLifeDate < new Date()) {
-    score += 2;
-  }
-  
-  // Frameworks approaching end of life (within 6 months)
-  if (endOfLifeDate) {
-    const sixMonthsLater = new Date();
-    sixMonthsLater.setMonth(sixMonthsLater.getMonth() + 6);
-    
-    if (endOfLifeDate < sixMonthsLater) {
-      score += 1;
-    }
-  }
-  
-  // Security vulnerabilities are a significant business risk
-  if (hasVulnerabilities) {
-    score += 2;
-  }
-  
-  // Simply being outdated is a moderate risk
-  if (isOutdated) {
-    score += 1;
-  }
-  
-  // Adjust based on framework type
-  switch (frameworkName) {
-    // Critical backend frameworks have higher business impact
-    case 'Spring Boot':
-    case 'Django':
-    case 'Express.js':
-      score += 1;
-      break;
-      
-    // Database technologies can have significant impact on business
-    case 'MongoDB':
-    case 'MySQL':
-    case 'PostgreSQL':
-      score += 1;
-      break;
+  // Adjust based on known difficult migrations
+  const highEffortFrameworks = ['angular.js', 'spring', 'django', 'ruby-on-rails'];
+  if (highEffortFrameworks.some(f => frameworkName.toLowerCase().includes(f))) {
+    effort += 1;
   }
   
   // Cap at 5
-  return Math.min(5, score);
+  return Math.min(5, effort);
 }
 
 /**
- * Estimate the security impact of not updating a framework
+ * Convert severity to a numeric security impact score
  */
-function estimateSecurityImpact(
-  frameworkName: string,
-  vulnerabilities: VulnerabilityInfo[],
-  endOfLifeDate?: Date
-): number {
-  // Security impact on a scale of 1-5
-  // 1: Minimal security impact
-  // 2: Minor security concerns
-  // 3: Moderate security risks
-  // 4: Significant security risks
-  // 5: Critical security implications
-  
-  let score = 1;
-  
-  // End of life frameworks pose security risks
-  if (endOfLifeDate && endOfLifeDate < new Date()) {
-    score += 2;
+function securityImpactFromSeverity(severity: 'low' | 'medium' | 'high' | 'critical'): number {
+  switch (severity) {
+    case 'critical': return 5;
+    case 'high': return 4;
+    case 'medium': return 3;
+    case 'low': return 2;
+    default: return 1;
   }
-  
-  // Score based on vulnerability severity
-  if (vulnerabilities.length > 0) {
-    let hasCritical = false;
-    let hasHigh = false;
-    let hasMedium = false;
-    
-    for (const vuln of vulnerabilities) {
-      if (vuln.severity === 'critical') hasCritical = true;
-      else if (vuln.severity === 'high') hasHigh = true;
-      else if (vuln.severity === 'medium') hasMedium = true;
-    }
-    
-    if (hasCritical) score += 3;
-    else if (hasHigh) score += 2;
-    else if (hasMedium) score += 1;
-    
-    // Multiple vulnerabilities increase the risk
-    if (vulnerabilities.length > 5) score += 1;
-  }
-  
-  // Certain frameworks have higher security impact when outdated
-  switch (frameworkName) {
-    // Security-critical frameworks
-    case 'Spring Security':
-    case 'Django':
-    case 'Express.js':
-      score += 1;
-      break;
-  }
-  
-  // Cap at 5
-  return Math.min(5, score);
 }
