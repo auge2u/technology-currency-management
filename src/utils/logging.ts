@@ -1,96 +1,187 @@
-import winston from 'winston';
-import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
-import { WinstonTransport } from '@opentelemetry/instrumentation-winston';
-import { trace, context, SpanStatusCode } from '@opentelemetry/api';
-import config from '../config';
+/**
+ * Logging utility for the technology currency management system
+ */
 
-// Create custom format for console output
-const consoleFormat = winston.format.combine(
-  winston.format.timestamp(),
-  winston.format.colorize(),
-  winston.format.printf(({ level, message, timestamp, ...meta }) => {
-    return `${timestamp} ${level}: ${message} ${Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ''}`;
-  })
-);
-
-// Create OpenTelemetry-compatible format for structured logging
-const otelFormat = winston.format.combine(
-  winston.format.timestamp(),
-  winston.format.json()
-);
-
-// Create Winston logger
-const logger = winston.createLogger({
-  level: config.logging.level || 'info',
-  defaultMeta: {
-    service: 'tcms',
-    environment: config.environment
-  },
-  transports: [
-    new winston.transports.Console({
-      format: config.environment === 'production' ? otelFormat : consoleFormat
-    })
-  ]
-});
-
-// Add additional transports based on environment
-if (config.environment === 'production') {
-  // Add OpenTelemetry transport
-  logger.add(new WinstonTransport());
-  
-  // Add file transport for error logs
-  logger.add(
-    new winston.transports.File({
-      filename: 'logs/error.log',
-      level: 'error',
-      format: otelFormat
-    })
-  );
+// Log levels
+export enum LogLevel {
+  DEBUG = 0,
+  INFO = 1,
+  WARN = 2,
+  ERROR = 3,
+  SILENT = 4
 }
 
-// Create wrapper methods with trace context
-export const log = {
-  info: (message: string, meta = {}) => {
-    const span = trace.getActiveSpan();
-    if (span) {
-      Object.entries(meta).forEach(([key, value]) => {
-        span.setAttribute(`app.log.${key}`, String(value));
-      });
-    }
-    logger.info(message, meta);
-  },
-  
-  warn: (message: string, meta = {}) => {
-    const span = trace.getActiveSpan();
-    if (span) {
-      Object.entries(meta).forEach(([key, value]) => {
-        span.setAttribute(`app.log.${key}`, String(value));
-      });
-    }
-    logger.warn(message, meta);
-  },
-  
-  error: (message: string, meta = {}) => {
-    const span = trace.getActiveSpan();
-    if (span) {
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      Object.entries(meta).forEach(([key, value]) => {
-        span.setAttribute(`app.log.${key}`, String(value));
-      });
-      if (meta['error'] instanceof Error) {
-        span.recordException(meta['error'] as Error);
-      }
-    }
-    logger.error(message, meta);
-  },
-  
-  debug: (message: string, meta = {}) => {
-    const span = trace.getActiveSpan();
-    if (span) {
-      Object.entries(meta).forEach(([key, value]) => {
-        span.setAttribute(`app.log.${key}`, String(value));
-      });
-    }
-    logger.debug(message, meta);
-  }
+// Interface for log metadata
+interface LogMeta {
+  [key: string]: any;
+}
+
+/**
+ * Logger configuration options
+ */
+interface LoggerConfig {
+  // Minimum log level to display
+  minLevel: LogLevel;
+  // Whether to include timestamps in logs
+  showTimestamps: boolean;
+  // Whether to colorize console output
+  colorize: boolean;
+  // Whether to output logs to a file
+  logToFile: boolean;
+  // Path to log file (if logToFile is true)
+  logFilePath?: string;
+  // Format string for log output
+  format?: string;
+}
+
+/**
+ * Default configuration
+ */
+const defaultConfig: LoggerConfig = {
+  minLevel: LogLevel.INFO,
+  showTimestamps: true,
+  colorize: true,
+  logToFile: false
 };
+
+/**
+ * Main logger class
+ */
+class Logger {
+  private config: LoggerConfig;
+  
+  constructor(config: Partial<LoggerConfig> = {}) {
+    this.config = { ...defaultConfig, ...config };
+  }
+  
+  /**
+   * Update logger configuration
+   */
+  configure(config: Partial<LoggerConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+  
+  /**
+   * Log a debug message
+   */
+  debug(message: string, meta?: LogMeta): void {
+    this.log(LogLevel.DEBUG, message, meta);
+  }
+  
+  /**
+   * Log an info message
+   */
+  info(message: string, meta?: LogMeta): void {
+    this.log(LogLevel.INFO, message, meta);
+  }
+  
+  /**
+   * Log a warning message
+   */
+  warn(message: string, meta?: LogMeta): void {
+    this.log(LogLevel.WARN, message, meta);
+  }
+  
+  /**
+   * Log an error message
+   */
+  error(message: string, meta?: LogMeta): void {
+    this.log(LogLevel.ERROR, message, meta);
+  }
+  
+  /**
+   * Internal log method
+   */
+  private log(level: LogLevel, message: string, meta?: LogMeta): void {
+    // Skip if level is below minimum
+    if (level < this.config.minLevel) {
+      return;
+    }
+    
+    // Build log message
+    let logMessage = '';
+    
+    // Add timestamp if enabled
+    if (this.config.showTimestamps) {
+      logMessage += `[${new Date().toISOString()}] `;
+    }
+    
+    // Add log level
+    const levelNames = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
+    logMessage += `[${levelNames[level]}] `;
+    
+    // Add message
+    logMessage += message;
+    
+    // Add metadata if provided
+    if (meta) {
+      logMessage += ' ' + JSON.stringify(meta);
+    }
+    
+    // Output to console with appropriate color
+    if (this.config.colorize) {
+      this.colorizedConsoleLog(level, logMessage);
+    } else {
+      console.log(logMessage);
+    }
+    
+    // Output to file if enabled
+    if (this.config.logToFile && this.config.logFilePath) {
+      this.fileLog(logMessage);
+    }
+  }
+  
+  /**
+   * Output colorized log to console
+   */
+  private colorizedConsoleLog(level: LogLevel, message: string): void {
+    // ANSI color codes
+    const colors = {
+      reset: '\x1b[0m',
+      bright: '\x1b[1m',
+      dim: '\x1b[2m',
+      blue: '\x1b[34m',    // Debug
+      green: '\x1b[32m',   // Info
+      yellow: '\x1b[33m',  // Warn
+      red: '\x1b[31m'      // Error
+    };
+    
+    let color;
+    switch (level) {
+      case LogLevel.DEBUG:
+        color = colors.blue;
+        break;
+      case LogLevel.INFO:
+        color = colors.green;
+        break;
+      case LogLevel.WARN:
+        color = colors.yellow;
+        break;
+      case LogLevel.ERROR:
+        color = colors.red;
+        break;
+      default:
+        color = colors.reset;
+    }
+    
+    console.log(`${color}${message}${colors.reset}`);
+  }
+  
+  /**
+   * Output log to file
+   */
+  private fileLog(message: string): void {
+    // In a real implementation, this would append to the log file
+    // For example:
+    // const fs = require('fs');
+    // fs.appendFileSync(this.config.logFilePath, message + '\n');
+    
+    // For this mock implementation, we'll do nothing
+  }
+}
+
+// Create and export a default logger instance
+export const log = new Logger();
+
+// Export the Logger class for creating custom loggers
+export { Logger };
