@@ -2,44 +2,77 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import * as semver from 'semver';
-import axios from 'axios';
-import { OutdatedDependency } from '../types/scanning';
+import { DependencyIssue, VulnerabilityInfo } from '../types/scanning';
+import { compareVersions } from '../utils/scanner-utils';
 import { log } from '../utils/logging';
 
 const execAsync = promisify(exec);
 
 /**
- * Scanner to detect outdated dependencies across different package managers
+ * Configuration for dependency scanning
  */
-export async function scanDependencies(rootDir: string): Promise<OutdatedDependency[]> {
+export interface DependencyScannerConfig {
+  // Root directory to scan
+  rootDirectory: string;
+  
+  // Ecosystems to check
+  ecosystems: Array<'npm' | 'pip' | 'maven' | 'gradle' | 'nuget' | 'composer' | 'cargo' | 'go'>;
+  
+  // Whether to scan for transitive dependencies
+  checkTransitiveDependencies: boolean;
+  
+  // Whether to check for vulnerabilities
+  checkVulnerabilities: boolean;
+  
+  // Whether to scan dev dependencies
+  includeDevDependencies: boolean;
+  
+  // Security advisory sources to use
+  securityAdvisorySources: Array<'npm' | 'github' | 'snyk' | 'osv' | 'nvd'>;
+  
+  // Severity threshold (only report issues at or above this severity)
+  severityThreshold: 'low' | 'medium' | 'high' | 'critical';
+  
+  // Skip dependencies with specific names
+  ignoreDependencies?: string[];
+  
+  // Skip dependencies matching specific patterns
+  ignorePatterns?: string[];
+  
+  // Retry limit for external API calls
+  apiRetryLimit: number;
+  
+  // API timeout in milliseconds
+  apiTimeoutMs: number;
+}
+
+/**
+ * Scan project dependencies for outdated packages and vulnerabilities
+ */
+export async function scanDependencies(
+  config: DependencyScannerConfig
+): Promise<DependencyIssue[]> {
   try {
-    log.info(`Starting dependency scanning in ${rootDir}`);
+    log.info('Starting dependency scanner');
     
-    const results: OutdatedDependency[] = [];
+    const issues: DependencyIssue[] = [];
     
-    // Scan for different types of dependencies
-    const npmResults = await scanNpmDependencies(rootDir);
-    const pythonResults = await scanPythonDependencies(rootDir);
-    const javaResults = await scanJavaDependencies(rootDir);
-    const rubyResults = await scanRubyDependencies(rootDir);
-    const dotnetResults = await scanDotNetDependencies(rootDir);
-    const goResults = await scanGoDependencies(rootDir);
-    const rustResults = await scanRustDependencies(rootDir);
+    // Find all package manifests based on enabled ecosystems
+    const manifests = await findPackageManifests(config);
+    log.info(`Found ${manifests.length} dependency manifests to scan`);
     
-    results.push(
-      ...npmResults,
-      ...pythonResults,
-      ...javaResults,
-      ...rubyResults,
-      ...dotnetResults,
-      ...goResults,
-      ...rustResults
-    );
+    // Process each manifest file
+    for (const manifest of manifests) {
+      try {
+        const dependencyIssues = await scanManifest(manifest, config);
+        issues.push(...dependencyIssues);
+      } catch (manifestError) {
+        log.warn(`Error scanning manifest ${manifest.path}`, { error: manifestError });
+      }
+    }
     
-    log.info(`Dependency scanning completed. Found ${results.length} outdated dependencies`);
-    
-    return results;
+    log.info(`Completed dependency scanning. Found ${issues.length} issues`);
+    return issues;
   } catch (error) {
     log.error('Error during dependency scanning', { error });
     return [];
@@ -47,373 +80,631 @@ export async function scanDependencies(rootDir: string): Promise<OutdatedDepende
 }
 
 /**
- * Scan for outdated NPM dependencies
+ * Map of file patterns for each supported ecosystem
  */
-async function scanNpmDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  try {
-    log.info('Scanning NPM dependencies');
+const ECOSYSTEM_FILE_PATTERNS: Record<string, string[]> = {
+  npm: ['package.json'],
+  pip: ['requirements.txt', 'setup.py', 'Pipfile', 'pyproject.toml'],
+  maven: ['pom.xml'],
+  gradle: ['build.gradle', 'build.gradle.kts'],
+  nuget: ['*.csproj', '*.fsproj', 'packages.config'],
+  composer: ['composer.json'],
+  cargo: ['Cargo.toml'],
+  go: ['go.mod']
+};
+
+/**
+ * Information about a package manifest file
+ */
+interface ManifestInfo {
+  path: string;
+  ecosystem: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget' | 'composer' | 'cargo' | 'go';
+  dependencies: Map<string, string>;
+}
+
+/**
+ * Find all package manifest files in the project
+ */
+async function findPackageManifests(config: DependencyScannerConfig): Promise<ManifestInfo[]> {
+  const manifests: ManifestInfo[] = [];
+  
+  for (const ecosystem of config.ecosystems) {
+    const filePatterns = ECOSYSTEM_FILE_PATTERNS[ecosystem];
     
-    // Find all package.json files (excluding node_modules)
-    const { stdout } = await execAsync(`find ${rootDir} -name "package.json" -not -path "*/node_modules/*" -not -path "*/dist/*" -not -path "*/build/*"`);
-    const packageJsonFiles = stdout.trim().split('\n').filter(Boolean);
-    
-    if (packageJsonFiles.length === 0) {
-      log.info('No NPM projects found');
-      return [];
+    if (!filePatterns) {
+      log.warn(`Unknown ecosystem: ${ecosystem}`);
+      continue;
     }
     
-    const results: OutdatedDependency[] = [];
+    for (const pattern of filePatterns) {
+      const foundFiles = await globFiles(path.join(config.rootDirectory, '**', pattern));
+      
+      for (const filePath of foundFiles) {
+        try {
+          const dependencies = await parseDependencies(filePath, ecosystem, config.includeDevDependencies);
+          
+          if (dependencies.size > 0) {
+            manifests.push({
+              path: filePath,
+              ecosystem,
+              dependencies
+            });
+          }
+        } catch (parseError) {
+          log.warn(`Error parsing dependencies in ${filePath}`, { error: parseError });
+        }
+      }
+    }
+  }
+  
+  return manifests;
+}
+
+/**
+ * Find files matching a glob pattern
+ */
+async function globFiles(pattern: string): Promise<string[]> {
+  // Using a dynamic import for glob as it's an ESM module in newer versions
+  const { glob } = await import('glob');
+  return glob(pattern);
+}
+
+/**
+ * Parse dependencies from a manifest file
+ */
+async function parseDependencies(
+  filePath: string,
+  ecosystem: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget' | 'composer' | 'cargo' | 'go',
+  includeDevDependencies: boolean
+): Promise<Map<string, string>> {
+  const dependencies = new Map<string, string>();
+  
+  try {
+    const fileContent = fs.readFileSync(filePath, 'utf8');
     
-    for (const filePath of packageJsonFiles) {
-      try {
-        log.info(`Processing NPM dependencies in ${filePath}`);
-        const content = fs.readFileSync(filePath, 'utf8');
-        const packageJson = JSON.parse(content);
-        const projectName = packageJson.name || path.basename(path.dirname(filePath));
+    switch (ecosystem) {
+      case 'npm':
+        return parseNpmDependencies(fileContent, includeDevDependencies);
+      case 'pip':
+        return parsePipDependencies(fileContent, filePath);
+      case 'maven':
+        return parseMavenDependencies(fileContent);
+      case 'cargo':
+        return parseCargoDependencies(fileContent);
+      case 'composer':
+        return parseComposerDependencies(fileContent, includeDevDependencies);
+      case 'go':
+        return parseGoDependencies(fileContent);
+      // Add more parsers as needed
+      default:
+        log.warn(`No parser implemented for ecosystem: ${ecosystem}`);
+        return new Map();
+    }
+  } catch (error) {
+    log.warn(`Error reading or parsing ${filePath}`, { error });
+    return new Map();
+  }
+}
+
+/**
+ * Parse dependencies from package.json (npm/Node.js)
+ */
+function parseNpmDependencies(fileContent: string, includeDevDependencies: boolean): Map<string, string> {
+  const dependencies = new Map<string, string>();
+  
+  try {
+    const packageJson = JSON.parse(fileContent);
+    
+    // Regular dependencies
+    if (packageJson.dependencies) {
+      for (const [name, version] of Object.entries(packageJson.dependencies)) {
+        dependencies.set(name, version as string);
+      }
+    }
+    
+    // Dev dependencies if enabled
+    if (includeDevDependencies && packageJson.devDependencies) {
+      for (const [name, version] of Object.entries(packageJson.devDependencies)) {
+        dependencies.set(name, version as string);
+      }
+    }
+  } catch (error) {
+    log.warn('Error parsing package.json', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Parse dependencies from Python requirements files
+ */
+function parsePipDependencies(fileContent: string, filePath: string): Map<string, string> {
+  const dependencies = new Map<string, string>();
+  const fileName = path.basename(filePath);
+  
+  if (fileName === 'requirements.txt') {
+    // Parse requirements.txt format
+    const lines = fileContent.split('\n');
+    
+    for (const line of lines) {
+      // Skip comments and empty lines
+      const trimmedLine = line.trim();
+      if (trimmedLine === '' || trimmedLine.startsWith('#')) {
+        continue;
+      }
+      
+      // Handle different requirement formats
+      // e.g., package==1.0.0, package>=1.0.0, package~=1.0.0
+      const requirementMatch = trimmedLine.match(/^([a-zA-Z0-9\-_.]+)(\[.*\])?(\s*[=<>~!]=\s*|\s+)([a-zA-Z0-9\-_.]+)/);
+      
+      if (requirementMatch) {
+        const name = requirementMatch[1];
+        const version = requirementMatch[4];
+        dependencies.set(name, version);
+      }
+    }
+  } else if (fileName === 'Pipfile') {
+    // Simple parsing for Pipfile (would need a TOML parser for proper handling)
+    const lines = fileContent.split('\n');
+    let inPackagesSection = false;
+    
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      
+      if (trimmedLine === '[packages]') {
+        inPackagesSection = true;
+        continue;
+      } else if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+        inPackagesSection = false;
+        continue;
+      }
+      
+      if (inPackagesSection) {
+        const packageMatch = trimmedLine.match(/^([a-zA-Z0-9\-_.]+)\s*=\s*"([^"]+)"/);
+        if (packageMatch) {
+          const name = packageMatch[1];
+          const version = packageMatch[2].replace(/^\^|~|==|>=|<=/, '');
+          dependencies.set(name, version);
+        }
+      }
+    }
+  }
+  // Add support for setup.py and pyproject.toml as needed
+  
+  return dependencies;
+}
+
+/**
+ * Parse dependencies from Maven pom.xml
+ */
+function parseMavenDependencies(fileContent: string): Map<string, string> {
+  const dependencies = new Map<string, string>();
+  
+  // Simple regex-based parsing - for production use, a proper XML parser would be better
+  const dependencyRegex = /<dependency>\s*<groupId>([^<]+)<\/groupId>\s*<artifactId>([^<]+)<\/artifactId>\s*<version>([^<]+)<\/version>/g;
+  
+  let match;
+  while ((match = dependencyRegex.exec(fileContent)) !== null) {
+    const groupId = match[1].trim();
+    const artifactId = match[2].trim();
+    const version = match[3].trim();
+    
+    // Use a composite key for Maven dependencies
+    const dependencyKey = `${groupId}:${artifactId}`;
+    dependencies.set(dependencyKey, version);
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Parse dependencies from Cargo.toml (Rust)
+ */
+function parseCargoDependencies(fileContent: string): Map<string, string> {
+  const dependencies = new Map<string, string>();
+  
+  // Simple parsing for TOML - for production use, a proper TOML parser would be better
+  const lines = fileContent.split('\n');
+  let inDependenciesSection = false;
+  
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    
+    if (trimmedLine === '[dependencies]') {
+      inDependenciesSection = true;
+      continue;
+    } else if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+      inDependenciesSection = false;
+      continue;
+    }
+    
+    if (inDependenciesSection && trimmedLine !== '') {
+      // Simple key = "value" format
+      const simpleMatch = trimmedLine.match(/^([a-zA-Z0-9\-_]+)\s*=\s*"([^"]+)"/);
+      if (simpleMatch) {
+        const name = simpleMatch[1];
+        const version = simpleMatch[2];
+        dependencies.set(name, version);
+        continue;
+      }
+      
+      // Table format (dependency = { version = "1.0" })
+      const tableStartMatch = trimmedLine.match(/^([a-zA-Z0-9\-_]+)\s*=\s*\{/);
+      if (tableStartMatch) {
+        const name = tableStartMatch[1];
+        // Look for version in the next few lines
+        const versionMatch = line.match(/version\s*=\s*"([^"]+)"/);
+        if (versionMatch) {
+          dependencies.set(name, versionMatch[1]);
+        }
+      }
+    }
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Parse dependencies from composer.json (PHP)
+ */
+function parseComposerDependencies(fileContent: string, includeDevDependencies: boolean): Map<string, string> {
+  const dependencies = new Map<string, string>();
+  
+  try {
+    const composerJson = JSON.parse(fileContent);
+    
+    // Regular dependencies
+    if (composerJson.require) {
+      for (const [name, version] of Object.entries(composerJson.require)) {
+        // Skip php requirement itself
+        if (name !== 'php') {
+          dependencies.set(name, version as string);
+        }
+      }
+    }
+    
+    // Dev dependencies if enabled
+    if (includeDevDependencies && composerJson['require-dev']) {
+      for (const [name, version] of Object.entries(composerJson['require-dev'])) {
+        dependencies.set(name, version as string);
+      }
+    }
+  } catch (error) {
+    log.warn('Error parsing composer.json', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Parse dependencies from go.mod (Go)
+ */
+function parseGoDependencies(fileContent: string): Map<string, string> {
+  const dependencies = new Map<string, string>();
+  const lines = fileContent.split('\n');
+  let inRequireBlock = false;
+  
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    
+    if (trimmedLine === 'require (') {
+      inRequireBlock = true;
+      continue;
+    } else if (trimmedLine === ')') {
+      inRequireBlock = false;
+      continue;
+    } else if (trimmedLine.startsWith('require ')) {
+      // Single-line require
+      const match = trimmedLine.match(/require\s+([^\s]+)\s+([^\s]+)/);
+      if (match) {
+        dependencies.set(match[1], match[2]);
+      }
+      continue;
+    }
+    
+    if (inRequireBlock && trimmedLine !== '') {
+      const match = trimmedLine.match(/([^\s]+)\s+([^\s]+)/);
+      if (match) {
+        dependencies.set(match[1], match[2]);
+      }
+    }
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Scan a specific manifest file for dependency issues
+ */
+async function scanManifest(
+  manifest: ManifestInfo,
+  config: DependencyScannerConfig
+): Promise<DependencyIssue[]> {
+  const issues: DependencyIssue[] = [];
+  const { path: manifestPath, ecosystem, dependencies } = manifest;
+  
+  log.info(`Scanning ${ecosystem} dependencies in ${manifestPath}`);
+  
+  // Skip ignored dependencies
+  let filteredDependencies = dependencies;
+  if (config.ignoreDependencies && config.ignoreDependencies.length > 0) {
+    filteredDependencies = new Map(
+      [...dependencies].filter(([name]) => !config.ignoreDependencies!.includes(name))
+    );
+  }
+  
+  // Check for latest versions and vulnerabilities
+  for (const [name, currentVersion] of filteredDependencies.entries()) {
+    try {
+      // Skip dependencies matching ignore patterns
+      if (config.ignorePatterns && config.ignorePatterns.some(pattern => 
+        new RegExp(pattern).test(name)
+      )) {
+        continue;
+      }
+      
+      const latestVersion = await getLatestVersion(name, ecosystem, config);
+      
+      if (!latestVersion) {
+        continue; // Skip if we couldn't determine latest version
+      }
+      
+      const isOutdated = compareVersions(currentVersion, latestVersion) < 0;
+      
+      if (isOutdated) {
+        // Fetch vulnerability information if enabled
+        let vulnerabilities: VulnerabilityInfo[] = [];
         
-        const allDependencies = {
-          ...packageJson.dependencies,
-          ...packageJson.devDependencies
+        if (config.checkVulnerabilities) {
+          vulnerabilities = await getVulnerabilities(
+            name, 
+            currentVersion, 
+            ecosystem, 
+            config
+          );
+        }
+        
+        // Filter vulnerabilities by severity if needed
+        if (config.severityThreshold !== 'low') {
+          const severityLevels = { 'low': 0, 'medium': 1, 'high': 2, 'critical': 3 };
+          const threshold = severityLevels[config.severityThreshold];
+          
+          vulnerabilities = vulnerabilities.filter(vuln => {
+            return severityLevels[vuln.severity] >= threshold;
+          });
+        }
+        
+        // Create dependency issue
+        const issue: DependencyIssue = {
+          name,
+          currentVersion,
+          latestVersion,
+          isOutdated,
+          isDirect: true, // We're only scanning direct dependencies for now
+          ecosystem,
+          definitionFile: manifestPath,
+          vulnerabilities,
+          isDeprecated: await isDeprecated(name, ecosystem),
+          detectedAt: new Date(),
+          suggestedFix: generateUpgradeCommand(name, latestVersion, ecosystem, manifestPath)
         };
         
-        for (const [name, versionSpec] of Object.entries(allDependencies)) {
-          // Skip packages with non-standard version specs (like Git URLs)
-          if (typeof versionSpec !== 'string' || versionSpec.includes(':') || versionSpec.includes('/')) {
-            continue;
-          }
-          
-          // Clean up version string (remove ^, ~, etc.)
-          const currentVersion = versionSpec.replace(/^[\^~><=]/, '');
-          
-          try {
-            // Check if there's a newer version available
-            const latestVersion = await getLatestNpmVersion(name);
-            
-            if (latestVersion && semver.valid(currentVersion) && semver.valid(latestVersion)) {
-              // Calculate version difference
-              const diff = semver.diff(currentVersion, latestVersion);
-              const behind = getVersionsBehind(currentVersion, latestVersion);
-              
-              if (diff) {
-                const severity = getSeverityForVersionDiff(diff, behind);
-                
-                // Determine if we should notify based on version difference
-                const dependency: OutdatedDependency = {
-                  id: `npm-${name}-${projectName}`,
-                  name,
-                  packageManager: 'npm',
-                  currentVersion,
-                  latestVersion,
-                  versionsBehind: behind,
-                  releaseDate: null, // Would require additional API calls to get this
-                  severity,
-                  path: filePath,
-                  isDirectDependency: true,
-                  remediationSteps: `Update ${name} to version ${latestVersion} in ${path.basename(filePath)}`,
-                  detectedAt: new Date()
-                };
-                
-                results.push(dependency);
-              }
-            }
-          } catch (packageError) {
-            log.warn(`Error checking latest version for ${name}`, { error: packageError });
-          }
+        // Add deprecation message if applicable
+        if (issue.isDeprecated) {
+          issue.deprecationMessage = await getDeprecationMessage(name, ecosystem);
         }
-      } catch (fileError) {
-        log.warn(`Error processing ${filePath}`, { error: fileError });
-      }
-    }
-    
-    return results;
-  } catch (error) {
-    log.error('Error scanning NPM dependencies', { error });
-    return [];
-  }
-}
-
-/**
- * Get the latest version of an NPM package
- */
-async function getLatestNpmVersion(packageName: string): Promise<string | null> {
-  try {
-    const response = await axios.get(`https://registry.npmjs.org/${packageName}`);
-    return response.data['dist-tags']?.latest || null;
-  } catch (error) {
-    log.warn(`Failed to fetch latest version for ${packageName}`, { error });
-    return null;
-  }
-}
-
-/**
- * Calculate the difference between two semver versions
- */
-function getVersionsBehind(current: string, latest: string): {
-  major: number;
-  minor: number;
-  patch: number;
-} {
-  const currentParts = semver.parse(current);
-  const latestParts = semver.parse(latest);
-  
-  if (!currentParts || !latestParts) {
-    return { major: 0, minor: 0, patch: 0 };
-  }
-  
-  // Calculate versions behind for each segment
-  let majorBehind = Math.max(0, latestParts.major - currentParts.major);
-  let minorBehind = 0;
-  let patchBehind = 0;
-  
-  if (majorBehind === 0) {
-    minorBehind = Math.max(0, latestParts.minor - currentParts.minor);
-    
-    if (minorBehind === 0) {
-      patchBehind = Math.max(0, latestParts.patch - currentParts.patch);
-    }
-  }
-  
-  return {
-    major: majorBehind,
-    minor: minorBehind,
-    patch: patchBehind
-  };
-}
-
-/**
- * Determine severity based on version difference and count
- */
-function getSeverityForVersionDiff(
-  diff: string,
-  behind: { major: number; minor: number; patch: number }
-): 'low' | 'medium' | 'high' | 'critical' {
-  // Major version differences
-  if (diff === 'major') {
-    if (behind.major >= 3) return 'critical';
-    if (behind.major >= 2) return 'high';
-    return 'medium';
-  }
-  
-  // Minor version differences
-  if (diff === 'minor') {
-    if (behind.minor >= 10) return 'high';
-    if (behind.minor >= 5) return 'medium';
-    return 'low';
-  }
-  
-  // Patch version differences
-  if (diff === 'patch') {
-    if (behind.patch >= 20) return 'medium';
-    if (behind.patch >= 10) return 'low';
-    return 'low';
-  }
-  
-  // Default
-  return 'low';
-}
-
-/**
- * Scan for outdated Python dependencies
- */
-async function scanPythonDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  try {
-    log.info('Scanning Python dependencies');
-    
-    // Find all requirements.txt files
-    const { stdout: requirementsStdout } = await execAsync(`find ${rootDir} -name "requirements.txt" -not -path "*/venv/*" -not -path "*/.env/*"`);
-    const requirementsFiles = requirementsStdout.trim().split('\n').filter(Boolean);
-    
-    // Find all Pipfile files
-    const { stdout: pipfileStdout } = await execAsync(`find ${rootDir} -name "Pipfile" -not -path "*/venv/*" -not -path "*/.env/*"`);
-    const pipfileFiles = pipfileStdout.trim().split('\n').filter(Boolean);
-    
-    // Find all pyproject.toml files
-    const { stdout: pyprojectStdout } = await execAsync(`find ${rootDir} -name "pyproject.toml" -not -path "*/venv/*" -not -path "*/.env/*"`);
-    const pyprojectFiles = pyprojectStdout.trim().split('\n').filter(Boolean);
-    
-    if (requirementsFiles.length === 0 && pipfileFiles.length === 0 && pyprojectFiles.length === 0) {
-      log.info('No Python projects found');
-      return [];
-    }
-    
-    const results: OutdatedDependency[] = [];
-    
-    // Process requirements.txt files
-    for (const filePath of requirementsFiles) {
-      try {
-        log.info(`Processing Python dependencies in ${filePath}`);
-        const content = fs.readFileSync(filePath, 'utf8');
-        const lines = content.split('\n');
         
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('#') || !line.trim()) continue;
-          
-          // Parse package name and version
-          // This regex matches patterns like 'package==1.0.0', 'package>=1.0.0', etc.
-          const match = line.match(/^([\w-\.]+)(\s*[=<>!~]+\s*[\w\.]+)?/);
-          
-          if (match) {
-            const name = match[1];
-            let currentVersion = 'unknown';
-            
-            // Extract version if present
-            if (match[2]) {
-              const versionMatch = match[2].match(/[=<>!~]+\s*([\w\.]+)/);
-              if (versionMatch) {
-                currentVersion = versionMatch[1];
-              }
-            }
-            
-            // Skip packages without a specific version
-            if (currentVersion === 'unknown') {
-              continue;
-            }
-            
-            try {
-              // Check if there's a newer version available
-              const latestVersion = await getLatestPypiVersion(name);
-              
-              if (latestVersion && currentVersion !== 'unknown') {
-                // Try to parse as semver
-                const currentSemver = parsePythonVersionToSemver(currentVersion);
-                const latestSemver = parsePythonVersionToSemver(latestVersion);
-                
-                if (currentSemver && latestSemver && semver.lt(currentSemver, latestSemver)) {
-                  // Calculate version difference
-                  const diff = semver.diff(currentSemver, latestSemver);
-                  const behind = getVersionsBehind(currentSemver, latestSemver);
-                  
-                  if (diff) {
-                    const severity = getSeverityForVersionDiff(diff, behind);
-                    
-                    const dependency: OutdatedDependency = {
-                      id: `pip-${name}-${path.basename(path.dirname(filePath))}`,
-                      name,
-                      packageManager: 'pip',
-                      currentVersion,
-                      latestVersion,
-                      versionsBehind: behind,
-                      releaseDate: null,
-                      severity,
-                      path: filePath,
-                      isDirectDependency: true,
-                      remediationSteps: `Update ${name} to version ${latestVersion} in ${path.basename(filePath)}`,
-                      detectedAt: new Date()
-                    };
-                    
-                    results.push(dependency);
-                  }
-                }
-              }
-            } catch (packageError) {
-              log.warn(`Error checking latest version for Python package ${name}`, { error: packageError });
-            }
-          }
-        }
-      } catch (fileError) {
-        log.warn(`Error processing ${filePath}`, { error: fileError });
+        issues.push(issue);
       }
+    } catch (depError) {
+      log.warn(`Error checking dependency ${name}@${currentVersion}`, { error: depError });
     }
-    
-    // Process Pipfile and pyproject.toml files
-    // In a real implementation, we would parse these files and check for outdated dependencies
-    // For brevity, we'll skip the implementation details here
-    
-    return results;
-  } catch (error) {
-    log.error('Error scanning Python dependencies', { error });
-    return [];
   }
+  
+  return issues;
 }
 
 /**
- * Get the latest version of a PyPI package
+ * Get latest version for a package
  */
-async function getLatestPypiVersion(packageName: string): Promise<string | null> {
+async function getLatestVersion(
+  packageName: string,
+  ecosystem: string,
+  config: DependencyScannerConfig
+): Promise<string | null> {
   try {
-    const response = await axios.get(`https://pypi.org/pypi/${packageName}/json`);
-    return response.data.info.version || null;
+    switch (ecosystem) {
+      case 'npm':
+        return getLatestNpmVersion(packageName, config);
+      case 'pip':
+        return getLatestPipVersion(packageName, config);
+      case 'maven':
+        return getLatestMavenVersion(packageName, config);
+      // Add other ecosystems as needed
+      default:
+        log.warn(`No version checker implemented for ecosystem: ${ecosystem}`);
+        return null;
+    }
   } catch (error) {
-    log.warn(`Failed to fetch latest version for Python package ${packageName}`, { error });
+    log.warn(`Error getting latest version for ${packageName}`, { error });
     return null;
   }
 }
 
 /**
- * Parse Python version string to semver format
+ * Get latest npm package version
  */
-function parsePythonVersionToSemver(version: string): string | null {
-  // Handle simple versions like '1.0.0'
-  if (semver.valid(version)) {
-    return version;
+async function getLatestNpmVersion(
+  packageName: string,
+  config: DependencyScannerConfig
+): Promise<string | null> {
+  try {
+    const { stdout } = await execAsync(`npm view ${packageName} version`, {
+      timeout: config.apiTimeoutMs
+    });
+    return stdout.trim();
+  } catch (error) {
+    log.warn(`Error getting latest npm version for ${packageName}`, { error });
+    return null;
   }
-  
-  // Try to handle versions like '1.0', '1.0.0a1', etc.
-  const match = version.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[a-zA-Z]+\d*)?$/);
-  
-  if (match) {
-    const major = match[1] || '0';
-    const minor = match[2] || '0';
-    const patch = match[3] || '0';
+}
+
+/**
+ * Get latest Python package version
+ */
+async function getLatestPipVersion(
+  packageName: string,
+  config: DependencyScannerConfig
+): Promise<string | null> {
+  try {
+    const { stdout } = await execAsync(`pip index versions ${packageName} --pre=false`, {
+      timeout: config.apiTimeoutMs
+    });
     
-    // Construct a valid semver string
-    const semverVersion = `${major}.${minor}.${patch}`;
-    
-    if (semver.valid(semverVersion)) {
-      return semverVersion;
+    // Parse the output to get the latest version
+    const versionMatch = stdout.match(/Available versions: ([^\s,]+)/);
+    if (versionMatch && versionMatch[1]) {
+      return versionMatch[1];
     }
+    return null;
+  } catch (error) {
+    log.warn(`Error getting latest pip version for ${packageName}`, { error });
+    return null;
+  }
+}
+
+/**
+ * Get latest Maven package version
+ */
+async function getLatestMavenVersion(
+  packageName: string,
+  config: DependencyScannerConfig
+): Promise<string | null> {
+  // Maven packages use groupId:artifactId format
+  const [groupId, artifactId] = packageName.split(':');
+  
+  if (!groupId || !artifactId) {
+    log.warn(`Invalid Maven package name: ${packageName}`);
+    return null;
   }
   
-  return null;
+  try {
+    // Use Maven's metadata to get the latest version
+    // In a real implementation, this would parse the Maven Central XML response
+    // For simplicity, we're returning null here
+    return null;
+  } catch (error) {
+    log.warn(`Error getting latest Maven version for ${packageName}`, { error });
+    return null;
+  }
 }
 
 /**
- * Scan for outdated Java dependencies (Maven/Gradle)
+ * Check if a package is deprecated
  */
-async function scanJavaDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  // Implementation for scanning Java dependencies would go here
-  // This would involve parsing pom.xml or build.gradle files and
-  // comparing with latest versions from Maven Central
-  return [];
+async function isDeprecated(
+  packageName: string,
+  ecosystem: string
+): Promise<boolean> {
+  try {
+    switch (ecosystem) {
+      case 'npm':
+        return isNpmDeprecated(packageName);
+      // Add other ecosystems as needed
+      default:
+        return false;
+    }
+  } catch (error) {
+    log.warn(`Error checking deprecation status for ${packageName}`, { error });
+    return false;
+  }
 }
 
 /**
- * Scan for outdated Ruby dependencies (Gemfile)
+ * Check if an npm package is deprecated
  */
-async function scanRubyDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  // Implementation for scanning Ruby dependencies would go here
-  // This would involve parsing Gemfile/Gemfile.lock files and
-  // comparing with latest versions from RubyGems
-  return [];
+async function isNpmDeprecated(packageName: string): Promise<boolean> {
+  try {
+    const { stdout } = await execAsync(`npm view ${packageName} deprecated`);
+    return stdout.trim() !== 'undefined';
+  } catch (error) {
+    return false;
+  }
 }
 
 /**
- * Scan for outdated .NET dependencies
+ * Get deprecation message for a package
  */
-async function scanDotNetDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  // Implementation for scanning .NET dependencies would go here
-  // This would involve parsing .csproj files and comparing with
-  // latest versions from NuGet
-  return [];
+async function getDeprecationMessage(
+  packageName: string,
+  ecosystem: string
+): Promise<string | undefined> {
+  try {
+    switch (ecosystem) {
+      case 'npm':
+        return getNpmDeprecationMessage(packageName);
+      // Add other ecosystems as needed
+      default:
+        return undefined;
+    }
+  } catch (error) {
+    log.warn(`Error getting deprecation message for ${packageName}`, { error });
+    return undefined;
+  }
 }
 
 /**
- * Scan for outdated Go dependencies
+ * Get deprecation message for an npm package
  */
-async function scanGoDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  // Implementation for scanning Go dependencies would go here
-  // This would involve parsing go.mod files and comparing with
-  // latest versions from Go modules proxy
-  return [];
+async function getNpmDeprecationMessage(packageName: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execAsync(`npm view ${packageName} deprecated`);
+    const message = stdout.trim();
+    return message !== 'undefined' ? message : undefined;
+  } catch (error) {
+    return undefined;
+  }
 }
 
 /**
- * Scan for outdated Rust dependencies
+ * Get vulnerabilities for a package
  */
-async function scanRustDependencies(rootDir: string): Promise<OutdatedDependency[]> {
-  // Implementation for scanning Rust dependencies would go here
-  // This would involve parsing Cargo.toml files and comparing with
-  // latest versions from crates.io
-  return [];
+async function getVulnerabilities(
+  packageName: string,
+  version: string,
+  ecosystem: string,
+  config: DependencyScannerConfig
+): Promise<VulnerabilityInfo[]> {
+  try {
+    // In a real implementation, this would query security advisories
+    // from multiple sources based on config.securityAdvisorySources
+    
+    // For simplicity, we'll return an empty array
+    return [];
+  } catch (error) {
+    log.warn(`Error getting vulnerabilities for ${packageName}@${version}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Generate upgrade command for a dependency
+ */
+function generateUpgradeCommand(
+  packageName: string,
+  targetVersion: string,
+  ecosystem: string,
+  manifestPath: string
+): string | undefined {
+  switch (ecosystem) {
+    case 'npm':
+      return `npm install ${packageName}@${targetVersion}`;
+    case 'pip':
+      return `pip install ${packageName}==${targetVersion}`;
+    case 'composer':
+      return `composer require ${packageName}:${targetVersion}`;
+    // Add other ecosystems as needed
+    default:
+      return undefined;
+  }
 }
