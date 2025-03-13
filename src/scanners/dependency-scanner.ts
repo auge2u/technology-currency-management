@@ -5,7 +5,7 @@ import { glob } from 'glob';
 import * as child_process from 'child_process';
 import { DependencyIssue, VulnerabilityInfo } from '../types/scanning';
 import { log } from '../utils/logging';
-import { compareVersions } from '../utils/scanner-utils';
+import { compareVersions, isDependencyCritical, isReallyOutdated } from '../utils/scanner-utils';
 
 const readFileAsync = promisify(fs.readFile);
 const execAsync = promisify(child_process.exec);
@@ -26,11 +26,11 @@ export interface DependencyScannerConfig {
   // Whether to check for security vulnerabilities
   checkVulnerabilities: boolean;
   
-  // Whether to check for license compliance
-  checkLicenses: boolean;
+  // Whether to check for unused dependencies
+  checkUnused: boolean;
   
-  // Whether to validate if all dependencies are in use
-  checkUnusedDependencies: boolean;
+  // Whether to check for license issues
+  checkLicenses: boolean;
   
   // Skip dependencies with specific names
   ignoreDependencies?: string[];
@@ -40,6 +40,38 @@ export interface DependencyScannerConfig {
   
   // API timeout in milliseconds
   apiTimeoutMs: number;
+  
+  // Directory to store cached data
+  cacheDir?: string;
+  
+  // Whether this is a production system
+  isProduction?: boolean;
+}
+
+/**
+ * Detected dependency
+ */
+interface DetectedDependency {
+  name: string;
+  version: string;
+  type: 'npm' | 'pip' | 'gem' | 'composer' | 'maven' | 'gradle' | 'nuget' | 'cargo' | 'go';
+  location: string;
+  isDevDependency: boolean;
+}
+
+/**
+ * Dependency version info from registry
+ */
+interface DependencyVersionInfo {
+  latestVersion: string;
+  latestReleaseDate?: Date;
+  isDeprecated: boolean;
+  vulnerabilities: VulnerabilityInfo[];
+  licenses: string[];
+  alternativeDependencies?: {
+    name: string;
+    url: string;
+  }[];
 }
 
 /**
@@ -52,47 +84,16 @@ export async function scanDependencies(
     log.info('Starting dependency scanner');
     const issues: DependencyIssue[] = [];
     
-    // Scan each dependency type
-    for (const depType of config.dependencyTypes) {
+    // Detect dependencies for each type
+    for (const dependencyType of config.dependencyTypes) {
       try {
-        log.info(`Scanning ${depType} dependencies`);
+        log.info(`Scanning for ${dependencyType} dependencies`);
         
-        let dependencies: Dependency[] = [];
+        // Detect dependencies
+        const dependencies = await detectDependencies(config.rootDirectory, dependencyType);
+        log.info(`Found ${dependencies.length} ${dependencyType} dependencies`);
         
-        // Get dependencies for this type
-        switch (depType) {
-          case 'npm':
-            dependencies = await scanNpmDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'pip':
-            dependencies = await scanPipDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'gem':
-            dependencies = await scanGemDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'composer':
-            dependencies = await scanComposerDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'maven':
-            dependencies = await scanMavenDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'gradle':
-            dependencies = await scanGradleDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'nuget':
-            dependencies = await scanNuGetDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'cargo':
-            dependencies = await scanCargoDependencies(config.rootDirectory, config.offlineMode);
-            break;
-          case 'go':
-            dependencies = await scanGoDependencies(config.rootDirectory, config.offlineMode);
-            break;
-        }
-        
-        log.info(`Found ${dependencies.length} ${depType} dependencies`);
-        
-        // Process each dependency
+        // Check each dependency
         for (const dependency of dependencies) {
           try {
             // Skip ignored dependencies
@@ -108,92 +109,109 @@ export async function scanDependencies(
               continue;
             }
             
+            // Get dependency information
+            const dependencyInfo = await getDependencyInfo(
+              dependency.name,
+              dependency.version,
+              dependency.type,
+              config.offlineMode,
+              config.checkVulnerabilities,
+              config.checkLicenses,
+              config.cacheDir
+            );
+            
             // Check if outdated
-            if (dependency.currentVersion && dependency.latestVersion) {
-              const isOutdated = compareVersions(dependency.currentVersion, dependency.latestVersion) < 0;
+            const isOutdated = isReallyOutdated(
+              dependency.name,
+              dependency.version,
+              dependencyInfo.latestVersion
+            );
+            
+            // Check if unused (in a real implementation, this would use static analysis)
+            const isUnused = config.checkUnused ? await checkIfUnused(dependency, config.rootDirectory) : false;
+            
+            // Check for license issues
+            const licenseIssue = config.checkLicenses ? 
+              checkLicenseIssues(dependencyInfo.licenses, config.isProduction || false) : undefined;
+            
+            // Only create an issue if there's at least one problem
+            if (isOutdated || isUnused || licenseIssue || dependencyInfo.isDeprecated || 
+                (config.checkVulnerabilities && dependencyInfo.vulnerabilities.length > 0)) {
               
-              if (!isOutdated) {
-                log.info(`Dependency ${dependency.name} is up to date`);
-                continue;
-              }
-              
-              // Check for vulnerabilities if configured
-              let vulnerabilities: VulnerabilityInfo[] = [];
-              
-              if (config.checkVulnerabilities) {
-                vulnerabilities = await getDependencyVulnerabilities(
-                  dependency.name,
-                  dependency.currentVersion,
-                  dependency.type
-                );
-              }
-              
-              // Check if dependency is deprecated or abandoned
-              const isDeprecated = await checkIfDeprecated(dependency.name, dependency.type);
-              
-              // Check license compliance if configured
-              let licenseIssue = null;
-              
-              if (config.checkLicenses) {
-                licenseIssue = await checkLicenseCompliance(dependency.name, dependency.type);
-              }
-              
-              // Check if unused if configured
-              let isUnused = false;
-              
-              if (config.checkUnusedDependencies) {
-                isUnused = await checkIfUnused(
-                  dependency.name,
-                  dependency.type,
-                  config.rootDirectory
-                );
-              }
-              
-              // Create issue
+              // Create the issue
               const issue: DependencyIssue = {
                 name: dependency.name,
                 type: dependency.type,
-                currentVersion: dependency.currentVersion,
-                latestVersion: dependency.latestVersion,
-                isOutdated: true,
-                isDeprecated,
+                currentVersion: dependency.version,
+                latestVersion: dependencyInfo.latestVersion,
+                isOutdated,
+                isDeprecated: dependencyInfo.isDeprecated,
+                isUnused,
+                licenseIssue,
                 location: dependency.location,
                 detectedAt: new Date()
               };
               
-              // Add optional information
-              if (vulnerabilities.length > 0) {
-                issue.vulnerabilities = vulnerabilities;
-                issue.securityImpact = Math.max(...vulnerabilities.map(v => securityImpactFromSeverity(v.severity)));
+              // Add vulnerability info if any exist
+              if (dependencyInfo.vulnerabilities.length > 0) {
+                issue.vulnerabilities = dependencyInfo.vulnerabilities;
+                issue.securityImpact = Math.max(...dependencyInfo.vulnerabilities.map(v => 
+                  securityImpactFromSeverity(v.severity)));
               }
               
-              if (licenseIssue) {
-                issue.licenseIssue = licenseIssue;
-              }
-              
-              if (isUnused) {
-                issue.isUnused = true;
-              }
-              
-              // Add recommendation
-              issue.recommendation = generateRecommendation(
-                dependency,
+              // Calculate business impact
+              const isCritical = isDependencyCritical(dependency.name);
+              issue.businessImpact = calculateBusinessImpact(
                 isOutdated,
-                isDeprecated,
-                vulnerabilities.length > 0,
-                isUnused
+                dependencyInfo.isDeprecated,
+                dependencyInfo.vulnerabilities.length > 0,
+                isCritical,
+                !dependency.isDevDependency
+              );
+              
+              // Calculate migration effort
+              issue.migrationEffort = calculateMigrationEffort(
+                dependency.name,
+                dependency.version,
+                dependencyInfo.latestVersion,
+                dependencyInfo.vulnerabilities.length > 0,
+                dependency.type
+              );
+              
+              // Generate recommendation
+              issue.recommendation = generateRecommendation(
+                dependency.name,
+                dependency.version,
+                dependencyInfo.latestVersion,
+                isOutdated,
+                dependencyInfo.isDeprecated,
+                isUnused,
+                licenseIssue,
+                dependencyInfo.vulnerabilities.length > 0,
+                dependencyInfo.alternativeDependencies
+              );
+              
+              // Add appropriate tags
+              issue.tags = generateTags(
+                dependency.type,
+                isOutdated,
+                dependencyInfo.isDeprecated,
+                isUnused,
+                licenseIssue,
+                dependencyInfo.vulnerabilities.length > 0,
+                dependency.isDevDependency
               );
               
               // Add to issues list
               issues.push(issue);
-              log.info(`Added issue for dependency ${dependency.name} ${dependency.currentVersion}`);
+              log.info(`Added issue for dependency ${dependency.name} ${dependency.version}`);
             }
           } catch (depError) {
             log.warn(`Error processing dependency: ${dependency.name}`, { error: depError });
           }
         }
       } catch (typeError) {
-        log.error(`Error scanning ${depType} dependencies`, { error: typeError });
+        log.error(`Error scanning ${dependencyType} dependencies`, { error: typeError });
       }
     }
     
@@ -206,465 +224,440 @@ export async function scanDependencies(
 }
 
 /**
- * Dependency information
+ * Detect dependencies in a project
  */
-interface Dependency {
-  // Dependency name
-  name: string;
-  
-  // Current version
-  currentVersion?: string;
-  
-  // Latest available version
-  latestVersion?: string;
-  
-  // Dependency type
-  type: 'npm' | 'pip' | 'gem' | 'composer' | 'maven' | 'gradle' | 'nuget' | 'cargo' | 'go';
-  
-  // Location in the project
-  location: string;
-  
-  // Whether it's a development dependency
-  isDev?: boolean;
-  
-  // Whether it's a direct or transitive dependency
-  isDirect?: boolean;
-  
-  // License information
-  license?: string;
-}
-
-/**
- * Scan for NPM dependencies
- */
-async function scanNpmDependencies(
+async function detectDependencies(
   rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
+  dependencyType: 'npm' | 'pip' | 'gem' | 'composer' | 'maven' | 'gradle' | 'nuget' | 'cargo' | 'go'
+): Promise<DetectedDependency[]> {
   try {
-    log.info('Scanning NPM dependencies');
-    const dependencies: Dependency[] = [];
+    const dependencies: DetectedDependency[] = [];
     
-    // Find all package.json files
-    const packageJsonPaths = await glob(path.join(rootDirectory, '**/package.json'), {
-      ignore: ['**/node_modules/**']
-    });
-    
-    log.info(`Found ${packageJsonPaths.length} package.json files`);
-    
-    // Process each package.json
-    for (const packageJsonPath of packageJsonPaths) {
-      try {
-        const content = await readFileAsync(packageJsonPath, 'utf8');
-        const packageJson = JSON.parse(content);
+    switch (dependencyType) {
+      case 'npm':
+        // Find package.json files
+        const packageJsonFiles = await glob(path.join(rootDirectory, '**', 'package.json'), {
+          ignore: ['**/node_modules/**', '**/.git/**']
+        });
         
-        // Process production dependencies
-        if (packageJson.dependencies) {
-          for (const [name, version] of Object.entries(packageJson.dependencies)) {
-            try {
-              const cleanVersion = (version as string).replace(/^[^0-9]*/, '');
-              
-              // Get latest version (if online)
-              let latestVersion = cleanVersion;
-              
-              if (!offlineMode) {
-                try {
-                  const { stdout } = await execAsync(`npm view ${name} version`);
-                  latestVersion = stdout.trim();
-                } catch (npmError) {
-                  log.warn(`Error getting latest version for ${name}`, { error: npmError });
-                }
+        for (const packageJsonFile of packageJsonFiles) {
+          try {
+            const content = await readFileAsync(packageJsonFile, 'utf8');
+            const packageJson = JSON.parse(content);
+            
+            // Process dependencies
+            if (packageJson.dependencies) {
+              for (const [name, version] of Object.entries(packageJson.dependencies)) {
+                dependencies.push({
+                  name,
+                  version: String(version).replace(/[^0-9.]/g, ''),
+                  type: 'npm',
+                  location: packageJsonFile,
+                  isDevDependency: false
+                });
               }
-              
-              dependencies.push({
-                name,
-                currentVersion: cleanVersion,
-                latestVersion,
-                type: 'npm',
-                location: packageJsonPath,
-                isDev: false,
-                isDirect: true
-              });
-            } catch (depError) {
-              log.warn(`Error processing NPM dependency: ${name}`, { error: depError });
             }
+            
+            // Process devDependencies
+            if (packageJson.devDependencies) {
+              for (const [name, version] of Object.entries(packageJson.devDependencies)) {
+                dependencies.push({
+                  name,
+                  version: String(version).replace(/[^0-9.]/g, ''),
+                  type: 'npm',
+                  location: packageJsonFile,
+                  isDevDependency: true
+                });
+              }
+            }
+          } catch (fileError) {
+            log.warn(`Error processing package.json: ${packageJsonFile}`, { error: fileError });
           }
         }
+        break;
         
-        // Process dev dependencies
-        if (packageJson.devDependencies) {
-          for (const [name, version] of Object.entries(packageJson.devDependencies)) {
-            try {
-              const cleanVersion = (version as string).replace(/^[^0-9]*/, '');
-              
-              // Get latest version (if online)
-              let latestVersion = cleanVersion;
-              
-              if (!offlineMode) {
-                try {
-                  const { stdout } = await execAsync(`npm view ${name} version`);
-                  latestVersion = stdout.trim();
-                } catch (npmError) {
-                  log.warn(`Error getting latest version for ${name}`, { error: npmError });
-                }
+      case 'pip':
+        // Find requirements.txt files
+        const requirementsFiles = await glob(path.join(rootDirectory, '**', 'requirements*.txt'), {
+          ignore: ['**/venv/**', '**/.git/**', '**/.env/**']
+        });
+        
+        for (const requirementsFile of requirementsFiles) {
+          try {
+            const content = await readFileAsync(requirementsFile, 'utf8');
+            const lines = content.split('\n');
+            
+            for (const line of lines) {
+              // Skip comments and empty lines
+              if (line.trim().startsWith('#') || !line.trim()) {
+                continue;
               }
               
-              dependencies.push({
-                name,
-                currentVersion: cleanVersion,
-                latestVersion,
-                type: 'npm',
-                location: packageJsonPath,
-                isDev: true,
-                isDirect: true
-              });
-            } catch (depError) {
-              log.warn(`Error processing NPM dev dependency: ${name}`, { error: depError });
+              // Parse dependency line
+              const match = line.match(/^([\w-_.]+)(?:[<>=!~]+([\d.]+))?/);
+              if (match) {
+                const name = match[1];
+                const version = match[2] || '0.0.0'; // Default if not specified
+                
+                dependencies.push({
+                  name,
+                  version,
+                  type: 'pip',
+                  location: requirementsFile,
+                  // Assume dev dependencies have "dev" in the filename
+                  isDevDependency: requirementsFile.includes('dev')
+                });
+              }
             }
+          } catch (fileError) {
+            log.warn(`Error processing requirements file: ${requirementsFile}`, { error: fileError });
           }
         }
-      } catch (fileError) {
-        log.warn(`Error processing package.json: ${packageJsonPath}`, { error: fileError });
-      }
+        break;
+        
+      // Add more dependency types here in a real implementation
+      // For this example, we'll just implement npm and pip
+      
+      default:
+        log.info(`Dependency type not fully implemented: ${dependencyType}`);
     }
     
     return dependencies;
   } catch (error) {
-    log.error('Error scanning NPM dependencies', { error });
+    log.error(`Error detecting ${dependencyType} dependencies`, { error });
     return [];
   }
 }
 
 /**
- * Scan for Python pip dependencies
+ * Get dependency information from registry or cache
  */
-async function scanPipDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  try {
-    log.info('Scanning pip dependencies');
-    const dependencies: Dependency[] = [];
-    
-    // Find all requirements.txt files and setup.py files
-    const requirementsPaths = await glob(path.join(rootDirectory, '**/requirements*.txt'), {
-      ignore: ['**/venv/**', '**/.venv/**', '**/.env/**']
-    });
-    
-    const setupPyPaths = await glob(path.join(rootDirectory, '**/setup.py'), {
-      ignore: ['**/venv/**', '**/.venv/**', '**/.env/**']
-    });
-    
-    log.info(`Found ${requirementsPaths.length} requirements files and ${setupPyPaths.length} setup.py files`);
-    
-    // Process requirements.txt files
-    for (const requirementsPath of requirementsPaths) {
-      try {
-        const content = await readFileAsync(requirementsPath, 'utf8');
-        const lines = content.split('\n');
-        
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('#') || !line.trim()) {
-            continue;
-          }
-          
-          // Extract package name and version
-          const matches = line.match(/^([a-zA-Z0-9_.-]+)(?:[=<>~!]+([0-9a-zA-Z.]+))?/);
-          
-          if (matches) {
-            const name = matches[1];
-            const version = matches[2] || '';
-            
-            // Get latest version (if online)
-            let latestVersion = version;
-            
-            if (!offlineMode) {
-              try {
-                const { stdout } = await execAsync(`pip index versions ${name} --limit 1`);
-                const versionMatch = stdout.match(/([0-9]+\.[0-9]+\.[0-9]+)/);
-                if (versionMatch) {
-                  latestVersion = versionMatch[1];
-                }
-              } catch (pipError) {
-                log.warn(`Error getting latest version for ${name}`, { error: pipError });
-              }
-            }
-            
-            dependencies.push({
-              name,
-              currentVersion: version,
-              latestVersion,
-              type: 'pip',
-              location: requirementsPath,
-              isDirect: true
-            });
-          }
-        }
-      } catch (fileError) {
-        log.warn(`Error processing requirements file: ${requirementsPath}`, { error: fileError });
-      }
-    }
-    
-    return dependencies;
-  } catch (error) {
-    log.error('Error scanning pip dependencies', { error });
-    return [];
-  }
-}
-
-/**
- * Scan for Ruby gem dependencies
- */
-async function scanGemDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  try {
-    log.info('Scanning Ruby gem dependencies');
-    const dependencies: Dependency[] = [];
-    
-    // Find all Gemfile files
-    const gemfilePaths = await glob(path.join(rootDirectory, '**/Gemfile'), {
-      ignore: ['**/vendor/**']
-    });
-    
-    log.info(`Found ${gemfilePaths.length} Gemfile files`);
-    
-    // Process each Gemfile
-    for (const gemfilePath of gemfilePaths) {
-      try {
-        const content = await readFileAsync(gemfilePath, 'utf8');
-        const lines = content.split('\n');
-        
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('#') || !line.trim()) {
-            continue;
-          }
-          
-          // Extract gem declarations
-          const matches = line.match(/gem\s+['"]([\w-]+)['"](?:,\s*['"]?([^'"]+)['"]?)?/);
-          
-          if (matches) {
-            const name = matches[1];
-            let version = matches[2] || '';
-            
-            // Clean version string
-            version = version.replace(/^[^0-9]*/, '').replace(/[^0-9.]*$/, '');
-            
-            // Get latest version (if online)
-            let latestVersion = version;
-            
-            if (!offlineMode) {
-              try {
-                const { stdout } = await execAsync(`gem info ${name} -r`);
-                const versionMatch = stdout.match(/([0-9]+\.[0-9]+\.[0-9]+)/);
-                if (versionMatch) {
-                  latestVersion = versionMatch[1];
-                }
-              } catch (gemError) {
-                log.warn(`Error getting latest version for ${name}`, { error: gemError });
-              }
-            }
-            
-            dependencies.push({
-              name,
-              currentVersion: version,
-              latestVersion,
-              type: 'gem',
-              location: gemfilePath,
-              isDirect: true
-            });
-          }
-        }
-      } catch (fileError) {
-        log.warn(`Error processing Gemfile: ${gemfilePath}`, { error: fileError });
-      }
-    }
-    
-    return dependencies;
-  } catch (error) {
-    log.error('Error scanning gem dependencies', { error });
-    return [];
-  }
-}
-
-/**
- * Scan for PHP Composer dependencies
- */
-async function scanComposerDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  // Simplified for this example
-  return [];
-}
-
-/**
- * Scan for Maven dependencies
- */
-async function scanMavenDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  // Simplified for this example
-  return [];
-}
-
-/**
- * Scan for Gradle dependencies
- */
-async function scanGradleDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  // Simplified for this example
-  return [];
-}
-
-/**
- * Scan for NuGet dependencies
- */
-async function scanNuGetDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  // Simplified for this example
-  return [];
-}
-
-/**
- * Scan for Rust Cargo dependencies
- */
-async function scanCargoDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  // Simplified for this example
-  return [];
-}
-
-/**
- * Scan for Go dependencies
- */
-async function scanGoDependencies(
-  rootDirectory: string,
-  offlineMode: boolean
-): Promise<Dependency[]> {
-  // Simplified for this example
-  return [];
-}
-
-/**
- * Get vulnerabilities for a dependency
- */
-async function getDependencyVulnerabilities(
+async function getDependencyInfo(
   name: string,
   version: string,
-  type: string
-): Promise<VulnerabilityInfo[]> {
+  type: 'npm' | 'pip' | 'gem' | 'composer' | 'maven' | 'gradle' | 'nuget' | 'cargo' | 'go',
+  offlineMode: boolean,
+  checkVulnerabilities: boolean,
+  checkLicenses: boolean,
+  cacheDir?: string
+): Promise<DependencyVersionInfo> {
+  // Check cache first
+  if (cacheDir) {
+    const cacheFile = path.join(cacheDir, `${type}-${name}.json`);
+    
+    if (fs.existsSync(cacheFile)) {
+      try {
+        const cacheContent = await readFileAsync(cacheFile, 'utf8');
+        const cachedInfo = JSON.parse(cacheContent) as DependencyVersionInfo;
+        log.info(`Loaded ${name} info from cache`);
+        return cachedInfo;
+      } catch (cacheError) {
+        log.warn(`Error reading dependency cache for ${name}`, { error: cacheError });
+      }
+    }
+  }
+  
+  // If in offline mode and no cache, return placeholder data
+  if (offlineMode) {
+    log.info(`Offline mode enabled for ${name}, using placeholder data`);
+    return {
+      latestVersion: version, // Assume current version is latest
+      isDeprecated: false,
+      vulnerabilities: [],
+      licenses: []
+    };
+  }
+  
+  // In a real implementation, we would query the registry API
+  // For this example, we'll return mock data
   try {
-    // In a real implementation, this would query a vulnerability database
-    // For this example, we'll return a hardcoded vulnerability for one dependency
-    if (name === 'lodash' && type === 'npm' && compareVersions(version, '4.17.20') < 0) {
-      return [
+    // Mock registry query
+    log.info(`Querying registry for ${type} dependency: ${name}@${version}`);
+    
+    // Generate mock data based on the dependency name and version
+    const info: DependencyVersionInfo = {
+      latestVersion: incrementVersion(version),
+      latestReleaseDate: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000), // Random date in last 30 days
+      isDeprecated: name.includes('deprecated') || name.includes('legacy'),
+      vulnerabilities: [],
+      licenses: [getRandomLicense()]
+    };
+    
+    // Add vulnerabilities for some dependencies (for demo purposes)
+    if (checkVulnerabilities && (name.includes('vulnerable') || Math.random() < 0.1)) {
+      info.vulnerabilities = [
         {
-          id: 'CVE-2021-23337',
-          severity: 'high',
-          cvssScore: 7.2,
-          title: 'Prototype Pollution in Lodash',
-          description: 'Lodash versions prior to 4.17.20 are vulnerable to prototype pollution via methods such as zipObjectDeep, merge, etc.',
-          infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2021-23337',
-          publishedDate: new Date('2021-02-15'),
-          affectedVersions: '<4.17.20',
-          patchedVersions: '>=4.17.20',
-          recommendation: 'Upgrade to lodash 4.17.20 or newer'
+          id: `CVE-2023-${Math.floor(Math.random() * 10000)}`,
+          severity: getRandomSeverity(),
+          title: `Security vulnerability in ${name}`,
+          description: `${name} version ${version} has a security vulnerability`,
+          publishedDate: new Date(Date.now() - Math.random() * 90 * 24 * 60 * 60 * 1000), // Random date in last 90 days
+          affectedVersions: `<=${version}`,
+          patchedVersions: `>${version}`,
+          recommendation: `Update to ${info.latestVersion} or newer`
         }
       ];
     }
     
-    return [];
+    // If deprecated, suggest alternatives
+    if (info.isDeprecated) {
+      info.alternativeDependencies = [
+        {
+          name: `${name.replace('deprecated', 'modern').replace('legacy', 'next')}`,
+          url: `https://www.npmjs.com/package/${name.replace('deprecated', 'modern')}`
+        }
+      ];
+    }
+    
+    // Save to cache if cacheDir is provided
+    if (cacheDir) {
+      try {
+        if (!fs.existsSync(cacheDir)) {
+          fs.mkdirSync(cacheDir, { recursive: true });
+        }
+        
+        const cacheFile = path.join(cacheDir, `${type}-${name}.json`);
+        await fs.promises.writeFile(cacheFile, JSON.stringify(info, null, 2), 'utf8');
+        log.info(`Cached ${name} info`);
+      } catch (cacheError) {
+        log.warn(`Error writing dependency cache for ${name}`, { error: cacheError });
+      }
+    }
+    
+    return info;
   } catch (error) {
-    log.warn(`Error getting vulnerabilities for dependency ${name} ${version}`, { error });
-    return [];
-  }
-}
-
-/**
- * Check if a dependency is deprecated or abandoned
- */
-async function checkIfDeprecated(
-  name: string,
-  type: string
-): Promise<boolean> {
-  // In a real implementation, this would query package registries
-  // For this example, we'll return a hardcoded response for one dependency
-  return name === 'request' && type === 'npm';
-}
-
-/**
- * Check license compliance for a dependency
- */
-async function checkLicenseCompliance(
-  name: string,
-  type: string
-): Promise<{ issue: string; severity: 'low' | 'medium' | 'high' } | null> {
-  // In a real implementation, this would check against a license policy
-  // For this example, we'll return a hardcoded response for one dependency
-  if (name === 'problematic-license-lib' && type === 'npm') {
+    log.error(`Error querying registry for ${name}`, { error });
+    
+    // Return basic info if registry query fails
     return {
-      issue: 'License AGPL-3.0 may not be compatible with your usage',
-      severity: 'high'
+      latestVersion: version,
+      isDeprecated: false,
+      vulnerabilities: [],
+      licenses: []
     };
   }
-  
-  return null;
 }
 
 /**
- * Check if a dependency is unused in the project
+ * Check if a dependency is unused
+ * In a real implementation, this would use static analysis
  */
 async function checkIfUnused(
-  name: string,
-  type: string,
+  dependency: DetectedDependency,
   rootDirectory: string
 ): Promise<boolean> {
-  // In a real implementation, this would scan source code for usage
-  // For this example, we'll return a hardcoded response
+  // For this example, we'll just return false (not unused)
+  // In a real implementation, this would use static analysis tools
   return false;
 }
 
 /**
- * Generate a recommendation for addressing a dependency issue
+ * Check for license issues
  */
-function generateRecommendation(
-  dependency: Dependency,
+function checkLicenseIssues(
+  licenses: string[],
+  isProduction: boolean
+): { issue: string; severity: 'low' | 'medium' | 'high' } | undefined {
+  if (!licenses || licenses.length === 0) {
+    return {
+      issue: 'Unknown license',
+      severity: isProduction ? 'high' : 'medium'
+    };
+  }
+  
+  // List of potentially problematic licenses for commercial use
+  const restrictiveLicenses = ['GPL', 'AGPL', 'LGPL', 'SSPL'];
+  
+  for (const license of licenses) {
+    if (restrictiveLicenses.some(l => license.includes(l))) {
+      return {
+        issue: `Restrictive license: ${license}`,
+        severity: isProduction ? 'high' : 'medium'
+      };
+    }
+  }
+  
+  return undefined;
+}
+
+/**
+ * Calculate business impact score
+ */
+function calculateBusinessImpact(
   isOutdated: boolean,
   isDeprecated: boolean,
   hasVulnerabilities: boolean,
-  isUnused: boolean
+  isCriticalDependency: boolean,
+  isProductionDependency: boolean
+): number {
+  let score = 1; // Start with minimal impact
+  
+  if (isOutdated) score += 1;
+  if (isDeprecated) score += 2;
+  if (hasVulnerabilities) score += 2;
+  if (isCriticalDependency) score += 1;
+  if (isProductionDependency) score += 1;
+  
+  // Cap at maximum of 5
+  return Math.min(score, 5);
+}
+
+/**
+ * Calculate migration effort
+ */
+function calculateMigrationEffort(
+  name: string,
+  currentVersion: string,
+  latestVersion: string,
+  hasVulnerabilities: boolean,
+  type: string
+): number {
+  // Start with base effort
+  let effort = 1;
+  
+  // Major version change is more effort
+  if (getMajorVersion(currentVersion) < getMajorVersion(latestVersion)) {
+    effort += 2;
+  } else if (getMinorVersion(currentVersion) < getMinorVersion(latestVersion)) {
+    effort += 1;
+  }
+  
+  // Critical dependencies are usually harder to migrate
+  if (isDependencyCritical(name)) {
+    effort += 1;
+  }
+  
+  // Cap at maximum of 5
+  return Math.min(effort, 5);
+}
+
+/**
+ * Generate tags for categorizing issues
+ */
+function generateTags(
+  type: string,
+  isOutdated: boolean,
+  isDeprecated: boolean,
+  isUnused: boolean,
+  licenseIssue: { issue: string; severity: 'low' | 'medium' | 'high' } | undefined,
+  hasVulnerabilities: boolean,
+  isDevDependency: boolean
+): string[] {
+  const tags: string[] = [type];
+  
+  if (isOutdated) tags.push('outdated');
+  if (isDeprecated) tags.push('deprecated');
+  if (isUnused) tags.push('unused');
+  if (licenseIssue) tags.push('license-issue');
+  if (hasVulnerabilities) tags.push('security');
+  if (isDevDependency) tags.push('dev-dependency');
+  else tags.push('production-dependency');
+  
+  return tags;
+}
+
+/**
+ * Generate a recommendation
+ */
+function generateRecommendation(
+  name: string,
+  currentVersion: string,
+  latestVersion: string,
+  isOutdated: boolean,
+  isDeprecated: boolean,
+  isUnused: boolean,
+  licenseIssue: { issue: string; severity: 'low' | 'medium' | 'high' } | undefined,
+  hasVulnerabilities: boolean,
+  alternatives?: { name: string, url: string }[]
 ): string {
   const recommendations: string[] = [];
   
   if (isOutdated) {
-    recommendations.push(`Update ${dependency.name} from ${dependency.currentVersion} to ${dependency.latestVersion}`);
+    recommendations.push(`Update ${name} from ${currentVersion} to ${latestVersion}`);
   }
   
   if (isDeprecated) {
-    recommendations.push(`Replace deprecated dependency ${dependency.name} with an actively maintained alternative`);
-  }
-  
-  if (hasVulnerabilities) {
-    recommendations.push(`Address security vulnerabilities by updating ${dependency.name}`);
+    if (alternatives && alternatives.length > 0) {
+      const alternative = alternatives[0];
+      recommendations.push(`Replace deprecated ${name} with ${alternative.name} (${alternative.url})`);
+    } else {
+      recommendations.push(`Remove or replace deprecated dependency ${name}`);
+    }
   }
   
   if (isUnused) {
-    recommendations.push(`Remove unused dependency ${dependency.name}`);
+    recommendations.push(`Remove unused dependency ${name}`);
   }
   
-  // Return combined recommendations
+  if (licenseIssue) {
+    recommendations.push(`Address license issue: ${licenseIssue.issue}`);
+  }
+  
+  if (hasVulnerabilities) {
+    recommendations.push(`Update ${name} immediately to address security vulnerabilities`);
+  }
+  
+  if (recommendations.length === 0) {
+    recommendations.push(`No immediate action required for ${name}`);
+  }
+  
   return recommendations.join('. ');
+}
+
+/**
+ * Helper function to increment a version for demo purposes
+ */
+function incrementVersion(version: string): string {
+  try {
+    const parts = version.split('.');
+    
+    if (parts.length < 3) {
+      // Ensure we have at least 3 parts
+      while (parts.length < 3) {
+        parts.push('0');
+      }
+    }
+    
+    // Increment the last part
+    const lastPart = parseInt(parts[parts.length - 1], 10) || 0;
+    parts[parts.length - 1] = String(lastPart + 1);
+    
+    return parts.join('.');
+  } catch (error) {
+    return `${version}.1`; // Fallback
+  }
+}
+
+/**
+ * Helper function to get major version
+ */
+function getMajorVersion(version: string): number {
+  const parts = version.split('.');
+  return parseInt(parts[0], 10) || 0;
+}
+
+/**
+ * Helper function to get minor version
+ */
+function getMinorVersion(version: string): number {
+  const parts = version.split('.');
+  return parts.length > 1 ? (parseInt(parts[1], 10) || 0) : 0;
+}
+
+/**
+ * Helper function for getting a random severity
+ */
+function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
+  const severities: Array<'low' | 'medium' | 'high' | 'critical'> = ['low', 'medium', 'high', 'critical'];
+  return severities[Math.floor(Math.random() * severities.length)];
+}
+
+/**
+ * Helper function for getting a random license
+ */
+function getRandomLicense(): string {
+  const licenses = ['MIT', 'Apache-2.0', 'BSD-3-Clause', 'GPL-3.0', 'ISC', 'LGPL-3.0', 'Unlicense', 'Custom'];
+  return licenses[Math.floor(Math.random() * licenses.length)];
 }
 
 /**
