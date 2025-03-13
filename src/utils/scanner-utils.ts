@@ -9,228 +9,242 @@
  * @returns -1 if version1 < version2, 0 if equal, 1 if version1 > version2
  */
 export function compareVersions(version1: string, version2: string): number {
-  if (version1 === version2) return 0;
+  if (!version1 && !version2) return 0;
+  if (!version1) return -1;
+  if (!version2) return 1;
   
-  // Handle non-standard version strings
-  if (version1 === 'latest') return -1; // 'latest' is always less than any version
-  if (version2 === 'latest') return 1;  // Any version is greater than 'latest'
+  // Split versions into components
+  const v1Components = version1.split(/[.-]/);
+  const v2Components = version2.split(/[.-]/);
   
-  // Extract numeric parts for comparison
-  const parts1 = version1.split(/[.-]/).map(part => {
-    // Try to parse as a number if possible
-    const num = parseInt(part, 10);
-    return isNaN(num) ? part : num;
-  });
-  
-  const parts2 = version2.split(/[.-]/).map(part => {
-    const num = parseInt(part, 10);
-    return isNaN(num) ? part : num;
-  });
-  
-  // Compare each part
-  const maxLength = Math.max(parts1.length, parts2.length);
+  // Compare each component
+  const maxLength = Math.max(v1Components.length, v2Components.length);
   
   for (let i = 0; i < maxLength; i++) {
-    // Treat missing parts as 0 for numeric or '' for strings
-    const part1 = i < parts1.length ? parts1[i] : (typeof parts1[0] === 'number' ? 0 : '');
-    const part2 = i < parts2.length ? parts2[i] : (typeof parts2[0] === 'number' ? 0 : '');
+    // If a component is missing, treat it as 0
+    const v1Component = i < v1Components.length ? parseInt(v1Components[i], 10) || 0 : 0;
+    const v2Component = i < v2Components.length ? parseInt(v2Components[i], 10) || 0 : 0;
     
-    // Different types, convert to string for comparison
-    if (typeof part1 !== typeof part2) {
-      const str1 = String(part1);
-      const str2 = String(part2);
-      
-      if (str1 < str2) return -1;
-      if (str1 > str2) return 1;
-      continue;
-    }
-    
-    // Same types, compare directly
-    if (part1 < part2) return -1;
-    if (part1 > part2) return 1;
+    if (v1Component < v2Component) return -1;
+    if (v1Component > v2Component) return 1;
   }
   
-  // All parts equal
   return 0;
+}
+
+/**
+ * Format a date for display
+ * @param date Date to format
+ * @returns Formatted date string
+ */
+export function formatDate(date?: Date): string {
+  if (!date) return 'Unknown';
+  return date.toISOString().split('T')[0];
 }
 
 /**
  * Calculate days between two dates
  * @param date1 First date
- * @param date2 Second date
+ * @param date2 Second date (defaults to current date)
  * @returns Number of days between dates
  */
-export function daysBetween(date1: Date, date2: Date): number {
-  // Convert both dates to milliseconds since epoch
-  const date1Ms = date1.getTime();
-  const date2Ms = date2.getTime();
-  
-  // Calculate difference in milliseconds
-  const diffMs = Math.abs(date2Ms - date1Ms);
-  
-  // Convert to days and return
-  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+export function daysBetween(date1: Date, date2: Date = new Date()): number {
+  const oneDay = 24 * 60 * 60 * 1000; // hours*minutes*seconds*milliseconds
+  const diffDays = Math.round(Math.abs((date1.getTime() - date2.getTime()) / oneDay));
+  return diffDays;
 }
 
 /**
- * Check if a version is within a version range
- * @param version Version to check
- * @param range Version range (e.g., '>=1.0.0 <2.0.0')
- * @returns Whether the version is in the range
+ * Check if a version string is a valid semantic version
+ * @param version Version string to check
+ * @returns True if valid semver
  */
-export function isVersionInRange(version: string, range: string): boolean {
-  // Handle simple ranges
-  if (range.includes('||')) {
-    // OR ranges, e.g., '>=1.0.0 <2.0.0 || >=3.0.0'
-    const orRanges = range.split('||').map(r => r.trim());
-    return orRanges.some(orRange => isVersionInRange(version, orRange));
-  }
-  
-  // Handle multiple conditions
-  if (range.includes(' ')) {
-    // AND ranges, e.g., '>=1.0.0 <2.0.0'
-    const andRanges = range.split(' ').map(r => r.trim()).filter(r => r !== '');
-    return andRanges.every(andRange => isVersionInSimpleRange(version, andRange));
-  }
-  
-  // Handle single condition
-  return isVersionInSimpleRange(version, range);
+export function isValidSemver(version: string): boolean {
+  const semverRegex = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+  return semverRegex.test(version);
 }
 
 /**
- * Check if a version is within a simple version range
- * @param version Version to check
- * @param range Simple version range (e.g., '>=1.0.0')
- * @returns Whether the version is in the range
+ * Parse a semantic version string into its components
+ * @param version Semver string
+ * @returns Object with version components
  */
-function isVersionInSimpleRange(version: string, range: string): boolean {
-  // Extract operator and version from range
-  const match = range.match(/^([<>=~^]*)(.*)$/);
+export function parseSemver(version: string): {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string;
+  buildmetadata: string;
+} {
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?(?:\+([\w.-]+))?$/);
   
   if (!match) {
-    return version === range; // Exact match if no operator
+    return {
+      major: 0,
+      minor: 0,
+      patch: 0,
+      prerelease: '',
+      buildmetadata: ''
+    };
   }
   
-  const [, operator, rangeVersion] = match;
-  
-  // Compare based on operator
-  const comparison = compareVersions(version, rangeVersion);
-  
-  switch (operator) {
-    case '>':
-      return comparison > 0;
-    case '>=':
-      return comparison >= 0;
-    case '<':
-      return comparison < 0;
-    case '<=':
-      return comparison <= 0;
-    case '=':
-    case '==':
-      return comparison === 0;
-    case '~':
-      // Compatible changes (patch level)
-      // ~1.2.3 is equivalent to >=1.2.3 <1.3.0
-      const parts = rangeVersion.split('.');
-      const nextMinor = [...parts];
-      nextMinor[1] = String(parseInt(nextMinor[1] || '0', 10) + 1);
-      nextMinor[2] = '0';
-      
-      return isVersionInRange(version, `>=${rangeVersion} <${nextMinor.join('.')}`);
-    case '^':
-      // Compatible changes (minor level)
-      // ^1.2.3 is equivalent to >=1.2.3 <2.0.0
-      const caretParts = rangeVersion.split('.');
-      const nextMajor = [...caretParts];
-      nextMajor[0] = String(parseInt(nextMajor[0] || '0', 10) + 1);
-      nextMajor[1] = '0';
-      nextMajor[2] = '0';
-      
-      return isVersionInRange(version, `>=${rangeVersion} <${nextMajor.join('.')}`);
-    default:
-      return version === rangeVersion; // Default to exact match
-  }
+  return {
+    major: parseInt(match[1], 10),
+    minor: parseInt(match[2], 10),
+    patch: parseInt(match[3], 10),
+    prerelease: match[4] || '',
+    buildmetadata: match[5] || ''
+  };
 }
 
 /**
- * Parse a vulnerability impact score (CVSS) into a severity level
- * @param cvssScore CVSS score (0-10)
- * @returns Severity level ('low', 'medium', 'high', 'critical')
- */
-export function cvssToSeverity(cvssScore: number): 'low' | 'medium' | 'high' | 'critical' {
-  if (cvssScore >= 9.0) return 'critical';
-  if (cvssScore >= 7.0) return 'high';
-  if (cvssScore >= 4.0) return 'medium';
-  return 'low';
-}
-
-/**
- * Estimate business impact from technical factors
- * @param isOutdated Whether the component is outdated
- * @param isDeprecated Whether the component is deprecated
- * @param hasVulnerabilities Whether the component has vulnerabilities
- * @param criticalSystemComponent Whether this is a critical system component
- * @returns Business impact score (1-5)
+ * Estimate the business impact of outdated technology
+ * @param isOutdated Whether the technology is outdated
+ * @param isDeprecated Whether the technology is deprecated
+ * @param hasVulnerabilities Whether the technology has vulnerabilities
+ * @param isCriticalSystem Whether this is a critical system component
+ * @returns Business impact score from 1-5
  */
 export function estimateBusinessImpact(
   isOutdated: boolean,
   isDeprecated: boolean,
   hasVulnerabilities: boolean,
-  criticalSystemComponent: boolean
+  isCriticalSystem: boolean
 ): number {
-  let score = 1; // Start with minimal impact
+  // Start with a base impact level
+  let impact = 1;
   
-  if (isOutdated) score += 1;
-  if (isDeprecated) score += 1;
-  if (hasVulnerabilities) score += 2;
-  if (criticalSystemComponent) score += 1;
+  // Adjust based on conditions
+  if (isOutdated) impact += 1;
+  if (isDeprecated) impact += 2;
+  if (hasVulnerabilities) impact += 2;
+  if (isCriticalSystem) impact += 1;
   
-  return Math.min(5, score); // Cap at 5
+  // Cap at 5
+  return Math.min(5, impact);
 }
 
 /**
- * Generate a standardized ID for a detected issue
- * @param issueType Type of issue (framework, dependency, extension)
- * @param name Name of the component
- * @param version Version of the component
- * @returns Unique issue ID
+ * Calculate percentage difference between two versions
+ * @param currentVersion Current version
+ * @param latestVersion Latest version
+ * @returns Percentage behind (0-100)
  */
-export function generateIssueId(
-  issueType: string,
-  name: string,
-  version: string
-): string {
-  // Create a consistent ID format for tracking issues
-  const nameSlug = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-  const versionSlug = version.replace(/[^a-z0-9.]/g, '-');
+export function calculateVersionDifference(
+  currentVersion: string,
+  latestVersion: string
+): number {
+  const current = parseSemver(currentVersion);
+  const latest = parseSemver(latestVersion);
   
-  return `${issueType}-${nameSlug}-${versionSlug}`;
-}
-
-/**
- * Format a date for display or storage
- * @param date Date to format
- * @param format Format style ('iso', 'short', 'long')
- * @returns Formatted date string
- */
-export function formatDate(
-  date: Date | undefined,
-  format: 'iso' | 'short' | 'long' = 'iso'
-): string {
-  if (!date) return 'N/A';
+  // For major version differences, use a scale based on semantic versioning
+  const majorDiff = latest.major - current.major;
   
-  switch (format) {
-    case 'iso':
-      return date.toISOString();
-    case 'short':
-      return date.toLocaleDateString();
-    case 'long':
-      return date.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-      });
-    default:
-      return date.toISOString();
+  if (majorDiff > 0) {
+    // Calculate percentage based on major version difference
+    // Each major version is considered a 20% gap
+    return Math.min(100, majorDiff * 20);
   }
+  
+  // For minor version differences
+  const minorDiff = latest.minor - current.minor;
+  
+  if (minorDiff > 0) {
+    // Each minor version is a 5% gap
+    return Math.min(19, minorDiff * 5);
+  }
+  
+  // For patch version differences
+  const patchDiff = latest.patch - current.patch;
+  
+  if (patchDiff > 0) {
+    // Each patch is a 1% gap
+    return Math.min(4, patchDiff);
+  }
+  
+  return 0;
+}
+
+/**
+ * Generate a migration score based on how challenging it would be to update
+ * @param currentVersion Current version
+ * @param latestVersion Latest version
+ * @param type Technology type
+ * @returns Migration difficulty score from 1-5
+ */
+export function estimateMigrationDifficulty(
+  currentVersion: string,
+  latestVersion: string,
+  type: string
+): number {
+  // Start with a base difficulty level
+  let difficulty = 1;
+  
+  // Check version difference
+  const versionDiff = calculateVersionDifference(currentVersion, latestVersion);
+  
+  // Adjust difficulty based on version difference
+  if (versionDiff >= 50) {
+    difficulty += 3; // Major version jump (multiple major versions behind)
+  } else if (versionDiff >= 20) {
+    difficulty += 2; // Major version jump
+  } else if (versionDiff >= 10) {
+    difficulty += 1; // Significant minor version jump
+  }
+  
+  // Adjust based on known difficult migrations
+  const highDifficultyTypes = ['database', 'core-framework', 'language-runtime'];
+  if (highDifficultyTypes.some(t => type.includes(t))) {
+    difficulty += 1;
+  }
+  
+  // Cap at 5
+  return Math.min(5, difficulty);
+}
+
+/**
+ * Calculate the age of a technology version in days
+ * @param releaseDate Release date of the version
+ * @returns Age in days
+ */
+export function calculateVersionAge(releaseDate?: Date): number {
+  if (!releaseDate) return 0;
+  return daysBetween(releaseDate);
+}
+
+/**
+ * Check if a version is within its support lifecycle
+ * @param version Version to check
+ * @param endOfSupportDate End of support date
+ * @returns True if supported
+ */
+export function isVersionSupported(version: string, endOfSupportDate?: Date): boolean {
+  if (!endOfSupportDate) return true;
+  return new Date() < endOfSupportDate;
+}
+
+/**
+ * Format a timeframe into a human-readable string
+ * @param days Number of days
+ * @returns Human-readable timeframe
+ */
+export function formatTimeframe(days: number): string {
+  if (days < 0) return 'Already passed';
+  if (days === 0) return 'Today';
+  if (days < 30) return `${days} days`;
+  if (days < 365) return `${Math.round(days / 30)} months`;
+  return `${Math.round(days / 365)} years`;
+}
+
+/**
+ * Prioritize issues based on urgency and impact
+ * @param issues Array of issues with impact and urgency scores
+ * @returns Sorted array of issues
+ */
+export function prioritizeIssues<T extends { businessImpact?: number; securityImpact?: number }>(issues: T[]): T[] {
+  return [...issues].sort((a, b) => {
+    const aImpact = Math.max(a.businessImpact || 0, a.securityImpact || 0);
+    const bImpact = Math.max(b.businessImpact || 0, b.securityImpact || 0);
+    return bImpact - aImpact;
+  });
 }
