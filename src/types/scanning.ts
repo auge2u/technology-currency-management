@@ -1,92 +1,44 @@
 /**
- * Common base interface for all scanning issues
+ * Common types for technology currency scanning
+ */
+
+/**
+ * Base issue interface for all scanner types
  */
 export interface BaseIssue {
   // When the issue was detected
   detectedAt: Date;
   
-  // Optional notes about the issue
-  notes?: string;
+  // Risk level assessment
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
   
-  // Tags for categorization
-  tags?: string[];
+  // Tags for filtering and categorization
+  tags: string[];
   
   // Recommendation for resolving the issue
-  recommendation?: string;
+  recommendation: string;
 }
 
 /**
- * Dependency scan issue
- */
-export interface DependencyIssue extends BaseIssue {
-  // Name of the dependency
-  name: string;
-  
-  // Current version
-  currentVersion: string;
-  
-  // Latest available version
-  latestVersion: string;
-  
-  // Package manager (npm, pip, maven, etc.)
-  packageManager: string;
-  
-  // Type of dependency (production, development, peer, optional)
-  type: 'production' | 'development' | 'peer' | 'optional';
-  
-  // Path to the manifest file where this dependency was found
-  manifestFile: string;
-  
-  // Whether the dependency is outdated
-  isOutdated: boolean;
-  
-  // Whether the dependency is deprecated
-  isDeprecated: boolean;
-  
-  // Whether the dependency has security issues
-  hasSecurityIssues: boolean;
-  
-  // Security issues details if any
-  securityIssues?: Array<{
-    severity: 'low' | 'medium' | 'high' | 'critical';
-    description: string;
-    fixedInVersion?: string;
-    cve?: string;
-  }>;
-  
-  // License information
-  license?: string;
-  
-  // Repository URL
-  repo?: string;
-  
-  // Business impact score (1-5, where 5 is highest impact)
-  businessImpact?: number;
-  
-  // Update effort score (1-5, where 5 is highest effort)
-  updateEffort?: number;
-}
-
-/**
- * Browser extension scan issue
+ * Extension-related issue
  */
 export interface ExtensionIssue extends BaseIssue {
-  // Extension ID
+  // Extension identifier
   id: string;
   
-  // Extension name
+  // Extension display name
   name: string;
   
   // Browser (chrome, firefox, edge, safari)
   browser: string;
   
-  // Current version
-  currentVersion: string;
+  // Current version installed
+  currentVersion?: string;
   
-  // Latest available version
-  latestVersion: string;
+  // Latest version available
+  latestVersion?: string;
   
-  // Path where the extension is installed
+  // Path to the extension
   path: string;
   
   // Whether the extension is outdated
@@ -98,279 +50,227 @@ export interface ExtensionIssue extends BaseIssue {
   // Whether the extension has security issues
   hasSecurityIssues: boolean;
   
-  // Security issues details if any
-  securityIssues?: Array<{
-    severity: 'low' | 'medium' | 'high' | 'critical';
-    description: string;
-    cve?: string;
-  }>;
-  
-  // Store URL
+  // URL to the extension in the store
   storeUrl?: string;
   
-  // Compatibility issues
-  compatibilityIssues?: string[];
+  // Whether the extension is in the approved list
+  isApproved: boolean;
   
-  // Whether the extension is approved by the organization
-  isApproved?: boolean;
-  
-  // Whether the extension has been removed from the extension store
+  // Whether the extension has been removed from the store
   removedFromStore?: boolean;
   
-  // Risk level assessment
-  riskLevel?: 'low' | 'medium' | 'high' | 'critical';
+  // Compatibility issues with current browser
+  compatibilityIssues?: string[];
   
-  // Update urgency assessment
-  updateUrgency?: 'low' | 'medium' | 'high' | 'critical';
-}
-
-/**
- * Framework/technology scan issue
- */
-export interface FrameworkIssue extends BaseIssue {
-  // Name of the framework or technology
-  name: string;
-  
-  // Current version
-  currentVersion: string;
-  
-  // Latest available version
-  latestVersion: string;
-  
-  // Type of technology
-  type: 'framework' | 'language' | 'runtime' | 'database' | 'infrastructure' | 'other';
-  
-  // Files where this framework/technology is used
-  files: string[];
-  
-  // Whether the framework is outdated
-  isOutdated: boolean;
-  
-  // Whether the framework is deprecated
-  isDeprecated: boolean;
-  
-  // Whether the framework has security issues
-  hasSecurityIssues: boolean;
-  
-  // End of life date if known
-  endOfLifeDate?: Date;
-  
-  // End of support date if known
-  endOfSupportDate?: Date;
-  
-  // Security issues details if any
+  // Security vulnerabilities
   securityIssues?: Array<{
     severity: 'low' | 'medium' | 'high' | 'critical';
     description: string;
-    fixedInVersion?: string;
     cve?: string;
   }>;
   
-  // License information
-  license?: string;
-  
-  // Repository URL
-  repo?: string;
-  
-  // Usage count in the codebase
-  usageCount?: number;
-  
-  // Business impact score (1-5, where 5 is highest impact)
-  businessImpact?: number;
-  
-  // Update effort score (1-5, where 5 is highest effort)
-  updateEffort?: number;
-  
-  // Suggested migration path
-  migrationPath?: string;
+  // Urgency for updating
+  updateUrgency: 'low' | 'medium' | 'high' | 'critical';
 }
 
 /**
- * API usage scan issue for deprecated APIs
+ * Technology-related issue
  */
-export interface ApiIssue extends BaseIssue {
-  // Name of the API
+export interface TechnologyIssue extends BaseIssue {
+  // Technology identifier
+  technologyId: string;
+  
+  // Technology display name
   name: string;
   
-  // API source (framework, language, library)
-  source: string;
+  // Technology category
+  category: string;
   
-  // Usage locations in code
-  locations: Array<{
-    file: string;
-    line: number;
-    column: number;
-    code: string;
-  }>;
+  // Current version in use
+  currentVersion?: string;
   
-  // Whether the API is deprecated
-  isDeprecated: boolean;
+  // Latest version available
+  latestVersion?: string;
   
-  // Whether the API has security issues
-  hasSecurityIssues: boolean;
+  // Files where technology is used
+  detectedFiles: string[];
   
-  // Deprecation date if known
-  deprecationDate?: Date;
+  // Whether the technology is end-of-life
+  isEol: boolean;
   
-  // Removal date if known
-  removalDate?: Date;
+  // Whether the technology is outdated
+  isOutdated?: boolean;
   
-  // Security issues details if any
-  securityIssues?: Array<{
-    severity: 'low' | 'medium' | 'high' | 'critical';
-    description: string;
+  // Whether the technology is deprecated
+  isDeprecated?: boolean;
+  
+  // Whether the technology has security vulnerabilities
+  isVulnerable: boolean;
+  
+  // Whether the technology has deprecated features
+  hasDeprecatedFeatures: boolean;
+  
+  // Security vulnerabilities
+  vulnerabilities?: Array<{
+    versionRange: string;
+    details: string;
+    cveIds?: string[];
     fixedInVersion?: string;
-    cve?: string;
   }>;
   
-  // Suggested replacement API
-  replacement?: string;
+  // Deprecated features
+  deprecatedFeatures?: Array<{
+    feature: string;
+    deprecatedInVersion: string;
+    removedInVersion?: string;
+    alternative?: string;
+  }>;
   
-  // Code example for migration
-  migrationExample?: string;
+  // End-of-life details
+  eolDetails?: {
+    date: Date;
+    link?: string;
+    migrationGuide?: string;
+    replacementPath?: string;
+  };
+  
+  // Website URL
+  website?: string;
   
   // Documentation URL
   documentationUrl?: string;
   
-  // Business impact score (1-5, where 5 is highest impact)
-  businessImpact?: number;
+  // Recommended alternatives
+  alternatives?: string[];
   
-  // Update effort score (1-5, where 5 is highest effort)
-  updateEffort?: number;
+  // Business impact score (1-5)
+  businessImpact: number;
+  
+  // Remediation effort score (1-5)
+  remediationEffort: number;
 }
 
 /**
- * Scan report containing all issues
+ * Dependency-related issue
  */
-export interface ScanReport {
-  // When the scan was run
-  scanDate: Date;
+export interface DependencyIssue extends BaseIssue {
+  // Package name
+  packageName: string;
   
-  // Scan duration in milliseconds
-  duration: number;
+  // Current version in use
+  currentVersion: string;
   
-  // System information
-  system: {
-    platform: string;
-    architecture: string;
-    nodeVersion?: string;
-    cpuCores?: number;
-    memoryTotal?: number;
-  };
+  // Latest version available
+  latestVersion?: string;
   
-  // Scan configuration
-  config: Record<string, any>;
+  // Package manager (npm, yarn, pip, etc.)
+  packageManager: string;
   
-  // Dependency issues
-  dependencyIssues: DependencyIssue[];
+  // Whether the dependency is direct or transitive
+  isDirect: boolean;
   
-  // Extension issues
-  extensionIssues: ExtensionIssue[];
+  // Whether the dependency is outdated
+  isOutdated: boolean;
   
-  // Framework/technology issues
-  frameworkIssues: FrameworkIssue[];
+  // Whether the dependency has known vulnerabilities
+  isVulnerable: boolean;
   
-  // API issues
-  apiIssues: ApiIssue[];
-  
-  // Summary statistics
-  summary: {
-    totalIssues: number;
-    criticalIssues: number;
-    highPriorityIssues: number;
-    mediumPriorityIssues: number;
-    lowPriorityIssues: number;
-    securityIssues: number;
-    deprecatedIssues: number;
-    outdatedIssues: number;
-    unresolvedIssues: number;
-  };
-  
-  // Overall health score (0-100)
-  healthScore: number;
-  
-  // Next steps recommendations
-  recommendations: string[];
-  
-  // Any errors that occurred during scanning
-  errors?: Array<{
-    message: string;
-    stack?: string;
-    scanner: string;
+  // Vulnerability details
+  vulnerabilities?: Array<{
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    cveIds?: string[];
+    fixedInVersion?: string;
+    url?: string;
   }>;
+  
+  // Files dependent on this package
+  dependentFiles?: string[];
+  
+  // Update impact assessment
+  updateImpact?: {
+    breakingChanges: boolean;
+    testCoverage?: number;
+    affectedComponents?: string[];
+    estimatedEffort: 'low' | 'medium' | 'high';
+  };
 }
 
 /**
- * Configuration for the scanning process
+ * API deprecation issue
  */
-export interface ScanConfig {
-  // Root directory to scan
-  rootDirectory: string;
+export interface ApiDeprecationIssue extends BaseIssue {
+  // API name
+  apiName: string;
   
-  // Whether to use offline mode (don't make API calls)
-  offlineMode: boolean;
+  // API provider
+  provider: string;
   
-  // Dependency scanning configuration
-  dependencyScanning: {
-    enabled: boolean;
-    includeDev: boolean;
-    includePeer: boolean;
-    includeOptional: boolean;
-    ignorePackages?: string[];
+  // Current version in use
+  currentVersion?: string;
+  
+  // When the API will be deprecated
+  deprecationDate?: Date;
+  
+  // When the API will be removed
+  removalDate?: Date;
+  
+  // Files using the deprecated API
+  affectedFiles: string[];
+  
+  // Usage patterns found
+  usagePatterns: Array<{
+    pattern: string;
+    count: number;
+    examples: string[];
+  }>;
+  
+  // Recommended replacement API
+  replacementApi?: string;
+  
+  // Migration guide URL
+  migrationGuideUrl?: string;
+}
+
+/**
+ * Cloud service deprecation issue
+ */
+export interface CloudServiceIssue extends BaseIssue {
+  // Service name
+  serviceName: string;
+  
+  // Cloud provider
+  provider: string;
+  
+  // Current version/tier in use
+  currentVersion?: string;
+  
+  // Type of issue (deprecation, price change, etc.)
+  issueType: 'deprecation' | 'version-eol' | 'price-change' | 'region-closure' | 'feature-removal';
+  
+  // When the change will take effect
+  effectiveDate?: Date;
+  
+  // Components using this service
+  affectedComponents: string[];
+  
+  // Business impact assessment
+  businessImpact: {
+    costIncrease?: number; // Percentage
+    downtime?: number; // Minutes
+    performance?: 'none' | 'minor' | 'major';
+    compliance?: boolean;
+    score: number; // 1-5
   };
   
-  // Extension scanning configuration
-  extensionScanning: {
-    enabled: boolean;
-    browsers: {
-      chrome: boolean;
-      firefox: boolean;
-      edge: boolean;
-      safari: boolean;
-    };
-    approvedExtensions?: string[];
-  };
+  // Recommended action
+  recommendedAction: 'migrate' | 'upgrade' | 'replace' | 'reevaluate-costs';
   
-  // Framework scanning configuration
-  frameworkScanning: {
-    enabled: boolean;
-    includeLanguages: boolean;
-    includeRuntimes: boolean;
-    includeDatabases: boolean;
-    includeInfrastructure: boolean;
-  };
-  
-  // API scanning configuration
-  apiScanning: {
-    enabled: boolean;
-    frameworks: string[];
-    libraries: string[];
-  };
-  
-  // Output configuration
-  output: {
-    jsonFile?: string;
-    htmlReport?: string;
-    csvExport?: string;
-    console: boolean;
-  };
-  
-  // Cache configuration
-  cache: {
-    enabled: boolean;
-    directory?: string;
-    ttlMinutes?: number;
-  };
-  
-  // Custom rules path
-  customRulesPath?: string;
-  
-  // GitHub integration
-  github?: {
-    enabled: boolean;
-    token?: string;
-    owner?: string;
-    repo?: string;
-    createIssues?: boolean;
-  };
+  // Alternative services
+  alternatives?: Array<{
+    name: string;
+    provider: string;
+    migrationEffort: 'low' | 'medium' | 'high';
+    costComparison?: 'lower' | 'similar' | 'higher';
+  }>;
 }
