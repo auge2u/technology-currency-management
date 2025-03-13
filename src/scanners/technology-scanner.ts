@@ -3,96 +3,89 @@ import * as path from 'path';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import { log } from '../utils/logging';
-import { TechnologyIssue } from '../types/scanning';
-import { compareVersions, formatDate } from '../utils/scanner-utils';
+import { ScannerConfig, TechnologyIssue } from '../types/scanning';
 
 const readFileAsync = promisify(fs.readFile);
 
 /**
- * Configuration for technology scanning
+ * Configuration specific to technology scanning
  */
-export interface TechnologyScannerConfig {
-  // Root directory to scan
-  rootDirectory: string;
+export interface TechnologyScannerConfig extends ScannerConfig {
+  // Optional custom database of technologies
+  customTechnologyDbPath?: string;
   
-  // Whether to use offline mode (don't make API calls)
-  offlineMode: boolean;
+  // Whether to detect end-of-life dates
+  detectEol?: boolean;
   
-  // Skip specific technologies
-  ignoreTechnologies?: string[];
+  // Whether to estimate migration effort
+  estimateMigrationEffort?: boolean;
   
-  // API timeout in milliseconds
-  apiTimeoutMs: number;
+  // Maximum number of file samples to read per technology
+  maxFileSamplesPerTechnology?: number;
   
-  // Directory to store cached data
-  cacheDir?: string;
+  // Custom technology definitions to supplement or override defaults
+  customTechnologyDefinitions?: Record<string, TechnologyDefinition>;
   
-  // Custom technology patterns to detect
-  customPatterns?: Record<string, string[]>;
+  // Specific categories to include or exclude
+  includeCategories?: Array<'framework' | 'library' | 'language' | 'runtime' | 'platform' | 'api' | 'other'>;
+  excludeCategories?: Array<'framework' | 'library' | 'language' | 'runtime' | 'platform' | 'api' | 'other'>;
   
-  // Months threshold to flag upcoming EOL
-  upcomingEolMonths?: number;
+  // Specific technologies to include or exclude
+  includeTechnologies?: string[];
+  excludeTechnologies?: string[];
 }
 
 /**
- * Technology definition with version patterns
+ * Definition of a technology for detection and analysis
  */
-interface TechnologyPattern {
+interface TechnologyDefinition {
+  // Technology name
   name: string;
-  type: 'framework' | 'language' | 'library' | 'database' | 'platform' | 'runtime' | 'tool';
-  patterns: Array<{
-    filePattern: string;
-    versionPattern?: RegExp;
-    dependencyPattern?: string;
-    versionExtractor?: (content: string) => string | null;
+  
+  // Category of technology
+  category: 'framework' | 'library' | 'language' | 'runtime' | 'platform' | 'api' | 'other';
+  
+  // File patterns where this technology can be found
+  filePatterns: string[];
+  
+  // Regex patterns to detect this technology in files
+  detectionPatterns: string[];
+  
+  // Regex to extract version information
+  versionExtractionPattern?: string;
+  
+  // Default version to assume if not detectable
+  defaultVersion?: string;
+  
+  // List of versions with their status
+  versions?: Record<string, {
+    releaseDate?: string;
+    endOfLifeDate?: string;
+    supportStatus: 'active' | 'maintenance' | 'security-only' | 'end-of-life' | 'unknown';
+    knownIssues?: string[];
   }>;
-}
-
-/**
- * Detected technology
- */
-interface DetectedTechnology {
-  name: string;
-  type: string;
-  version?: string;
-  detectedAt: string;
-  location: string;
-}
-
-/**
- * EOL (End of Life) information
- */
-interface EolInfo {
-  currentVersion: string;
-  latestVersion: string;
-  isEol: boolean;
-  eolDate?: Date;
-  isDeprecated: boolean;
-  isOutdated: boolean;
-  supportedVersions?: string[];
-  releaseDate?: Date;
-  endOfSupportDate?: Date;
-  endOfExtendedSupportDate?: Date;
-  migrationPath?: string;
+  
+  // Known alternatives to this technology
+  alternatives?: string[];
+  
+  // Migration effort estimate (1-10)
   migrationEffort?: number;
-  recommendedVersion?: string;
+  
+  // Is this technology deprecated
+  isDeprecated?: boolean;
+  
+  // Latest stable version
+  latestVersion?: string;
+  
+  // Vendor/maintainer URL
+  vendorUrl?: string;
+  
+  // Documentation URL
+  documentationUrl?: string;
 }
 
 /**
- * Technology version with lifecycle information
- */
-interface TechnologyVersion {
-  version: string;
-  releaseDate?: Date;
-  endOfSupportDate?: Date;
-  endOfExtendedSupportDate?: Date;
-  isEol: boolean;
-  isLts?: boolean;
-  isLatest?: boolean;
-}
-
-/**
- * Scanner for detecting frameworks, languages, and technologies
+ * Scanner for detecting outdated and deprecated technologies
  */
 export async function scanTechnologies(
   config: TechnologyScannerConfig
@@ -101,84 +94,76 @@ export async function scanTechnologies(
     log.info('Starting technology scanner');
     const issues: TechnologyIssue[] = [];
     
-    // Detect technologies
-    const technologies = await detectTechnologies(config);
-    log.info(`Found ${technologies.length} technologies`);
+    // Load technology definitions database
+    const technologyDefs = await loadTechnologyDefinitions(config);
+    log.info(`Loaded ${Object.keys(technologyDefs).length} technology definitions`);
     
-    // Check each technology
-    for (const technology of technologies) {
+    // Filter definitions based on config
+    const filteredDefs = filterTechnologyDefinitions(technologyDefs, config);
+    log.info(`Using ${Object.keys(filteredDefs).length} technology definitions after filtering`);
+    
+    // Scan for each technology
+    for (const [techId, definition] of Object.entries(filteredDefs)) {
       try {
-        // Skip ignored technologies
-        if (config.ignoreTechnologies && config.ignoreTechnologies.includes(technology.name)) {
-          log.info(`Skipping ignored technology: ${technology.name}`);
-          continue;
+        log.info(`Scanning for technology: ${definition.name}`);
+        
+        // Find files that match the technology patterns
+        const matchingFiles = await findMatchingFiles(definition, config);
+        log.info(`Found ${matchingFiles.length} files matching patterns for ${definition.name}`);
+        
+        if (matchingFiles.length === 0) {
+          continue; // Skip if no files match
         }
         
-        // Get EOL information
-        const eolInfo = await getEolInfo(
-          technology.name,
-          technology.type,
-          technology.version,
-          config.offlineMode,
-          config.cacheDir
-        );
+        // Analyze the files to confirm technology and detect version
+        const analysisResults = await analyzeTechnologyUsage(definition, matchingFiles, config);
+        log.info(`Analysis complete for ${definition.name}`);
         
-        // Only create an issue if there's at least one problem
-        if (eolInfo.isEol || eolInfo.isDeprecated || eolInfo.isOutdated || 
-            (eolInfo.eolDate && isUpcomingEol(eolInfo.eolDate, config.upcomingEolMonths || 6))) {
+        if (!analysisResults.detected) {
+          continue; // Skip if technology was not actually detected
+        }
+        
+        // Check if technology is outdated or deprecated
+        const isOutdated = checkIfOutdated(definition, analysisResults.version);
+        
+        if (isOutdated || definition.isDeprecated === true) {
+          // Create an issue
+          const daysUntilEndOfLife = calculateDaysUntilEndOfLife(definition, analysisResults.version);
           
-          // Create the issue
           const issue: TechnologyIssue = {
-            name: technology.name,
-            type: technology.type,
-            currentVersion: technology.version || eolInfo.currentVersion,
-            latestVersion: eolInfo.latestVersion,
-            location: technology.location,
             detectedAt: new Date(),
-            isEol: eolInfo.isEol,
-            isDeprecated: eolInfo.isDeprecated,
-            isOutdated: eolInfo.isOutdated,
-            eolDate: eolInfo.eolDate,
-            endOfSupportDate: eolInfo.endOfSupportDate,
-            endOfExtendedSupportDate: eolInfo.endOfExtendedSupportDate,
-            supportedVersions: eolInfo.supportedVersions,
-            releaseDate: eolInfo.releaseDate
+            name: definition.name,
+            category: definition.category,
+            currentVersion: analysisResults.version,
+            latestVersion: definition.latestVersion,
+            isDeprecated: !!definition.isDeprecated,
+            isOutdated,
+            supportStatus: getTechnologySupportStatus(definition, analysisResults.version),
+            knownIssues: getKnownIssues(definition, analysisResults.version),
+            affectedFiles: analysisResults.detectedFiles,
+            alternatives: definition.alternatives,
+            riskLevel: calculateRiskLevel(definition, analysisResults.version, isOutdated),
+            tags: generateTags(definition, analysisResults.version, isOutdated),
+            recommendation: generateRecommendation(definition, analysisResults.version, isOutdated),
+            updateImpact: assessUpdateImpact(definition, analysisResults.version)
           };
           
-          // Calculate business impact
-          issue.businessImpact = calculateBusinessImpact(
-            technology,
-            eolInfo
-          );
-          
-          // Calculate migration effort
-          if (eolInfo.migrationEffort !== undefined) {
-            issue.migrationEffort = eolInfo.migrationEffort;
-          } else {
-            issue.migrationEffort = calculateMigrationEffort(
-              technology,
-              eolInfo
-            );
+          // Add end of life information if available
+          if (daysUntilEndOfLife !== null) {
+            issue.daysUntilEndOfLife = daysUntilEndOfLife;
+            
+            // Extract the EOL date from the definition
+            const versionInfo = definition.versions?.[analysisResults.version];
+            if (versionInfo?.endOfLifeDate) {
+              issue.endOfLifeDate = new Date(versionInfo.endOfLifeDate);
+            }
           }
           
-          // Generate recommendation
-          issue.recommendation = generateRecommendation(
-            technology,
-            eolInfo
-          );
-          
-          // Generate tags
-          issue.tags = generateTags(
-            technology,
-            eolInfo
-          );
-          
-          // Add to issues list
           issues.push(issue);
-          log.info(`Added issue for technology ${technology.name} ${technology.version || 'unknown version'}`);
+          log.info(`Added issue for technology ${definition.name} ${analysisResults.version}`);
         }
       } catch (techError) {
-        log.warn(`Error processing technology: ${technology.name}`, { error: techError });
+        log.error(`Error analyzing technology ${definition.name}`, { error: techError });
       }
     }
     
@@ -191,383 +176,439 @@ export async function scanTechnologies(
 }
 
 /**
- * Detect technologies used in the project
+ * Load technology definitions from built-in data and custom sources
  */
-async function detectTechnologies(
+async function loadTechnologyDefinitions(
   config: TechnologyScannerConfig
-): Promise<DetectedTechnology[]> {
-  try {
-    const technologies: DetectedTechnology[] = [];
-    const rootDir = config.rootDirectory;
-    
-    // Define technology patterns
-    const patterns = getTechnologyPatterns();
-    
-    // Add custom patterns if provided
-    if (config.customPatterns) {
-      for (const [name, filePatterns] of Object.entries(config.customPatterns)) {
-        // Add as custom technology type
-        patterns.push({
-          name,
-          type: 'framework',
-          patterns: filePatterns.map(pattern => ({ filePattern: pattern }))
-        });
+): Promise<Record<string, TechnologyDefinition>> {
+  // Start with built-in technology definitions
+  const definitions = getBuiltInTechnologyDefinitions();
+  
+  // Add custom definitions from config
+  if (config.customTechnologyDefinitions) {
+    for (const [id, def] of Object.entries(config.customTechnologyDefinitions)) {
+      definitions[id] = def;
+    }
+  }
+  
+  // Load from custom database file if specified
+  if (config.customTechnologyDbPath && fs.existsSync(config.customTechnologyDbPath)) {
+    try {
+      const customDb = JSON.parse(await readFileAsync(config.customTechnologyDbPath, 'utf8'));
+      
+      for (const [id, def] of Object.entries(customDb)) {
+        // Validate tech definition structure
+        if (isValidTechDefinition(def as any)) {
+          definitions[id] = def as TechnologyDefinition;
+        } else {
+          log.warn(`Invalid technology definition found in custom DB: ${id}`);
+        }
       }
+    } catch (dbError) {
+      log.error('Error loading custom technology database', { error: dbError });
+    }
+  }
+  
+  return definitions;
+}
+
+/**
+ * Check if a technology definition has the required properties
+ */
+function isValidTechDefinition(def: any): boolean {
+  return (
+    typeof def === 'object' &&
+    typeof def.name === 'string' &&
+    ['framework', 'library', 'language', 'runtime', 'platform', 'api', 'other'].includes(def.category) &&
+    Array.isArray(def.filePatterns) &&
+    Array.isArray(def.detectionPatterns)
+  );
+}
+
+/**
+ * Filter technology definitions based on configuration
+ */
+function filterTechnologyDefinitions(
+  definitions: Record<string, TechnologyDefinition>,
+  config: TechnologyScannerConfig
+): Record<string, TechnologyDefinition> {
+  const filtered: Record<string, TechnologyDefinition> = {};
+  
+  for (const [id, def] of Object.entries(definitions)) {
+    // Skip if explicitly excluded
+    if (config.excludeTechnologies?.includes(def.name)) {
+      continue;
     }
     
-    // Detect each technology
-    for (const technology of patterns) {
-      try {
-        for (const pattern of technology.patterns) {
+    // Skip if category is excluded
+    if (config.excludeCategories?.includes(def.category)) {
+      continue;
+    }
+    
+    // Include only if in includeCategories (if specified)
+    if (config.includeCategories && !config.includeCategories.includes(def.category)) {
+      continue;
+    }
+    
+    // Include only if in includeTechnologies (if specified)
+    if (config.includeTechnologies && !config.includeTechnologies.includes(def.name)) {
+      continue;
+    }
+    
+    filtered[id] = def;
+  }
+  
+  return filtered;
+}
+
+/**
+ * Find files that match the file patterns for a technology
+ */
+async function findMatchingFiles(
+  definition: TechnologyDefinition,
+  config: TechnologyScannerConfig
+): Promise<string[]> {
+  const matchingFiles: string[] = [];
+  
+  // Process each file pattern
+  for (const pattern of definition.filePatterns) {
+    try {
+      const files = await glob(pattern, {
+        cwd: config.rootDir,
+        absolute: true,
+        ignore: [...(config.excludePaths || []), '**/node_modules/**', '**/.git/**']
+      });
+      
+      // Apply file size restrictions if configured
+      if (config.maxFileSizeBytes) {
+        for (const file of files) {
           try {
-            const matches = await glob(path.join(rootDir, pattern.filePattern), {
-              ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
-            });
-            
-            for (const match of matches) {
-              try {
-                let version: string | undefined;
-                
-                // Try to extract version if a version pattern is provided
-                if (pattern.versionPattern || pattern.versionExtractor) {
-                  try {
-                    const content = await readFileAsync(match, 'utf8');
-                    
-                    if (pattern.versionExtractor) {
-                      const extractedVersion = pattern.versionExtractor(content);
-                      if (extractedVersion) {
-                        version = extractedVersion;
-                      }
-                    } else if (pattern.versionPattern) {
-                      const versionMatch = content.match(pattern.versionPattern);
-                      if (versionMatch && versionMatch[1]) {
-                        version = versionMatch[1];
-                      }
-                    }
-                  } catch (readError) {
-                    // Skip version extraction if file can't be read
-                  }
-                }
-                
-                // Only add if not already detected
-                const existingTech = technologies.find(t => 
-                  t.name === technology.name && t.version === version
-                );
-                
-                if (!existingTech) {
-                  technologies.push({
-                    name: technology.name,
-                    type: technology.type,
-                    version,
-                    detectedAt: match,
-                    location: match
-                  });
-                  
-                  log.info(
-                    `Detected ${technology.name} ${version || 'unknown version'} at ${match}`
-                  );
-                }
-              } catch (matchError) {
-                log.warn(`Error processing match: ${match}`, { error: matchError });
-              }
+            const stats = await fs.promises.stat(file);
+            if (stats.size <= config.maxFileSizeBytes) {
+              matchingFiles.push(file);
+            } else {
+              log.info(`Skipping file exceeding size limit: ${file} (${stats.size} bytes)`);
             }
-          } catch (patternError) {
-            log.warn(`Error processing pattern: ${pattern.filePattern}`, { error: patternError });
+          } catch (fileError) {
+            log.warn(`Error checking file size for ${file}`, { error: fileError });
           }
         }
-      } catch (techError) {
-        log.warn(`Error processing technology: ${technology.name}`, { error: techError });
+      } else {
+        matchingFiles.push(...files);
       }
+    } catch (globError) {
+      log.warn(`Error searching for pattern ${pattern}`, { error: globError });
     }
-    
-    return technologies;
-  } catch (error) {
-    log.error('Error detecting technologies', { error });
-    return [];
   }
+  
+  return [...new Set(matchingFiles)]; // Deduplicate
 }
 
 /**
- * Get end-of-life information for a technology
+ * Analyze files to detect technology usage and version
  */
-async function getEolInfo(
-  name: string,
-  type: string,
-  version?: string,
-  offlineMode: boolean,
-  cacheDir?: string
-): Promise<EolInfo> {
-  // Check cache first
-  if (cacheDir) {
-    const cacheFile = path.join(cacheDir, `tech-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
-    
-    if (fs.existsSync(cacheFile)) {
-      try {
-        const cacheContent = await readFileAsync(cacheFile, 'utf8');
-        const cachedInfo = JSON.parse(cacheContent) as EolInfo;
-        log.info(`Loaded ${name} EOL info from cache`);
-        return cachedInfo;
-      } catch (cacheError) {
-        log.warn(`Error reading technology cache for ${name}`, { error: cacheError });
-      }
-    }
-  }
+async function analyzeTechnologyUsage(
+  definition: TechnologyDefinition,
+  files: string[],
+  config: TechnologyScannerConfig
+): Promise<{
+  detected: boolean;
+  version: string;
+  detectedFiles: string[];
+}> {
+  const result = {
+    detected: false,
+    version: definition.defaultVersion || 'unknown',
+    detectedFiles: [] as string[]
+  };
   
-  // If in offline mode and no cache, return placeholder data
-  if (offlineMode) {
-    log.info(`Offline mode enabled for ${name}, using placeholder data`);
-    return {
-      currentVersion: version || '0.0.0',
-      latestVersion: version || '0.0.0', // Assume current version is latest
-      isEol: false,
-      isDeprecated: false,
-      isOutdated: false
-    };
-  }
+  // Limit number of files to analyze if configured
+  const filesToAnalyze = config.maxFileSamplesPerTechnology && 
+    config.maxFileSamplesPerTechnology < files.length ?
+    files.slice(0, config.maxFileSamplesPerTechnology) : 
+    files;
   
-  // In a real implementation, we would query a technology database or API
-  // For this example, we'll use mock data
-  try {
-    log.info(`Querying EOL info for ${type} ${name} ${version || 'unknown version'}`);
-    
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 200));
-    
-    // Define technology versions with lifecycle information
-    const techVersions = getTechnologyVersions(name);
-    
-    // Find current version or use the provided one
-    const currentVersionObj = version 
-      ? techVersions.find(v => v.version === version) 
-      : techVersions[Math.floor(Math.random() * techVersions.length)];
-    
-    const currentVersion = currentVersionObj?.version || version || '0.0.0';
-    
-    // Find latest version
-    const latestVersion = techVersions
-      .filter(v => v.isLatest)
-      .map(v => v.version)
-      .sort((a, b) => compareVersions(b, a))[0] || currentVersion;
-    
-    // Calculate if it's EOL
-    const isEol = currentVersionObj?.isEol || false;
-    
-    // Generate random dates if not set
-    const releaseDate = currentVersionObj?.releaseDate || 
-      new Date(Date.now() - Math.random() * 5 * 365 * 24 * 60 * 60 * 1000);
-    
-    const endOfSupportDate = currentVersionObj?.endOfSupportDate || 
-      new Date(releaseDate.getTime() + Math.random() * 3 * 365 * 24 * 60 * 60 * 1000);
-    
-    const endOfExtendedSupportDate = currentVersionObj?.endOfExtendedSupportDate || 
-      new Date(endOfSupportDate.getTime() + Math.random() * 2 * 365 * 24 * 60 * 60 * 1000);
-    
-    // Generate the EOL info
-    const info: EolInfo = {
-      currentVersion,
-      latestVersion,
-      isEol,
-      eolDate: isEol ? endOfSupportDate : undefined,
-      isDeprecated: Math.random() < 0.2, // 20% chance of being deprecated
-      isOutdated: compareVersions(currentVersion, latestVersion) < 0,
-      supportedVersions: techVersions
-        .filter(v => !v.isEol)
-        .map(v => v.version),
-      releaseDate,
-      endOfSupportDate,
-      endOfExtendedSupportDate,
-      recommendedVersion: latestVersion
-    };
-    
-    // Calculate migration effort based on version difference
-    const versionDiff = compareVersions(latestVersion, currentVersion);
-    info.migrationEffort = Math.min(5, Math.max(1, Math.ceil(versionDiff / 2)));
-    
-    // Save to cache if cacheDir is provided
-    if (cacheDir) {
-      try {
-        if (!fs.existsSync(cacheDir)) {
-          fs.mkdirSync(cacheDir, { recursive: true });
-        }
+  // Create regex objects from detection patterns
+  const detectionRegexes = definition.detectionPatterns.map(pattern => new RegExp(pattern, 'i'));
+  
+  // Create version extraction regex if available
+  const versionRegex = definition.versionExtractionPattern ? 
+    new RegExp(definition.versionExtractionPattern, 'i') : 
+    null;
+  
+  // Analyze each file
+  for (const file of filesToAnalyze) {
+    try {
+      const content = await readFileAsync(file, 'utf8');
+      
+      // Check if any detection pattern matches
+      const detected = detectionRegexes.some(regex => regex.test(content));
+      
+      if (detected) {
+        result.detected = true;
+        result.detectedFiles.push(file);
         
-        const cacheFile = path.join(cacheDir, `tech-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
-        await fs.promises.writeFile(cacheFile, JSON.stringify(info, null, 2), 'utf8');
-        log.info(`Cached ${name} EOL info`);
-      } catch (cacheError) {
-        log.warn(`Error writing technology cache for ${name}`, { error: cacheError });
+        // Extract version if possible
+        if (versionRegex) {
+          const versionMatch = content.match(versionRegex);
+          if (versionMatch && versionMatch[1]) {
+            result.version = versionMatch[1].trim();
+            // Once we find a version, no need to look further
+            // (assuming all files use the same version)
+            break;
+          }
+        }
+      }
+    } catch (fileError) {
+      log.warn(`Error analyzing file ${file}`, { error: fileError });
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Check if a technology version is outdated
+ */
+function checkIfOutdated(
+  definition: TechnologyDefinition,
+  version: string
+): boolean {
+  // If the technology has a latest version defined
+  if (definition.latestVersion && version !== 'unknown') {
+    // Simple version comparison for now
+    // A more sophisticated approach would use semver or custom logic per technology
+    return version !== definition.latestVersion;
+  }
+  
+  // If the technology has version-specific support status
+  if (definition.versions && version in definition.versions) {
+    const versionInfo = definition.versions[version];
+    return versionInfo.supportStatus !== 'active';
+  }
+  
+  return false;
+}
+
+/**
+ * Calculate days until end-of-life for a technology version
+ */
+function calculateDaysUntilEndOfLife(
+  definition: TechnologyDefinition,
+  version: string
+): number | null {
+  // Skip if no version info or EOL date
+  if (!definition.versions || 
+      !definition.versions[version] || 
+      !definition.versions[version].endOfLifeDate) {
+    return null;
+  }
+  
+  const eolDateString = definition.versions[version].endOfLifeDate;
+  
+  try {
+    const eolDate = new Date(eolDateString!);
+    const today = new Date();
+    
+    // Calculate difference in days
+    const diffTime = eolDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    return Math.max(0, diffDays); // Return 0 if already past EOL
+  } catch (dateError) {
+    log.warn(`Error calculating EOL days for ${definition.name} ${version}`, { error: dateError });
+    return null;
+  }
+}
+
+/**
+ * Get support status for a technology version
+ */
+function getTechnologySupportStatus(
+  definition: TechnologyDefinition,
+  version: string
+): 'active' | 'maintenance' | 'security-only' | 'end-of-life' | 'unknown' {
+  // If version-specific status is available
+  if (definition.versions && version in definition.versions) {
+    return definition.versions[version].supportStatus;
+  }
+  
+  // Default status based on whether it's deprecated
+  return definition.isDeprecated ? 'end-of-life' : 'unknown';
+}
+
+/**
+ * Get known issues for a technology version
+ */
+function getKnownIssues(
+  definition: TechnologyDefinition,
+  version: string
+): string[] | undefined {
+  // If version-specific issues are available
+  if (definition.versions && version in definition.versions) {
+    return definition.versions[version].knownIssues;
+  }
+  
+  return undefined;
+}
+
+/**
+ * Calculate risk level for a technology issue
+ */
+function calculateRiskLevel(
+  definition: TechnologyDefinition,
+  version: string,
+  isOutdated: boolean
+): 'low' | 'medium' | 'high' | 'critical' {
+  // Start with a base risk level
+  let riskLevel: 'low' | 'medium' | 'high' | 'critical' = 'low';
+  
+  // If the technology is deprecated, it's at least medium risk
+  if (definition.isDeprecated) {
+    riskLevel = 'medium';
+  }
+  
+  // Check support status if version info is available
+  if (definition.versions && version in definition.versions) {
+    const versionInfo = definition.versions[version];
+    
+    switch (versionInfo.supportStatus) {
+      case 'end-of-life':
+        riskLevel = 'high';
+        break;
+      case 'security-only':
+        riskLevel = 'medium';
+        break;
+      case 'maintenance':
+        if (riskLevel === 'low') riskLevel = 'low';
+        break;
+      case 'active':
+        // Active support keeps risk low unless other factors increase it
+        break;
+    }
+    
+    // Check if past end-of-life
+    if (versionInfo.endOfLifeDate) {
+      const eolDate = new Date(versionInfo.endOfLifeDate);
+      const today = new Date();
+      
+      if (today > eolDate) {
+        // Past EOL is high risk
+        riskLevel = 'high';
+        
+        // More than a year past EOL is critical
+        const yearInMs = 365 * 24 * 60 * 60 * 1000;
+        if (today.getTime() - eolDate.getTime() > yearInMs) {
+          riskLevel = 'critical';
+        }
+      } else {
+        // Approaching EOL
+        const threeMonthsInMs = 90 * 24 * 60 * 60 * 1000;
+        if (eolDate.getTime() - today.getTime() < threeMonthsInMs) {
+          // Within 3 months of EOL increases risk
+          if (riskLevel === 'low') riskLevel = 'medium';
+          else if (riskLevel === 'medium') riskLevel = 'high';
+        }
       }
     }
     
-    return info;
-  } catch (error) {
-    log.error(`Error querying EOL info for ${name}`, { error });
-    
-    // Return basic info if query fails
-    return {
-      currentVersion: version || '0.0.0',
-      latestVersion: version || '0.0.0',
-      isEol: false,
-      isDeprecated: false,
-      isOutdated: false
-    };
-  }
-}
-
-/**
- * Check if EOL date is approaching within the specified number of months
- */
-function isUpcomingEol(eolDate: Date, months: number): boolean {
-  const now = new Date();
-  const monthsAway = (eolDate.getTime() - now.getTime()) / (30 * 24 * 60 * 60 * 1000);
-  return monthsAway > 0 && monthsAway <= months;
-}
-
-/**
- * Calculate business impact score for a technology issue
- */
-function calculateBusinessImpact(
-  technology: DetectedTechnology,
-  eolInfo: EolInfo
-): number {
-  let score = 1; // Start with minimal impact
-  
-  // EOL has high impact
-  if (eolInfo.isEol) score += 2;
-  
-  // Deprecation has medium impact
-  if (eolInfo.isDeprecated) score += 1;
-  
-  // Being outdated has lower impact
-  if (eolInfo.isOutdated) score += 1;
-  
-  // If EOL date is close, increase impact
-  if (eolInfo.eolDate) {
-    const monthsToEol = (eolInfo.eolDate.getTime() - new Date().getTime()) / (30 * 24 * 60 * 60 * 1000);
-    if (monthsToEol > 0 && monthsToEol <= 3) {
-      score += 1;
+    // Known issues increase risk
+    if (versionInfo.knownIssues && versionInfo.knownIssues.length > 0) {
+      // Having any known issues increases risk
+      if (riskLevel === 'low') riskLevel = 'medium';
+      else if (riskLevel === 'medium') riskLevel = 'high';
+      
+      // Many known issues may indicate critical risk
+      if (versionInfo.knownIssues.length > 3) {
+        riskLevel = 'high';
+      }
     }
   }
   
-  // Core technologies have higher impact
-  const criticalTechnologies = ['java', 'dotnet', 'python', 'nodejs', 'react', 'angular', 'vue', 'spring', 'django'];
-  if (criticalTechnologies.includes(technology.name.toLowerCase())) {
-    score += 1;
-  }
-  
-  // Cap at maximum of 5
-  return Math.min(score, 5);
-}
-
-/**
- * Calculate migration effort for updating a technology
- */
-function calculateMigrationEffort(
-  technology: DetectedTechnology,
-  eolInfo: EolInfo
-): number {
-  // Use provided migration effort if available
-  if (eolInfo.migrationEffort !== undefined) {
-    return eolInfo.migrationEffort;
-  }
-  
-  // Start with default effort
-  let effort = 3;
-  
-  // Calculate version difference
-  if (technology.version && eolInfo.latestVersion) {
-    const versionDiff = compareVersions(eolInfo.latestVersion, technology.version);
+  // Being significantly outdated increases risk
+  if (isOutdated && definition.latestVersion && version !== 'unknown') {
+    const versionParts = version.split('.');
+    const latestParts = definition.latestVersion.split('.');
     
-    // Major version upgrades are more difficult
-    if (versionDiff >= 2) {
-      effort += 1;
-    } else if (versionDiff <= 0) {
-      effort -= 1; // Same or newer version is easier
+    // Check major version difference (simple heuristic)
+    if (versionParts[0] !== latestParts[0]) {
+      if (riskLevel === 'medium') riskLevel = 'high';
+      else if (riskLevel === 'low') riskLevel = 'medium';
+      
+      // Multiple major versions behind is more serious
+      const majorDiff = parseInt(latestParts[0]) - parseInt(versionParts[0]);
+      if (majorDiff >= 2) {
+        riskLevel = 'high';
+      }
     }
   }
   
-  // Technology type affects effort
-  switch (technology.type) {
-    case 'language':
-    case 'platform':
-      // Languages and platforms are harder to migrate
-      effort += 1;
-      break;
-    case 'library':
-      // Libraries are generally easier
-      effort -= 1;
-      break;
-  }
-  
-  // Cap at 1-5 range
-  return Math.max(1, Math.min(5, effort));
+  return riskLevel;
 }
 
 /**
- * Generate a recommendation for a technology issue
- */
-function generateRecommendation(
-  technology: DetectedTechnology,
-  eolInfo: EolInfo
-): string {
-  const recommendations: string[] = [];
-  
-  if (eolInfo.isEol) {
-    recommendations.push(
-      `Migrate ${technology.name} ${technology.version || ''} to a supported version as it has reached end-of-life`
-    );
-    
-    if (eolInfo.recommendedVersion) {
-      recommendations.push(
-        `Consider upgrading to ${technology.name} ${eolInfo.recommendedVersion}`
-      );
-    }
-  } else if (eolInfo.isDeprecated) {
-    recommendations.push(
-      `Plan migration from deprecated ${technology.name} ${technology.version || ''} to a supported alternative`
-    );
-  } else if (eolInfo.isOutdated) {
-    recommendations.push(
-      `Update ${technology.name} from ${technology.version || eolInfo.currentVersion} to ${eolInfo.latestVersion}`
-    );
-  }
-  
-  if (eolInfo.eolDate) {
-    const now = new Date();
-    const monthsToEol = Math.round((eolInfo.eolDate.getTime() - now.getTime()) / (30 * 24 * 60 * 60 * 1000));
-    
-    if (monthsToEol > 0 && monthsToEol <= 12) {
-      recommendations.push(
-        `Prepare for ${technology.name} end-of-support in approximately ${monthsToEol} month${monthsToEol !== 1 ? 's' : ''} (${formatDate(eolInfo.eolDate)})`
-      );
-    }
-  }
-  
-  if (recommendations.length === 0) {
-    recommendations.push(`No immediate action required for ${technology.name} ${technology.version || ''}`);
-  }
-  
-  return recommendations.join('. ');
-}
-
-/**
- * Generate tags for categorizing technology issues
+ * Generate tags for a technology issue
  */
 function generateTags(
-  technology: DetectedTechnology,
-  eolInfo: EolInfo
+  definition: TechnologyDefinition,
+  version: string,
+  isOutdated: boolean
 ): string[] {
-  const tags: string[] = [technology.type];
+  const tags = [definition.category];
   
-  if (eolInfo.isEol) tags.push('eol');
-  if (eolInfo.isDeprecated) tags.push('deprecated');
-  if (eolInfo.isOutdated) tags.push('outdated');
+  // Add tech-specific tag
+  tags.push(definition.name.toLowerCase().replace(/\s+/g, '-'));
   
-  // Add upcoming-eol tag if EOL is within 6 months
-  if (eolInfo.eolDate) {
-    const now = new Date();
-    const monthsToEol = (eolInfo.eolDate.getTime() - now.getTime()) / (30 * 24 * 60 * 60 * 1000);
-    if (monthsToEol > 0 && monthsToEol <= 6) {
-      tags.push('upcoming-eol');
+  // Version-related tags
+  if (version !== 'unknown') {
+    tags.push(`version-${version}`);
+  }
+  
+  // Status tags
+  if (definition.isDeprecated) {
+    tags.push('deprecated');
+  }
+  
+  if (isOutdated) {
+    tags.push('outdated');
+    
+    // Check if it's a major, minor, or patch version difference
+    if (definition.latestVersion && version !== 'unknown') {
+      const versionParts = version.split('.');
+      const latestParts = definition.latestVersion.split('.');
+      
+      if (versionParts[0] !== latestParts[0]) {
+        tags.push('major-update-needed');
+      } else if (versionParts[1] !== latestParts[1]) {
+        tags.push('minor-update-needed');
+      } else {
+        tags.push('patch-update-needed');
+      }
+    }
+  }
+  
+  // Support status tag
+  const supportStatus = getTechnologySupportStatus(definition, version);
+  tags.push(`support-${supportStatus}`);
+  
+  // EOL tag if applicable
+  if (definition.versions?.[version]?.endOfLifeDate) {
+    const eolDate = new Date(definition.versions[version].endOfLifeDate!); 
+    const today = new Date();
+    
+    if (today > eolDate) {
+      tags.push('past-eol');
+    } else {
+      // Calculate months until EOL
+      const monthsUntilEol = Math.floor(
+        (eolDate.getTime() - today.getTime()) / (30 * 24 * 60 * 60 * 1000)
+      );
+      
+      if (monthsUntilEol <= 3) {
+        tags.push('eol-imminent');
+      } else if (monthsUntilEol <= 12) {
+        tags.push('eol-approaching');
+      }
     }
   }
   
@@ -575,417 +616,386 @@ function generateTags(
 }
 
 /**
- * Get predefined technology patterns for detection
+ * Generate recommendation for a technology issue
  */
-function getTechnologyPatterns(): TechnologyPattern[] {
-  return [
-    // JavaScript Frameworks
-    {
-      name: 'React',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/package.json', dependencyPattern: 'react' },
-        { filePattern: '**/*.jsx' },
-        { filePattern: '**/*.tsx' },
-        {
-          filePattern: '**/package.json',
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.dependencies?.react || pkg.devDependencies?.react || null;
-            } catch {
-              return null;
-            }
-          }
+function generateRecommendation(
+  definition: TechnologyDefinition,
+  version: string,
+  isOutdated: boolean
+): string {
+  const recommendations: string[] = [];
+  
+  // Handle deprecated technology
+  if (definition.isDeprecated) {
+    recommendations.push(
+      `${definition.name} is deprecated and should be replaced with an alternative technology.`
+    );
+    
+    if (definition.alternatives && definition.alternatives.length > 0) {
+      recommendations.push(
+        `Consider using one of these alternatives: ${definition.alternatives.join(', ')}.`
+      );
+    }
+  }
+  // Handle outdated but not deprecated technology
+  else if (isOutdated && definition.latestVersion) {
+    recommendations.push(
+      `Update ${definition.name} from version ${version} to the latest version ${definition.latestVersion}.`
+    );
+    
+    // Add version-specific concerns
+    if (definition.versions && version in definition.versions) {
+      const versionInfo = definition.versions[version];
+      
+      if (versionInfo.supportStatus === 'end-of-life') {
+        recommendations.push(
+          `Version ${version} has reached end-of-life and is no longer supported.`
+        );
+      } else if (versionInfo.supportStatus === 'security-only') {
+        recommendations.push(
+          `Version ${version} is in security-only maintenance mode and receives only critical security patches.`
+        );
+      } else if (versionInfo.supportStatus === 'maintenance') {
+        recommendations.push(
+          `Version ${version} is in maintenance mode and will not receive new features.`
+        );
+      }
+      
+      // Add EOL warning
+      if (versionInfo.endOfLifeDate) {
+        const eolDate = new Date(versionInfo.endOfLifeDate);
+        const today = new Date();
+        
+        if (today > eolDate) {
+          recommendations.push(
+            `This version reached end-of-life on ${eolDate.toLocaleDateString()}. Upgrade immediately.`
+          );
+        } else {
+          recommendations.push(
+            `This version will reach end-of-life on ${eolDate.toLocaleDateString()}. Plan your upgrade accordingly.`
+          );
         }
-      ]
-    },
-    {
-      name: 'Angular',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/angular.json' },
-        { filePattern: '**/package.json', dependencyPattern: '@angular/core' },
-        {
-          filePattern: '**/package.json',
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.dependencies?.['@angular/core'] || pkg.devDependencies?.['@angular/core'] || null;
-            } catch {
-              return null;
-            }
-          }
-        }
-      ]
-    },
-    {
-      name: 'Vue',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/package.json', dependencyPattern: 'vue' },
-        { filePattern: '**/*.vue' },
-        {
-          filePattern: '**/package.json',
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.dependencies?.vue || pkg.devDependencies?.vue || null;
-            } catch {
-              return null;
-            }
-          }
-        }
-      ]
-    },
-    // Backend Frameworks
-    {
-      name: 'Express',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/package.json', dependencyPattern: 'express' },
-        {
-          filePattern: '**/package.json',
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.dependencies?.express || pkg.devDependencies?.express || null;
-            } catch {
-              return null;
-            }
-          }
-        }
-      ]
-    },
-    {
-      name: 'Django',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/requirements.txt', versionPattern: /django([>=<~]*)([\d\.]+)/i },
-        { filePattern: '**/settings.py' },
-        { filePattern: '**/urls.py' },
-      ]
-    },
-    {
-      name: 'Spring Boot',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/pom.xml', versionPattern: /<spring-boot.version>([\d\.]+)<\/spring-boot.version>/ },
-        { filePattern: '**/build.gradle', versionPattern: /spring-boot:["']([\d\.]+)["']/ },
-        { filePattern: '**/application.properties' },
-        { filePattern: '**/application.yml' },
-      ]
-    },
-    // Languages
-    {
-      name: 'Node.js',
-      type: 'runtime',
-      patterns: [
-        { filePattern: '**/package.json' },
-        { filePattern: '**/.nvmrc', versionPattern: /^v?([\d\.]+)$/ },
-        { filePattern: '**/.node-version', versionPattern: /^v?([\d\.]+)$/ },
-      ]
-    },
-    {
-      name: 'Python',
-      type: 'language',
-      patterns: [
-        { filePattern: '**/requirements.txt' },
-        { filePattern: '**/*.py' },
-        { filePattern: '**/Pipfile' },
-        { filePattern: '**/.python-version', versionPattern: /^([\d\.]+)$/ },
-        { filePattern: '**/runtime.txt', versionPattern: /python-([\d\.]+)/ },
-      ]
-    },
-    {
-      name: 'Java',
-      type: 'language',
-      patterns: [
-        { filePattern: '**/pom.xml' },
-        { filePattern: '**/build.gradle' },
-        { filePattern: '**/*.java' },
-        { 
-          filePattern: '**/pom.xml', 
-          versionPattern: /<java.version>([\d\.]+)<\/java.version>/ 
-        },
-        { 
-          filePattern: '**/build.gradle', 
-          versionPattern: /sourceCompatibility\s*=\s*['"]?([\d\.]+)['"]?/ 
-        },
-      ]
-    },
-    {
-      name: 'PHP',
-      type: 'language',
-      patterns: [
-        { filePattern: '**/composer.json' },
-        { filePattern: '**/*.php' },
-        { 
-          filePattern: '**/composer.json', 
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.require?.php || null;
-            } catch {
-              return null;
-            }
-          }
-        },
-      ]
-    },
-    // Databases
-    {
-      name: 'MongoDB',
-      type: 'database',
-      patterns: [
-        { filePattern: '**/package.json', dependencyPattern: 'mongoose' },
-        { filePattern: '**/package.json', dependencyPattern: 'mongodb' },
-        { filePattern: '**/docker-compose.yml', versionPattern: /image:\s*mongo:([\d\.]+)/ },
-      ]
-    },
-    {
-      name: 'PostgreSQL',
-      type: 'database',
-      patterns: [
-        { filePattern: '**/package.json', dependencyPattern: 'pg' },
-        { filePattern: '**/docker-compose.yml', versionPattern: /image:\s*postgres:([\d\.]+)/ },
-        { filePattern: '**/requirements.txt', versionPattern: /psycopg2([>=<~]*)([\d\.]+)/ },
-      ]
-    },
-    // Mobile Frameworks
-    {
-      name: 'React Native',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/package.json', dependencyPattern: 'react-native' },
-        {
-          filePattern: '**/package.json',
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.dependencies?.['react-native'] || pkg.devDependencies?.['react-native'] || null;
-            } catch {
-              return null;
-            }
-          }
-        }
-      ]
-    },
-    {
-      name: 'Flutter',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/pubspec.yaml', versionPattern: /sdk:\s*flutter/ },
-        { filePattern: '**/*.dart' },
-      ]
-    },
-    // DevOps
-    {
-      name: 'Docker',
-      type: 'tool',
-      patterns: [
-        { filePattern: '**/Dockerfile' },
-        { filePattern: '**/docker-compose.yml' },
-      ]
-    },
-    {
-      name: 'Kubernetes',
-      type: 'platform',
-      patterns: [
-        { filePattern: '**/*.yaml', versionPattern: /apiVersion:\s*([\w\/]+)/ },
-        { filePattern: '**/*.yml', versionPattern: /apiVersion:\s*([\w\/]+)/ },
-      ]
-    },
-    // .NET
-    {
-      name: '.NET',
-      type: 'platform',
-      patterns: [
-        { filePattern: '**/*.csproj', versionPattern: /<TargetFramework>net([\d\.]+)<\/TargetFramework>/ },
-        { filePattern: '**/*.cs' },
-        { filePattern: '**/global.json', versionPattern: /"version":\s*"([\d\.]+)"/ },
-      ]
-    },
-    // Other frameworks
-    {
-      name: 'Laravel',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/composer.json', dependencyPattern: 'laravel/framework' },
-        { filePattern: '**/artisan' },
-        { 
-          filePattern: '**/composer.json', 
-          versionExtractor: (content) => {
-            try {
-              const pkg = JSON.parse(content);
-              return pkg.require?.['laravel/framework'] || null;
-            } catch {
-              return null;
-            }
-          }
-        },
-      ]
-    },
-    {
-      name: 'Ruby on Rails',
-      type: 'framework',
-      patterns: [
-        { filePattern: '**/Gemfile', versionPattern: /gem\s+['"]rails['"]\s*,\s*['"]([\d\.]+)['"]/ },
-        { filePattern: '**/config/application.rb' },
-        { filePattern: '**/config/routes.rb' },
-      ]
-    },
-    // Add more technologies as needed
-  ];
+      }
+      
+      // Add known issues
+      if (versionInfo.knownIssues && versionInfo.knownIssues.length > 0) {
+        recommendations.push(
+          `This version has ${versionInfo.knownIssues.length} known issues:`
+        );
+        
+        versionInfo.knownIssues.forEach(issue => {
+          recommendations.push(`- ${issue}`);
+        });
+      }
+    }
+  }
+  
+  // Add general information
+  if (definition.vendorUrl) {
+    recommendations.push(`Vendor information: ${definition.vendorUrl}`);
+  }
+  
+  if (definition.documentationUrl) {
+    recommendations.push(`Documentation: ${definition.documentationUrl}`);
+  }
+  
+  // If no specific recommendations were made, add a default message
+  if (recommendations.length === 0) {
+    recommendations.push(
+      `No immediate action required for ${definition.name} ${version}.`
+    );
+  }
+  
+  return recommendations.join('\n');
 }
 
 /**
- * Get technology versions with lifecycle information
+ * Assess the impact of updating or replacing a technology
  */
-function getTechnologyVersions(name: string): TechnologyVersion[] {
-  // This would come from a database or API in a real implementation
-  // Here we're using mock data for demonstration
+function assessUpdateImpact(
+  definition: TechnologyDefinition,
+  version: string
+): {
+  breakingChanges: boolean;
+  affectedComponents?: string[];
+  estimatedEffort: 'low' | 'medium' | 'high';
+  estimatedTimeInDays?: number;
+} {
+  // Default impact assessment
+  const impact = {
+    breakingChanges: false,
+    estimatedEffort: 'low' as 'low' | 'medium' | 'high'
+  };
   
-  const now = new Date();
-  const oneYear = 365 * 24 * 60 * 60 * 1000;
-  
-  switch (name.toLowerCase()) {
-    case 'node.js':
-      return [
-        {
-          version: '20.0.0',
-          releaseDate: new Date(now.getTime() - 0.2 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 1.8 * oneYear),
-          isEol: false,
-          isLatest: true
-        },
-        {
-          version: '18.0.0',
-          releaseDate: new Date(now.getTime() - 1.5 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 0.5 * oneYear),
-          isEol: false,
-          isLts: true
-        },
-        {
-          version: '16.0.0',
-          releaseDate: new Date(now.getTime() - 2.5 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 0.5 * oneYear),
-          isEol: true
-        },
-        {
-          version: '14.0.0',
-          releaseDate: new Date(now.getTime() - 3.5 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 1.5 * oneYear),
-          isEol: true
-        }
-      ];
-      
-    case 'react':
-      return [
-        {
-          version: '18.2.0',
-          releaseDate: new Date(now.getTime() - 0.4 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 2 * oneYear),
-          isEol: false,
-          isLatest: true
-        },
-        {
-          version: '18.0.0',
-          releaseDate: new Date(now.getTime() - 0.9 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 1.5 * oneYear),
-          isEol: false
-        },
-        {
-          version: '17.0.2',
-          releaseDate: new Date(now.getTime() - 2 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 0.2 * oneYear),
-          isEol: true
-        },
-        {
-          version: '16.14.0',
-          releaseDate: new Date(now.getTime() - 3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 1.2 * oneYear),
-          isEol: true
-        }
-      ];
+  // Defaulting to medium for most migrations
+  if (definition.isDeprecated) {
+    impact.breakingChanges = true;
+    impact.estimatedEffort = 'high';
+    impact.estimatedTimeInDays = estimateTimeInDays(definition, 'high');
+  } else if (definition.latestVersion && version !== 'unknown') {
+    // Determine if breaking changes are likely
+    const versionParts = version.split('.');
+    const latestParts = definition.latestVersion.split('.');
     
-    case 'python':
-      return [
-        {
-          version: '3.12.0',
-          releaseDate: new Date(now.getTime() - 0.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 4.7 * oneYear),
-          isEol: false,
-          isLatest: true
-        },
-        {
-          version: '3.11.0',
-          releaseDate: new Date(now.getTime() - 1.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 3.7 * oneYear),
-          isEol: false
-        },
-        {
-          version: '3.10.0',
-          releaseDate: new Date(now.getTime() - 2.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 2.7 * oneYear),
-          isEol: false
-        },
-        {
-          version: '3.9.0',
-          releaseDate: new Date(now.getTime() - 3.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 1.7 * oneYear),
-          isEol: false
-        },
-        {
-          version: '3.8.0',
-          releaseDate: new Date(now.getTime() - 4.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 0.7 * oneYear),
-          isEol: false
-        },
-        {
-          version: '3.7.0',
-          releaseDate: new Date(now.getTime() - 5.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 0.3 * oneYear),
-          isEol: true
-        },
-        {
-          version: '2.7.0',
-          releaseDate: new Date(now.getTime() - 8 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 3 * oneYear),
-          isEol: true
-        }
-      ];
+    // Major version bump typically means breaking changes
+    if (versionParts[0] !== latestParts[0]) {
+      impact.breakingChanges = true;
+      impact.estimatedEffort = 'medium';
+      impact.estimatedTimeInDays = estimateTimeInDays(definition, 'medium');
       
-    // Add more technologies as needed
-    
-    default:
-      // Generate random versions for other technologies
-      return [
-        {
-          version: '2.0.0',
-          releaseDate: new Date(now.getTime() - 0.3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 2.7 * oneYear),
-          isEol: false,
-          isLatest: true
-        },
-        {
-          version: '1.5.0',
-          releaseDate: new Date(now.getTime() - 1.5 * oneYear),
-          endOfSupportDate: new Date(now.getTime() + 1.5 * oneYear),
-          isEol: false
-        },
-        {
-          version: '1.0.0',
-          releaseDate: new Date(now.getTime() - 3 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 0.5 * oneYear),
-          isEol: true
-        },
-        {
-          version: '0.9.0',
-          releaseDate: new Date(now.getTime() - 4 * oneYear),
-          endOfSupportDate: new Date(now.getTime() - 1.5 * oneYear),
-          isEol: true
-        }
-      ];
+      // Multiple major versions behind is harder to migrate
+      const majorDiff = parseInt(latestParts[0]) - parseInt(versionParts[0]);
+      if (majorDiff >= 2) {
+        impact.estimatedEffort = 'high';
+        impact.estimatedTimeInDays = estimateTimeInDays(definition, 'high');
+      }
+    } 
+    // Multiple minor version jumps may require moderate effort
+    else if (versionParts[1] !== latestParts[1]) {
+      const minorVersionDiff = parseInt(latestParts[1]) - parseInt(versionParts[1]);
+      
+      if (minorVersionDiff > 2) {
+        impact.estimatedEffort = 'medium';
+        impact.estimatedTimeInDays = estimateTimeInDays(definition, 'medium');
+      } else {
+        impact.estimatedTimeInDays = estimateTimeInDays(definition, 'low');
+      }
+    } else {
+      impact.estimatedTimeInDays = estimateTimeInDays(definition, 'low');
+    }
   }
+  
+  // Use the migration effort from definition if available
+  if (definition.migrationEffort !== undefined) {
+    if (definition.migrationEffort >= 7) {
+      impact.estimatedEffort = 'high';
+      impact.estimatedTimeInDays = estimateTimeInDays(definition, 'high');
+    } else if (definition.migrationEffort >= 4) {
+      impact.estimatedEffort = 'medium';
+      impact.estimatedTimeInDays = estimateTimeInDays(definition, 'medium');
+    } else {
+      impact.estimatedEffort = 'low';
+      impact.estimatedTimeInDays = estimateTimeInDays(definition, 'low');
+    }
+  }
+  
+  return impact;
+}
+
+/**
+ * Estimate time to update in days based on effort level
+ */
+function estimateTimeInDays(
+  definition: TechnologyDefinition,
+  effortLevel: 'low' | 'medium' | 'high'
+): number {
+  // Base ranges for different effort levels
+  const timeRanges = {
+    low: { min: 1, max: 3 },
+    medium: { min: 5, max: 15 },
+    high: { min: 20, max: 60 }
+  };
+  
+  // Get the appropriate range
+  const range = timeRanges[effortLevel];
+  
+  // Adjust based on specific technology if we have migration effort data
+  if (definition.migrationEffort !== undefined) {
+    const factor = definition.migrationEffort / 5; // Normalize to a 0-2 scale (0.2 to 2.0)
+    return Math.round((range.min + (range.max - range.min) / 2) * factor);
+  }
+  
+  // Otherwise return the middle of the range
+  return Math.round(range.min + (range.max - range.min) / 2);
+}
+
+/**
+ * Get built-in technology definitions
+ */
+function getBuiltInTechnologyDefinitions(): Record<string, TechnologyDefinition> {
+  // This would typically load from a built-in database
+  // Here we're defining a few common technologies as examples
+  return {
+    'react16': {
+      name: 'React',
+      category: 'framework',
+      filePatterns: ['**/package.json', '**/*.jsx', '**/*.tsx'],
+      detectionPatterns: ['react@16\\.', 'import React from', 'require\\(["\']react["\']\\)'],
+      versionExtractionPattern: 'react@(\\d+\\.\\d+\\.\\d+)',
+      isDeprecated: false,
+      latestVersion: '18.2.0',
+      vendorUrl: 'https://reactjs.org/',
+      documentationUrl: 'https://reactjs.org/docs/getting-started.html',
+      versions: {
+        '16.0.0': {
+          releaseDate: '2017-09-26',
+          endOfLifeDate: '2022-03-29',
+          supportStatus: 'end-of-life',
+          knownIssues: [
+            'Potential memory leaks in concurrent mode',
+            'Performance degradation with large component trees'
+          ]
+        },
+        '16.8.0': {
+          releaseDate: '2019-02-06',
+          endOfLifeDate: '2022-03-29',
+          supportStatus: 'end-of-life',
+          knownIssues: ['React Hooks performance issues in certain edge cases']
+        },
+        '16.14.0': {
+          releaseDate: '2020-10-14',
+          endOfLifeDate: '2023-06-01',
+          supportStatus: 'security-only',
+          knownIssues: []
+        }
+      },
+      alternatives: ['Preact', 'Vue.js', 'Svelte'],
+      migrationEffort: 5
+    },
+    'jquery': {
+      name: 'jQuery',
+      category: 'library',
+      filePatterns: ['**/*.js', '**/package.json', '**/*.html'],
+      detectionPatterns: ['jquery@\\d+', 'import \\$ from ["\']jquery["\']', '<script.*jquery.*\\.js', '\\$\\(function'],
+      versionExtractionPattern: 'jquery@(\\d+\\.\\d+\\.\\d+)',
+      defaultVersion: '3.0.0',
+      isDeprecated: false,
+      latestVersion: '3.7.1',
+      vendorUrl: 'https://jquery.com/',
+      documentationUrl: 'https://api.jquery.com/',
+      versions: {
+        '1.12.4': {
+          releaseDate: '2016-05-20',
+          endOfLifeDate: '2016-12-31',
+          supportStatus: 'end-of-life',
+          knownIssues: [
+            'Security vulnerabilities in older versions',
+            'Performance issues compared to modern DOM APIs',
+            'Lack of modern JavaScript features'
+          ]
+        },
+        '2.2.4': {
+          releaseDate: '2016-05-20',
+          endOfLifeDate: '2018-12-31',
+          supportStatus: 'end-of-life',
+          knownIssues: [
+            'Performance issues compared to modern DOM APIs',
+            'Lack of modern JavaScript features'
+          ]
+        },
+        '3.5.1': {
+          releaseDate: '2020-05-04',
+          supportStatus: 'maintenance',
+          knownIssues: [
+            'Redundant when using modern frameworks'
+          ]
+        }
+      },
+      alternatives: ['Vanilla JavaScript', 'React', 'Vue.js'],
+      migrationEffort: 7
+    },
+    'python27': {
+      name: 'Python 2.7',
+      category: 'language',
+      filePatterns: ['**/*.py', '**/requirements.txt', '**/Pipfile', '**/setup.py'],
+      detectionPatterns: ['#!/usr/bin/env python2', 'from __future__ import', 'print "'],
+      defaultVersion: '2.7.18',
+      isDeprecated: true,
+      latestVersion: '3.11.5',
+      vendorUrl: 'https://www.python.org/',
+      documentationUrl: 'https://docs.python.org/',
+      versions: {
+        '2.7.18': {
+          releaseDate: '2020-04-20',
+          endOfLifeDate: '2020-01-01',
+          supportStatus: 'end-of-life',
+          knownIssues: [
+            'No security updates since January 2020',
+            'Most libraries have dropped Python 2 support',
+            'Poor Unicode handling compared to Python 3',
+            'Missing modern language features'
+          ]
+        }
+      },
+      alternatives: ['Python 3.11', 'Python 3.10'],
+      migrationEffort: 8
+    },
+    'angular1': {
+      name: 'AngularJS',
+      category: 'framework',
+      filePatterns: ['**/*.js', '**/package.json', '**/*.html'],
+      detectionPatterns: ['angular@1\\.', 'angular\\.module\\(', 'ng-app', 'ng-controller'],
+      versionExtractionPattern: 'angular@(1\\.\\d+\\.\\d+)',
+      defaultVersion: '1.8.2',
+      isDeprecated: true,
+      latestVersion: '1.8.2',
+      vendorUrl: 'https://angularjs.org/',
+      documentationUrl: 'https://docs.angularjs.org/',
+      versions: {
+        '1.8.2': {
+          releaseDate: '2021-03-05',
+          endOfLifeDate: '2022-01-01',
+          supportStatus: 'end-of-life',
+          knownIssues: [
+            'No security updates since January 2022',
+            'Performance issues with large applications',
+            'Limited support for modern web features'
+          ]
+        }
+      },
+      alternatives: ['Angular 16', 'React', 'Vue.js'],
+      migrationEffort: 9
+    },
+    'bootstrap3': {
+      name: 'Bootstrap 3',
+      category: 'framework',
+      filePatterns: ['**/*.html', '**/*.css', '**/package.json', '**/*.scss'],
+      detectionPatterns: ['bootstrap@3', '\\.col-md-', 'navbar-default'],
+      versionExtractionPattern: 'bootstrap@(3\\.\\d+\\.\\d+)',
+      defaultVersion: '3.4.1',
+      isDeprecated: false,
+      latestVersion: '5.3.1',
+      vendorUrl: 'https://getbootstrap.com/',
+      documentationUrl: 'https://getbootstrap.com/docs/3.4/',
+      versions: {
+        '3.4.1': {
+          releaseDate: '2019-02-13',
+          supportStatus: 'maintenance',
+          knownIssues: [
+            'Limited Flexbox support compared to newer versions',
+            'Less modern design aesthetics',
+            'Requires jQuery dependency'
+          ]
+        }
+      },
+      alternatives: ['Bootstrap 5', 'Tailwind CSS', 'Bulma'],
+      migrationEffort: 6
+    },
+    'nodejs12': {
+      name: 'Node.js 12',
+      category: 'runtime',
+      filePatterns: ['**/package.json', '**/.nvmrc', '**/.node-version'],
+      detectionPatterns: ['node@12', '"node": "12', '\\.nvmrc.*12'],
+      versionExtractionPattern: 'node@(12\\.\\d+\\.\\d+)',
+      defaultVersion: '12.22.12',
+      isDeprecated: true,
+      latestVersion: '20.5.1',
+      vendorUrl: 'https://nodejs.org/',
+      documentationUrl: 'https://nodejs.org/docs/latest-v12.x/api/',
+      versions: {
+        '12.22.12': {
+          releaseDate: '2022-04-05',
+          endOfLifeDate: '2022-04-30',
+          supportStatus: 'end-of-life',
+          knownIssues: [
+            'Security vulnerabilities no longer patched',
+            'Performance improvements in newer versions',
+            'Missing modern JavaScript features support'
+          ]
+        }
+      },
+      alternatives: ['Node.js 20', 'Node.js 18'],
+      migrationEffort: 4
+    }
+  };
 }
