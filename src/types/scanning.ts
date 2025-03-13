@@ -1,38 +1,41 @@
 /**
- * Base issue interface that all specific issues extend
+ * Common base interface for all scanning issues
  */
 export interface BaseIssue {
   // When the issue was detected
   detectedAt: Date;
   
-  // Business impact score (1-5)
-  businessImpact?: number;
+  // Optional notes about the issue
+  notes?: string;
   
-  // Recommended action
-  recommendation?: string;
-  
-  // Categorization tags
+  // Tags for categorization
   tags?: string[];
   
-  // Where the issue was found
-  location: string;
+  // Recommendation for resolving the issue
+  recommendation?: string;
 }
 
 /**
- * Dependency issue (npm packages, pip packages, gems, etc.)
+ * Dependency scan issue
  */
 export interface DependencyIssue extends BaseIssue {
   // Name of the dependency
   name: string;
   
-  // Type of dependency (npm, pip, etc.)
-  type: string;
-  
-  // Current version installed
+  // Current version
   currentVersion: string;
   
-  // Latest version available
+  // Latest available version
   latestVersion: string;
+  
+  // Package manager (npm, pip, maven, etc.)
+  packageManager: string;
+  
+  // Type of dependency (production, development, peer, optional)
+  type: 'production' | 'development' | 'peer' | 'optional';
+  
+  // Path to the manifest file where this dependency was found
+  manifestFile: string;
   
   // Whether the dependency is outdated
   isOutdated: boolean;
@@ -40,30 +43,35 @@ export interface DependencyIssue extends BaseIssue {
   // Whether the dependency is deprecated
   isDeprecated: boolean;
   
-  // Whether the dependency is unused
-  isUnused?: boolean;
+  // Whether the dependency has security issues
+  hasSecurityIssues: boolean;
   
-  // License issue if any
-  licenseIssue?: {
-    issue: string;
-    severity: 'low' | 'medium' | 'high';
-  };
+  // Security issues details if any
+  securityIssues?: Array<{
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    fixedInVersion?: string;
+    cve?: string;
+  }>;
   
-  // Security vulnerabilities
-  vulnerabilities?: VulnerabilityInfo[];
+  // License information
+  license?: string;
   
-  // Security impact score (1-5)
-  securityImpact?: number;
+  // Repository URL
+  repo?: string;
   
-  // Migration effort score (1-5)
-  migrationEffort?: number;
+  // Business impact score (1-5, where 5 is highest impact)
+  businessImpact?: number;
+  
+  // Update effort score (1-5, where 5 is highest effort)
+  updateEffort?: number;
 }
 
 /**
- * Browser extension issue
+ * Browser extension scan issue
  */
 export interface ExtensionIssue extends BaseIssue {
-  // Extension identifier
+  // Extension ID
   id: string;
   
   // Extension name
@@ -72,11 +80,14 @@ export interface ExtensionIssue extends BaseIssue {
   // Browser (chrome, firefox, edge, safari)
   browser: string;
   
-  // Current version installed
+  // Current version
   currentVersion: string;
   
-  // Latest version available
+  // Latest available version
   latestVersion: string;
+  
+  // Path where the extension is installed
+  path: string;
   
   // Whether the extension is outdated
   isOutdated: boolean;
@@ -84,51 +95,53 @@ export interface ExtensionIssue extends BaseIssue {
   // Whether the extension is deprecated
   isDeprecated: boolean;
   
-  // Whether the extension has been removed from the store
-  isRemoved: boolean;
+  // Whether the extension has security issues
+  hasSecurityIssues: boolean;
   
-  // Number of users
-  userCount?: number;
-  
-  // Rating in extension store
-  rating?: number;
-  
-  // Link to extension in store
-  storeUrl?: string;
-  
-  // Last update timestamp
-  lastUpdated?: Date;
-  
-  // When the latest version was released
-  latestUpdateDate?: Date;
-  
-  // Security vulnerabilities
-  vulnerabilities?: Array<{
-    id: string;
+  // Security issues details if any
+  securityIssues?: Array<{
     severity: 'low' | 'medium' | 'high' | 'critical';
     description: string;
-    fixedInVersion?: string;
+    cve?: string;
   }>;
+  
+  // Store URL
+  storeUrl?: string;
+  
+  // Compatibility issues
+  compatibilityIssues?: string[];
+  
+  // Whether the extension is approved by the organization
+  isApproved?: boolean;
+  
+  // Whether the extension has been removed from the extension store
+  removedFromStore?: boolean;
+  
+  // Risk level assessment
+  riskLevel?: 'low' | 'medium' | 'high' | 'critical';
+  
+  // Update urgency assessment
+  updateUrgency?: 'low' | 'medium' | 'high' | 'critical';
 }
 
 /**
- * Framework, language or platform issue
+ * Framework/technology scan issue
  */
 export interface FrameworkIssue extends BaseIssue {
-  // Framework name
+  // Name of the framework or technology
   name: string;
-  
-  // Framework type (nodejs, python, react, etc.)
-  type: string;
   
   // Current version
   currentVersion: string;
   
-  // Latest version available
+  // Latest available version
   latestVersion: string;
   
-  // Latest LTS version if applicable
-  latestLtsVersion?: string;
+  // Type of technology
+  type: 'framework' | 'language' | 'runtime' | 'database' | 'infrastructure' | 'other';
+  
+  // Files where this framework/technology is used
+  files: string[];
   
   // Whether the framework is outdated
   isOutdated: boolean;
@@ -136,74 +149,117 @@ export interface FrameworkIssue extends BaseIssue {
   // Whether the framework is deprecated
   isDeprecated: boolean;
   
-  // Whether the framework is end-of-life
-  isEol: boolean;
+  // Whether the framework has security issues
+  hasSecurityIssues: boolean;
   
-  // Current support status
-  supportStatus: 'supported' | 'maintenance' | 'deprecated' | 'eol';
+  // End of life date if known
+  endOfLifeDate?: Date;
   
-  // When support ends
-  supportEndDate?: Date;
+  // End of support date if known
+  endOfSupportDate?: Date;
   
-  // Migration effort score (1-5)
-  migrationEffort?: number;
-  
-  // Security vulnerabilities
-  vulnerabilities?: Array<{
-    id: string;
+  // Security issues details if any
+  securityIssues?: Array<{
     severity: 'low' | 'medium' | 'high' | 'critical';
     description: string;
     fixedInVersion?: string;
+    cve?: string;
   }>;
   
-  // URL to migration guide
-  migrationGuideUrl?: string;
+  // License information
+  license?: string;
   
-  // URL to release notes
-  releaseNotesUrl?: string;
+  // Repository URL
+  repo?: string;
+  
+  // Usage count in the codebase
+  usageCount?: number;
+  
+  // Business impact score (1-5, where 5 is highest impact)
+  businessImpact?: number;
+  
+  // Update effort score (1-5, where 5 is highest effort)
+  updateEffort?: number;
+  
+  // Suggested migration path
+  migrationPath?: string;
 }
 
 /**
- * Information about a security vulnerability
+ * API usage scan issue for deprecated APIs
  */
-export interface VulnerabilityInfo {
-  // Vulnerability identifier
-  id: string;
+export interface ApiIssue extends BaseIssue {
+  // Name of the API
+  name: string;
   
-  // Severity level
-  severity: 'low' | 'medium' | 'high' | 'critical';
+  // API source (framework, language, library)
+  source: string;
   
-  // Short title
-  title: string;
+  // Usage locations in code
+  locations: Array<{
+    file: string;
+    line: number;
+    column: number;
+    code: string;
+  }>;
   
-  // Detailed description
-  description: string;
+  // Whether the API is deprecated
+  isDeprecated: boolean;
   
-  // When the vulnerability was published
-  publishedDate?: Date;
+  // Whether the API has security issues
+  hasSecurityIssues: boolean;
   
-  // Affected version range
-  affectedVersions?: string;
+  // Deprecation date if known
+  deprecationDate?: Date;
   
-  // Versions that include a fix
-  patchedVersions?: string;
+  // Removal date if known
+  removalDate?: Date;
   
-  // Recommended action
-  recommendation?: string;
+  // Security issues details if any
+  securityIssues?: Array<{
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    fixedInVersion?: string;
+    cve?: string;
+  }>;
   
-  // URL to vulnerability details
-  url?: string;
+  // Suggested replacement API
+  replacement?: string;
   
-  // CVSS score if available
-  cvssScore?: number;
+  // Code example for migration
+  migrationExample?: string;
+  
+  // Documentation URL
+  documentationUrl?: string;
+  
+  // Business impact score (1-5, where 5 is highest impact)
+  businessImpact?: number;
+  
+  // Update effort score (1-5, where 5 is highest effort)
+  updateEffort?: number;
 }
 
 /**
- * Scanning result containing all issues
+ * Scan report containing all issues
  */
-export interface ScanningResult {
-  // When the scan was performed
-  scanTime: Date;
+export interface ScanReport {
+  // When the scan was run
+  scanDate: Date;
+  
+  // Scan duration in milliseconds
+  duration: number;
+  
+  // System information
+  system: {
+    platform: string;
+    architecture: string;
+    nodeVersion?: string;
+    cpuCores?: number;
+    memoryTotal?: number;
+  };
+  
+  // Scan configuration
+  config: Record<string, any>;
   
   // Dependency issues
   dependencyIssues: DependencyIssue[];
@@ -211,200 +267,110 @@ export interface ScanningResult {
   // Extension issues
   extensionIssues: ExtensionIssue[];
   
-  // Framework issues
+  // Framework/technology issues
   frameworkIssues: FrameworkIssue[];
   
-  // Summary stats
+  // API issues
+  apiIssues: ApiIssue[];
+  
+  // Summary statistics
   summary: {
     totalIssues: number;
-    highImpactIssues: number;
+    criticalIssues: number;
+    highPriorityIssues: number;
+    mediumPriorityIssues: number;
+    lowPriorityIssues: number;
     securityIssues: number;
-    deprecatedTechnologies: number;
-    outdatedDependencies: number;
-    endOfLifeComponents: number;
+    deprecatedIssues: number;
+    outdatedIssues: number;
+    unresolvedIssues: number;
   };
-}
-
-/**
- * Technical debt report
- */
-export interface TechnicalDebtReport {
-  // When the report was generated
-  generatedAt: Date;
   
   // Overall health score (0-100)
   healthScore: number;
   
-  // Debt categories
-  categories: {
-    securityDebt: number;
-    compatibilityDebt: number;
-    performanceDebt: number;
-    supportabilityDebt: number;
-  };
-  
-  // Issues organized by priority
-  issuesByPriority: {
-    critical: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
-    high: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
-    medium: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
-    low: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
-  };
-  
-  // Top recommendations
+  // Next steps recommendations
   recommendations: string[];
   
-  // Historical metrics
-  historicalMetrics?: {
-    timestamp: Date;
-    healthScore: number;
-    totalIssues: number;
-  }[];
+  // Any errors that occurred during scanning
+  errors?: Array<{
+    message: string;
+    stack?: string;
+    scanner: string;
+  }>;
 }
 
 /**
- * Notification settings
+ * Configuration for the scanning process
  */
-export interface NotificationSettings {
-  // Who to notify
-  recipients: string[];
-  
-  // Notification channels
-  channels: Array<'email' | 'slack' | 'teams' | 'webhook'>;
-  
-  // Notification thresholds
-  thresholds: {
-    securityIssues: 'all' | 'criticalOnly' | 'highAndAbove';
-    outdatedDependencies: 'all' | 'majorOnly' | 'criticalOnly';
-    deprecatedTechnologies: boolean;
-    endOfLifeComponents: boolean;
-  };
-  
-  // Notification frequency
-  frequency: 'immediate' | 'daily' | 'weekly';
-  
-  // Notification templates
-  templates?: {
-    email?: {
-      subject: string;
-      body: string;
-    };
-    slack?: {
-      title: string;
-      message: string;
-    };
-  };
-  
-  // Integration settings
-  integrationSettings?: {
-    slack?: {
-      webhookUrl: string;
-      channel: string;
-    };
-    teams?: {
-      webhookUrl: string;
-    };
-    email?: {
-      smtpServer: string;
-      port: number;
-      username: string;
-      password: string;
-      from: string;
-    };
-    webhook?: {
-      url: string;
-      method: 'GET' | 'POST';
-      headers?: Record<string, string>;
-    };
-  };
-}
-
-/**
- * Version control integration settings
- */
-export interface VersionControlSettings {
-  // Provider type
-  provider: 'github' | 'gitlab' | 'bitbucket' | 'azure-devops';
-  
-  // API token or credentials
-  credentials: {
-    token?: string;
-    username?: string;
-    password?: string;
-  };
-  
-  // Repository information
-  repository: {
-    owner: string;
-    name: string;
-    branch?: string;
-  };
-  
-  // Pull request settings
-  pullRequestSettings?: {
-    enabled: boolean;
-    automatic: boolean;
-    prefix: string;
-    assignees?: string[];
-    reviewers?: string[];
-    labels?: string[];
-  };
-  
-  // Issue tracking settings
-  issueSettings?: {
-    enabled: boolean;
-    automatic: boolean;
-    prefix: string;
-    labels?: string[];
-  };
-  
-  // Hook settings
-  hookSettings?: {
-    preCommit: boolean;
-    preReceive: boolean;
-  };
-}
-
-/**
- * Scanner configuration
- */
-export interface ScannerConfig {
+export interface ScanConfig {
   // Root directory to scan
   rootDirectory: string;
   
-  // Scanners to run
-  enabledScanners: {
-    dependencies: boolean;
-    extensions: boolean;
-    frameworks: boolean;
-  };
-  
-  // Scanner-specific configurations
-  dependencyScannerConfig?: any;
-  extensionScannerConfig?: any;
-  frameworkScannerConfig?: any;
-  
-  // Whether to use offline mode
+  // Whether to use offline mode (don't make API calls)
   offlineMode: boolean;
   
-  // Output directory for reports
-  outputDir: string;
+  // Dependency scanning configuration
+  dependencyScanning: {
+    enabled: boolean;
+    includeDev: boolean;
+    includePeer: boolean;
+    includeOptional: boolean;
+    ignorePackages?: string[];
+  };
   
-  // Notification settings
-  notificationSettings?: NotificationSettings;
+  // Extension scanning configuration
+  extensionScanning: {
+    enabled: boolean;
+    browsers: {
+      chrome: boolean;
+      firefox: boolean;
+      edge: boolean;
+      safari: boolean;
+    };
+    approvedExtensions?: string[];
+  };
   
-  // Version control settings
-  versionControlSettings?: VersionControlSettings;
+  // Framework scanning configuration
+  frameworkScanning: {
+    enabled: boolean;
+    includeLanguages: boolean;
+    includeRuntimes: boolean;
+    includeDatabases: boolean;
+    includeInfrastructure: boolean;
+  };
   
-  // Include patterns
-  includePatterns?: string[];
+  // API scanning configuration
+  apiScanning: {
+    enabled: boolean;
+    frameworks: string[];
+    libraries: string[];
+  };
   
-  // Exclude patterns
-  excludePatterns?: string[];
+  // Output configuration
+  output: {
+    jsonFile?: string;
+    htmlReport?: string;
+    csvExport?: string;
+    console: boolean;
+  };
   
-  // Cache directory
-  cacheDir?: string;
+  // Cache configuration
+  cache: {
+    enabled: boolean;
+    directory?: string;
+    ttlMinutes?: number;
+  };
   
-  // Cache TTL in seconds
-  cacheTTL?: number;
+  // Custom rules path
+  customRulesPath?: string;
+  
+  // GitHub integration
+  github?: {
+    enabled: boolean;
+    token?: string;
+    owner?: string;
+    repo?: string;
+    createIssues?: boolean;
+  };
 }
