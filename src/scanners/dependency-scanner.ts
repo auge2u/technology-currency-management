@@ -2,9 +2,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import { glob } from 'glob';
+import axios from 'axios';
+import * as semver from 'semver';
 import { log } from '../utils/logging';
 import { DependencyIssue } from '../types/scanning';
-import { compareVersions, formatDate } from '../utils/scanner-utils';
 
 const readFileAsync = promisify(fs.readFile);
 
@@ -13,13 +14,29 @@ const readFileAsync = promisify(fs.readFile);
  */
 export interface DependencyScannerConfig {
   // Root directory to scan
-  rootDirectory: string;
+  rootDir: string;
   
-  // Whether to use offline mode (don't make API calls)
-  offlineMode: boolean;
+  // Package manager manifests to scan for (glob patterns)
+  manifests: string[];
   
-  // Skip specific dependencies
-  ignoreDependencies?: string[];
+  // Whether to include dev dependencies
+  includeDev: boolean;
+  
+  // Whether to include peer dependencies
+  includePeer: boolean;
+  
+  // Whether to include optional dependencies
+  includeOptional: boolean;
+  
+  // Packages to ignore (exact names)
+  ignorePackages?: string[];
+  
+  // Version difference threshold to consider outdated (major.minor.patch)
+  outdatedThreshold: {
+    major: number;
+    minor: number;
+    patch: number;
+  };
   
   // API timeout in milliseconds
   apiTimeoutMs: number;
@@ -27,94 +44,76 @@ export interface DependencyScannerConfig {
   // Directory to store cached data
   cacheDir?: string;
   
-  // Only flag major version differences
-  majorVersionsOnly?: boolean;
+  // Custom vulnerability database file
+  customVulnerabilityDb?: string;
   
-  // Custom package manifests to scan
-  customManifests?: string[];
-  
-  // Scan development dependencies
-  includeDevDependencies?: boolean;
-  
-  // Scan peer dependencies
-  includePeerDependencies?: boolean;
-  
-  // Scan optional dependencies
-  includeOptionalDependencies?: boolean;
+  // Registry URLs by package manager
+  registryUrls?: {
+    npm?: string;
+    composer?: string;
+    pypi?: string;
+    maven?: string;
+    gradle?: string;
+    cargo?: string;
+    gem?: string;
+    nuget?: string;
+  };
 }
 
 /**
- * Package managers supported by the scanner
+ * Interface for dependency metadata from registries
  */
-enum PackageManager {
-  NPM = 'npm',
-  YARN = 'yarn',
-  PNPM = 'pnpm',
-  PIP = 'pip',
-  PIPENV = 'pipenv',
-  POETRY = 'poetry',
-  MAVEN = 'maven',
-  GRADLE = 'gradle',
-  NUGET = 'nuget',
-  CARGO = 'cargo',
-  COMPOSER = 'composer',
-  GO = 'go',
-  GEM = 'gem',
-  SWIFT = 'swift',
-  CUSTOM = 'custom'
-}
-
-/**
- * Dependency manifest file with version patterns
- */
-interface DependencyManifest {
-  packageManager: PackageManager;
-  filePattern: string;
-  parser: (content: string) => Record<string, string> | null;
-  devDependenciesParser?: (content: string) => Record<string, string> | null;
-  peerDependenciesParser?: (content: string) => Record<string, string> | null;
-  optionalDependenciesParser?: (content: string) => Record<string, string> | null;
-}
-
-/**
- * Detected dependency
- */
-interface DetectedDependency {
+interface DependencyMetadata {
   name: string;
-  currentVersion: string;
-  packageManager: string;
-  type: 'production' | 'development' | 'peer' | 'optional';
-  manifest: string;
-  detectedAt: Date;
-}
-
-/**
- * Dependency information from repository or cache
- */
-interface DependencyInfo {
   latestVersion: string;
-  latestStableVersion: string;
-  isOutdated: boolean;
   isDeprecated: boolean;
   hasSecurityIssues: boolean;
+  license?: string;
+  repo?: string;
   securityIssues?: Array<{
     severity: 'low' | 'medium' | 'high' | 'critical';
     description: string;
     fixedInVersion?: string;
     cve?: string;
   }>;
-  releaseDate?: Date;
-  latestReleaseDate?: Date;
-  downloadCount?: number;
-  repo?: string;
-  license?: string;
-  isMaintained?: boolean;
-  recommendedVersion?: string;
+  deprecationReason?: string;
   alternatives?: string[];
+  downloadCount?: number;
+  lastPublishedAt?: Date;
+  maintainedBy?: string[];
 }
 
 /**
- * Scanner for detecting dependencies across package managers
+ * Dependency information parsed from a manifest file
+ */
+interface ParsedDependency {
+  name: string;
+  version: string;
+  type: 'production' | 'development' | 'peer' | 'optional';
+  packageManager: string;
+  manifestFile: string;
+}
+
+/**
+ * Map of package manager to file patterns
+ */
+const PACKAGE_MANAGER_PATTERNS: Record<string, string[]> = {
+  npm: ['package.json'],
+  yarn: ['package.json', 'yarn.lock'],
+  pnpm: ['package.json', 'pnpm-lock.yaml'],
+  bun: ['package.json', 'bun.lockb'],
+  composer: ['composer.json'],
+  pip: ['requirements.txt', 'pyproject.toml', 'setup.py'],
+  poetry: ['pyproject.toml'],
+  maven: ['pom.xml'],
+  gradle: ['build.gradle', 'build.gradle.kts'],
+  cargo: ['Cargo.toml'],
+  bundler: ['Gemfile'],
+  nuget: ['*.csproj', '*.fsproj', 'packages.config']
+};
+
+/**
+ * Scanner for detecting outdated or vulnerable dependencies
  */
 export async function scanDependencies(
   config: DependencyScannerConfig
@@ -123,84 +122,95 @@ export async function scanDependencies(
     log.info('Starting dependency scanner');
     const issues: DependencyIssue[] = [];
     
-    // Detect dependencies
-    const dependencies = await detectDependencies(config);
-    log.info(`Found ${dependencies.length} dependencies`);
+    // Find manifest files to scan
+    const manifestFiles = await findManifestFiles(config);
+    log.info(`Found ${manifestFiles.length} manifest files to scan`);
     
-    // Check each dependency
-    for (const dependency of dependencies) {
+    // Process each manifest file
+    for (const manifestFile of manifestFiles) {
       try {
-        // Skip ignored dependencies
-        if (config.ignoreDependencies && config.ignoreDependencies.includes(dependency.name)) {
-          log.info(`Skipping ignored dependency: ${dependency.name}`);
+        // Read the manifest file
+        const content = await readFileAsync(manifestFile, 'utf8');
+        
+        // Determine package manager from file name
+        const packageManager = determinePackageManager(manifestFile);
+        
+        if (!packageManager) {
+          log.warn(`Could not determine package manager for ${manifestFile}, skipping`);
           continue;
         }
         
-        // Get dependency information
-        const dependencyInfo = await getDependencyInfo(
-          dependency.name,
-          dependency.currentVersion,
-          dependency.packageManager,
-          config.offlineMode,
-          config.apiTimeoutMs,
-          config.cacheDir,
-          config.majorVersionsOnly || false
+        // Parse dependencies from the manifest
+        const dependencies = await parseDependencies(
+          manifestFile,
+          content,
+          packageManager,
+          config
         );
         
-        // Only create an issue if there's at least one problem
-        if (dependencyInfo.isOutdated || dependencyInfo.isDeprecated || dependencyInfo.hasSecurityIssues) {
-          
-          // Create the issue
-          const issue: DependencyIssue = {
-            name: dependency.name,
-            packageManager: dependency.packageManager,
-            currentVersion: dependency.currentVersion,
-            latestVersion: dependencyInfo.latestVersion,
-            type: dependency.type,
-            manifestFile: dependency.manifest,
-            detectedAt: dependency.detectedAt,
-            isOutdated: dependencyInfo.isOutdated,
-            isDeprecated: dependencyInfo.isDeprecated,
-            hasSecurityIssues: dependencyInfo.hasSecurityIssues,
-            license: dependencyInfo.license,
-            repo: dependencyInfo.repo
-          };
-          
-          // Add security issues if any
-          if (dependencyInfo.securityIssues?.length) {
-            issue.securityIssues = dependencyInfo.securityIssues;
+        log.info(`Found ${dependencies.length} dependencies in ${manifestFile}`);
+        
+        // Check each dependency
+        for (const dep of dependencies) {
+          // Skip ignored packages
+          if (config.ignorePackages?.includes(dep.name)) {
+            log.info(`Skipping ignored package: ${dep.name}`);
+            continue;
           }
           
-          // Calculate business impact
-          issue.businessImpact = calculateBusinessImpact(
-            dependency,
-            dependencyInfo
-          );
-          
-          // Calculate update effort
-          issue.updateEffort = calculateUpdateEffort(
-            dependency,
-            dependencyInfo
-          );
-          
-          // Generate recommendation
-          issue.recommendation = generateRecommendation(
-            dependency,
-            dependencyInfo
-          );
-          
-          // Generate tags
-          issue.tags = generateTags(
-            dependency,
-            dependencyInfo
-          );
-          
-          // Add to issues list
-          issues.push(issue);
-          log.info(`Added issue for dependency ${dependency.name} ${dependency.currentVersion}`);
+          try {
+            // Get metadata from registry
+            const metadata = await getDependencyMetadata(
+              dep.name,
+              dep.version,
+              dep.packageManager,
+              config
+            );
+            
+            // Check if dependency has issues
+            const isOutdated = isOutdatedVersion(
+              dep.version,
+              metadata.latestVersion,
+              config.outdatedThreshold
+            );
+            
+            if (isOutdated || metadata.isDeprecated || metadata.hasSecurityIssues) {
+              // Create dependency issue
+              const issue: DependencyIssue = {
+                detectedAt: new Date(),
+                name: dep.name,
+                currentVersion: dep.version,
+                latestVersion: metadata.latestVersion,
+                packageManager: dep.packageManager,
+                type: dep.type,
+                manifestFile: dep.manifestFile,
+                isOutdated,
+                isDeprecated: metadata.isDeprecated,
+                hasSecurityIssues: metadata.hasSecurityIssues,
+                license: metadata.license,
+                repo: metadata.repo,
+                tags: generateTags(dep, metadata, isOutdated),
+                recommendation: generateRecommendation(dep, metadata, isOutdated)
+              };
+              
+              // Add security issues if any
+              if (metadata.securityIssues?.length) {
+                issue.securityIssues = metadata.securityIssues;
+              }
+              
+              // Add business impact and update effort scores
+              issue.businessImpact = calculateBusinessImpact(dep, metadata);
+              issue.updateEffort = calculateUpdateEffort(dep, metadata);
+              
+              issues.push(issue);
+              log.info(`Added issue for dependency ${dep.name} ${dep.version}`);
+            }
+          } catch (depError) {
+            log.warn(`Error checking dependency ${dep.name}`, { error: depError });
+          }
         }
-      } catch (depError) {
-        log.warn(`Error processing dependency: ${dependency.name}`, { error: depError });
+      } catch (manifestError) {
+        log.warn(`Error processing manifest file: ${manifestFile}`, { error: manifestError });
       }
     }
     
@@ -213,168 +223,317 @@ export async function scanDependencies(
 }
 
 /**
- * Detect dependencies across various package managers
+ * Find manifest files to scan based on configuration
  */
-async function detectDependencies(
+async function findManifestFiles(
   config: DependencyScannerConfig
-): Promise<DetectedDependency[]> {
+): Promise<string[]> {
   try {
-    const dependencies: DetectedDependency[] = [];
-    const rootDir = config.rootDirectory;
+    const allFiles: string[] = [];
     
-    // Define dependency manifests to scan
-    const manifests = getManifestDefinitions();
-    
-    // Add custom manifests if provided
-    if (config.customManifests) {
-      for (const customPattern of config.customManifests) {
-        manifests.push({
-          packageManager: PackageManager.CUSTOM,
-          filePattern: customPattern,
-          parser: parseCustomManifest
-        });
-      }
-    }
-    
-    // Scan each manifest type
-    for (const manifest of manifests) {
-      try {
-        const matches = await glob(path.join(rootDir, manifest.filePattern), {
-          ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
-        });
-        
-        for (const match of matches) {
-          try {
-            const content = await readFileAsync(match, 'utf8');
-            
-            // Parse production dependencies
-            const dependencies = manifest.parser(content);
-            if (dependencies) {
-              for (const [name, version] of Object.entries(dependencies)) {
-                addDependency(
-                  name,
-                  version,
-                  manifest.packageManager.toString(),
-                  'production',
-                  match,
-                  dependencies
-                );
-              }
-            }
-            
-            // Parse development dependencies if enabled
-            if (config.includeDevDependencies && manifest.devDependenciesParser) {
-              const devDependencies = manifest.devDependenciesParser(content);
-              if (devDependencies) {
-                for (const [name, version] of Object.entries(devDependencies)) {
-                  addDependency(
-                    name,
-                    version,
-                    manifest.packageManager.toString(),
-                    'development',
-                    match,
-                    devDependencies
-                  );
-                }
-              }
-            }
-            
-            // Parse peer dependencies if enabled
-            if (config.includePeerDependencies && manifest.peerDependenciesParser) {
-              const peerDependencies = manifest.peerDependenciesParser(content);
-              if (peerDependencies) {
-                for (const [name, version] of Object.entries(peerDependencies)) {
-                  addDependency(
-                    name,
-                    version,
-                    manifest.packageManager.toString(),
-                    'peer',
-                    match,
-                    peerDependencies
-                  );
-                }
-              }
-            }
-            
-            // Parse optional dependencies if enabled
-            if (config.includeOptionalDependencies && manifest.optionalDependenciesParser) {
-              const optionalDependencies = manifest.optionalDependenciesParser(content);
-              if (optionalDependencies) {
-                for (const [name, version] of Object.entries(optionalDependencies)) {
-                  addDependency(
-                    name,
-                    version,
-                    manifest.packageManager.toString(),
-                    'optional',
-                    match,
-                    optionalDependencies
-                  );
-                }
-              }
-            }
-            
-            log.info(`Parsed dependencies from ${match}`);
-          } catch (matchError) {
-            log.warn(`Error processing manifest: ${match}`, { error: matchError });
-          }
+    for (const pattern of config.manifests) {
+      const matchedFiles = await glob(
+        pattern, 
+        { 
+          cwd: config.rootDir,
+          absolute: true
         }
-      } catch (manifestError) {
-        log.warn(`Error processing manifest type: ${manifest.packageManager}`, { error: manifestError });
-      }
-    }
-    
-    return dependencies;
-    
-    // Helper to add dependency to the list
-    function addDependency(
-      name: string,
-      version: string,
-      packageManager: string,
-      type: 'production' | 'development' | 'peer' | 'optional',
-      manifest: string,
-      allDeps: Record<string, string>
-    ) {
-      // Clean up version string
-      const cleanVersion = cleanVersionString(version);
+      );
       
-      // Only add if it's a valid version
-      if (cleanVersion) {
-        dependencies.push({
-          name,
-          currentVersion: cleanVersion,
-          packageManager,
-          type,
-          manifest,
-          detectedAt: new Date()
-        });
-      }
+      allFiles.push(...matchedFiles);
     }
+    
+    return [...new Set(allFiles)]; // Remove duplicates
   } catch (error) {
-    log.error('Error detecting dependencies', { error });
+    log.error('Error finding manifest files', { error });
     return [];
   }
 }
 
 /**
- * Get dependency information from repository or cache
+ * Determine package manager from manifest file name
  */
-async function getDependencyInfo(
+function determinePackageManager(manifestFile: string): string | null {
+  const fileName = path.basename(manifestFile).toLowerCase();
+  
+  for (const [manager, patterns] of Object.entries(PACKAGE_MANAGER_PATTERNS)) {
+    if (patterns.some(pattern => {
+      if (pattern.includes('*')) {
+        return new RegExp('^' + pattern.replace(/\*/g, '.*') + '$').test(fileName);
+      }
+      return fileName === pattern.toLowerCase();
+    })) {
+      return manager;
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Parse dependencies from a manifest file
+ */
+async function parseDependencies(
+  manifestFile: string,
+  content: string,
+  packageManager: string,
+  config: DependencyScannerConfig
+): Promise<ParsedDependency[]> {
+  const fileName = path.basename(manifestFile).toLowerCase();
+  const dependencies: ParsedDependency[] = [];
+  
+  try {
+    // Handle different manifest formats
+    if (fileName === 'package.json') {
+      // Parse npm/yarn/pnpm package.json
+      const packageJson = JSON.parse(content);
+      
+      // Production dependencies
+      if (packageJson.dependencies) {
+        for (const [name, version] of Object.entries(packageJson.dependencies)) {
+          dependencies.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'production',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+      
+      // Development dependencies
+      if (config.includeDev && packageJson.devDependencies) {
+        for (const [name, version] of Object.entries(packageJson.devDependencies)) {
+          dependencies.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'development',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+      
+      // Peer dependencies
+      if (config.includePeer && packageJson.peerDependencies) {
+        for (const [name, version] of Object.entries(packageJson.peerDependencies)) {
+          dependencies.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'peer',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+      
+      // Optional dependencies
+      if (config.includeOptional && packageJson.optionalDependencies) {
+        for (const [name, version] of Object.entries(packageJson.optionalDependencies)) {
+          dependencies.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'optional',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+    } else if (fileName === 'composer.json') {
+      // Parse PHP composer.json
+      const composerJson = JSON.parse(content);
+      
+      // Production dependencies
+      if (composerJson.require) {
+        for (const [name, version] of Object.entries(composerJson.require)) {
+          if (name !== 'php') { // Skip PHP itself
+            dependencies.push({
+              name,
+              version: version.toString().replace(/[^0-9.]/g, ''),
+              type: 'production',
+              packageManager,
+              manifestFile
+            });
+          }
+        }
+      }
+      
+      // Development dependencies
+      if (config.includeDev && composerJson['require-dev']) {
+        for (const [name, version] of Object.entries(composerJson['require-dev'])) {
+          dependencies.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'development',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+    } else if (fileName === 'requirements.txt') {
+      // Parse Python requirements.txt
+      const lines = content.split('\n').map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'));
+      
+      for (const line of lines) {
+        // Basic format: package==version or package>=version
+        const match = line.match(/^([a-zA-Z0-9_.-]+)\s*([=><~!]+)\s*([0-9a-zA-Z.-]+)/);
+        if (match) {
+          const [_, name, operator, version] = match;
+          dependencies.push({
+            name,
+            version,
+            type: 'production',
+            packageManager,
+            manifestFile
+          });
+        } else if (!line.includes('=')) {
+          // Handle package with no version specified
+          dependencies.push({
+            name: line,
+            version: 'latest',
+            type: 'production',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+    } else if (fileName === 'pyproject.toml') {
+      // Very basic TOML parsing for Python projects
+      const lines = content.split('\n');
+      let currentSection = '';
+      
+      for (const line of lines) {
+        // Section headers are in [brackets]
+        const sectionMatch = line.match(/^\[([^\]]+)\]/);
+        if (sectionMatch) {
+          currentSection = sectionMatch[1];
+          continue;
+        }
+        
+        // Look for dependencies in various sections
+        const isDevSection = currentSection.includes('dev-dependencies') ||
+                             currentSection.includes('development-dependencies');
+        
+        if (['project', 'tool.poetry.dependencies', 'dependencies', 'build-system.requires'].some(s => currentSection.includes(s))) {
+          const depMatch = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*["']?([0-9a-zA-Z.-]+)["']?/);
+          if (depMatch) {
+            const [_, name, version] = depMatch;
+            dependencies.push({
+              name,
+              version,
+              type: isDevSection && config.includeDev ? 'development' : 'production',
+              packageManager,
+              manifestFile
+            });
+          }
+        }
+      }
+    } else if (fileName === 'cargo.toml') {
+      // Very basic TOML parsing for Rust projects
+      const lines = content.split('\n');
+      let currentSection = '';
+      
+      for (const line of lines) {
+        // Section headers
+        const sectionMatch = line.match(/^\[([^\]]+)\]/);
+        if (sectionMatch) {
+          currentSection = sectionMatch[1];
+          continue;
+        }
+        
+        const isDevSection = currentSection === 'dev-dependencies';
+        if (currentSection === 'dependencies' || isDevSection) {
+          // Simple key = "version"
+          const simpleDepMatch = line.match(/^([a-zA-Z0-9_-]+)\s*=\s*["']([^"']+)["']/);
+          if (simpleDepMatch) {
+            dependencies.push({
+              name: simpleDepMatch[1],
+              version: simpleDepMatch[2],
+              type: isDevSection && config.includeDev ? 'development' : 'production',
+              packageManager,
+              manifestFile
+            });
+          }
+          
+          // Table format with version
+          const tableDepMatch = line.match(/^([a-zA-Z0-9_-]+)\s*\.version\s*=\s*["']([^"']+)["']/);
+          if (tableDepMatch) {
+            dependencies.push({
+              name: tableDepMatch[1],
+              version: tableDepMatch[2],
+              type: isDevSection && config.includeDev ? 'development' : 'production',
+              packageManager,
+              manifestFile
+            });
+          }
+        }
+      }
+    } else if (fileName === 'gemfile') {
+      // Parse Ruby Gemfile
+      const lines = content.split('\n').map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'));
+      
+      for (const line of lines) {
+        // Match gem 'name', '~> version'
+        const gemMatch = line.match(/gem\s+['"]([^'"]*)['"](,\s*['"]([^'"]*)['"])?/);
+        if (gemMatch) {
+          const name = gemMatch[1];
+          const version = gemMatch[3] ? gemMatch[3].replace(/[^0-9.]/g, '') : 'latest';
+          
+          dependencies.push({
+            name,
+            version,
+            type: 'production',
+            packageManager,
+            manifestFile
+          });
+        }
+      }
+    } else if (fileName.endsWith('.csproj') || fileName.endsWith('.fsproj')) {
+      // Very simplistic handling of .NET project files
+      // For a real scanner, you'd use an XML parser
+      const packageRefRegex = /<PackageReference\s+Include=["']([^"']+)["']\s+Version=["']([^"']+)["']\s*\/>/g;
+      let match;
+      
+      while ((match = packageRefRegex.exec(content)) !== null) {
+        dependencies.push({
+          name: match[1],
+          version: match[2],
+          type: 'production',
+          packageManager,
+          manifestFile
+        });
+      }
+    }
+    
+    return dependencies;
+  } catch (error) {
+    log.warn(`Error parsing dependencies from ${manifestFile}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Get dependency metadata from appropriate registry
+ */
+async function getDependencyMetadata(
   name: string,
   version: string,
   packageManager: string,
-  offlineMode: boolean,
-  timeoutMs: number,
-  cacheDir?: string,
-  majorVersionsOnly = false
-): Promise<DependencyInfo> {
+  config: DependencyScannerConfig
+): Promise<DependencyMetadata> {
   // Check cache first
-  if (cacheDir) {
-    const cacheFile = path.join(cacheDir, `dep-${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
+  if (config.cacheDir) {
+    const cacheFile = path.join(
+      config.cacheDir, 
+      `${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`
+    );
     
     if (fs.existsSync(cacheFile)) {
       try {
         const cacheContent = await readFileAsync(cacheFile, 'utf8');
-        const cachedInfo = JSON.parse(cacheContent) as DependencyInfo;
+        const cachedInfo = JSON.parse(cacheContent) as DependencyMetadata;
         log.info(`Loaded ${name} dependency info from cache`);
         return cachedInfo;
       } catch (cacheError) {
@@ -383,94 +542,91 @@ async function getDependencyInfo(
     }
   }
   
-  // If in offline mode and no cache, return placeholder data
-  if (offlineMode) {
-    log.info(`Offline mode enabled for ${name}, using placeholder data`);
-    return {
-      latestVersion: version,
-      latestStableVersion: version,
-      isOutdated: false,
-      isDeprecated: false,
-      hasSecurityIssues: false
-    };
-  }
-  
-  // In a real implementation, we would query package repositories
-  // For this example, we'll use mock data
+  // In a real implementation, we would query package registries
+  // For this example, we'll use mock data to simulate API responses
   try {
-    log.info(`Querying ${packageManager} repository for dependency: ${name} ${version}`);
+    log.info(`Querying info for dependency: ${name} ${version} (${packageManager})`);
     
     // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 200));
+    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 100));
     
-    // Generate latest version based on current version
-    const latestVersion = incrementVersion(version);
-    const isOutdated = compareVersions(latestVersion, version) > 0;
-    
-    // Check if we should only flag major version differences
-    let actuallyOutdated = isOutdated;
-    if (majorVersionsOnly && isOutdated) {
-      const currentMajor = parseInt(version.split('.')[0], 10);
-      const latestMajor = parseInt(latestVersion.split('.')[0], 10);
-      actuallyOutdated = latestMajor > currentMajor;
-    }
-    
-    // Generate mock data
-    const info: DependencyInfo = {
-      latestVersion,
-      latestStableVersion: latestVersion,
-      isOutdated: actuallyOutdated,
+    // Construct metadata based on the package manager and name
+    // This is mock data for demonstration purposes
+    const metadata: DependencyMetadata = {
+      name,
+      latestVersion: incrementVersion(version),
       isDeprecated: Math.random() < 0.1, // 10% chance of being deprecated
-      hasSecurityIssues: Math.random() < 0.2, // 20% chance of having security issues
-      releaseDate: new Date(Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000),
-      latestReleaseDate: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000),
-      downloadCount: Math.floor(Math.random() * 1000000),
+      hasSecurityIssues: Math.random() < 0.15, // 15% chance of having security issues
       license: getRandomLicense(),
-      isMaintained: Math.random() > 0.1, // 90% chance of being maintained
-      recommendedVersion: latestVersion
+      repo: `https://github.com/org/${name.toLowerCase()}`,
+      lastPublishedAt: new Date(Date.now() - Math.random() * 180 * 24 * 60 * 60 * 1000), // Up to 180 days ago
+      downloadCount: Math.floor(Math.random() * 10000000), // Random download count
+      maintainedBy: ['developer1', 'developer2']
     };
     
+    // Set deprecation reason if deprecated
+    if (metadata.isDeprecated) {
+      metadata.deprecationReason = getRandomDeprecationReason();
+      metadata.alternatives = getRandomAlternatives(name, packageManager);
+    }
+    
     // Add security issues if flagged
-    if (info.hasSecurityIssues) {
-      info.securityIssues = [
+    if (metadata.hasSecurityIssues) {
+      metadata.securityIssues = [
         {
           severity: getRandomSeverity(),
           description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
-          fixedInVersion: info.latestVersion,
+          fixedInVersion: metadata.latestVersion,
           cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
         }
       ];
+      
+      // Sometimes add a second vulnerability
+      if (Math.random() < 0.3) {
+        metadata.securityIssues.push({
+          severity: getRandomSeverity(),
+          description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
+          fixedInVersion: metadata.latestVersion,
+          cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
+        });
+      }
     }
     
-    // Suggest alternatives if deprecated
-    if (info.isDeprecated) {
-      info.alternatives = getRandomAlternatives(name, packageManager);
-    }
+    // Customize based on some known package names for more realistic examples
+    customizeMockMetadata(metadata, name, version, packageManager);
     
     // Save to cache if cacheDir is provided
-    if (cacheDir) {
+    if (config.cacheDir) {
       try {
-        if (!fs.existsSync(cacheDir)) {
-          fs.mkdirSync(cacheDir, { recursive: true });
+        if (!fs.existsSync(config.cacheDir)) {
+          fs.mkdirSync(config.cacheDir, { recursive: true });
         }
         
-        const cacheFile = path.join(cacheDir, `dep-${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
-        await fs.promises.writeFile(cacheFile, JSON.stringify(info, null, 2), 'utf8');
+        const cacheFile = path.join(
+          config.cacheDir, 
+          `${packageManager}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`
+        );
+        
+        await fs.promises.writeFile(
+          cacheFile, 
+          JSON.stringify(metadata, null, 2), 
+          'utf8'
+        );
+        
         log.info(`Cached ${name} dependency info`);
       } catch (cacheError) {
         log.warn(`Error writing dependency cache for ${name}`, { error: cacheError });
       }
     }
     
-    return info;
+    return metadata;
   } catch (error) {
-    log.error(`Error querying repository for ${name}`, { error });
+    log.error(`Error querying info for dependency ${name}`, { error });
     
-    // Return basic info if repository query fails
+    // Return default info if query fails
     return {
+      name,
       latestVersion: version,
-      latestStableVersion: version,
-      isOutdated: false,
       isDeprecated: false,
       hasSecurityIssues: false
     };
@@ -478,95 +634,193 @@ async function getDependencyInfo(
 }
 
 /**
- * Calculate business impact score for a dependency issue
+ * Customize mock metadata for more realistic examples
  */
-function calculateBusinessImpact(
-  dependency: DetectedDependency,
-  info: DependencyInfo
-): number {
-  let score = 1; // Start with minimal impact
+function customizeMockMetadata(
+  metadata: DependencyMetadata,
+  name: string,
+  version: string,
+  packageManager: string
+): void {
+  // Well-known vulnerable packages
+  const knownVulnerablePackages: Record<string, {
+    description: string;
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    fixedInVersion: string;
+    affectedVersions: string;
+    cve?: string;
+  }[]> = {
+    'log4j-core': [{
+      description: 'Remote code execution vulnerability in log4j',
+      severity: 'critical',
+      fixedInVersion: '2.15.0',
+      affectedVersions: '<2.15.0',
+      cve: 'CVE-2021-44228'
+    }],
+    'lodash': [{
+      description: 'Prototype pollution vulnerability in lodash',
+      severity: 'high',
+      fixedInVersion: '4.17.21',
+      affectedVersions: '<4.17.21',
+      cve: 'CVE-2021-23337'
+    }],
+    'express': [{
+      description: 'Open redirect vulnerability in express',
+      severity: 'medium',
+      fixedInVersion: '4.17.3',
+      affectedVersions: '<4.17.3',
+      cve: 'CVE-2022-24999'
+    }],
+    'moment': [{
+      description: 'Regular expression denial of service',
+      severity: 'medium',
+      fixedInVersion: '2.29.2',
+      affectedVersions: '<2.29.2',
+      cve: 'CVE-2022-24785'
+    }]
+  };
   
-  // Security issues have high impact
-  if (info.hasSecurityIssues) {
-    const hasCritical = info.securityIssues?.some(issue => issue.severity === 'critical');
-    const hasHigh = info.securityIssues?.some(issue => issue.severity === 'high');
-    
-    if (hasCritical) score += 3;
-    else if (hasHigh) score += 2;
-    else score += 1;
+  // Known deprecated packages
+  const knownDeprecatedPackages: Record<string, {
+    reason: string;
+    alternatives: string[];
+  }> = {
+    'request': {
+      reason: 'Package is no longer maintained',
+      alternatives: ['node-fetch', 'axios', 'got', 'superagent']
+    },
+    'moment': {
+      reason: 'Project is now in maintenance mode',
+      alternatives: ['date-fns', 'dayjs', 'luxon']
+    },
+    'gulp': {
+      reason: 'Modern JavaScript build tools have superseded this package',
+      alternatives: ['webpack', 'parcel', 'vite', 'esbuild']
+    },
+    'coffeescript': {
+      reason: 'No longer actively developed',
+      alternatives: ['TypeScript', 'modern JavaScript']
+    }
+  };
+  
+  // Apply known vulnerabilities
+  if (name.toLowerCase() in knownVulnerablePackages) {
+    const vulns = knownVulnerablePackages[name.toLowerCase()];
+    metadata.hasSecurityIssues = true;
+    metadata.securityIssues = vulns.map(v => ({
+      severity: v.severity,
+      description: v.description,
+      fixedInVersion: v.fixedInVersion,
+      cve: v.cve
+    }));
+    metadata.latestVersion = vulns[0].fixedInVersion;
   }
   
-  // Deprecation has medium impact
-  if (info.isDeprecated) score += 1;
+  // Apply known deprecations
+  if (name.toLowerCase() in knownDeprecatedPackages) {
+    const depInfo = knownDeprecatedPackages[name.toLowerCase()];
+    metadata.isDeprecated = true;
+    metadata.deprecationReason = depInfo.reason;
+    metadata.alternatives = depInfo.alternatives;
+  }
   
-  // Being outdated has lower impact
-  if (info.isOutdated) score += 1;
-  
-  // Production dependencies have higher impact than dev dependencies
-  if (dependency.type === 'production') score += 1;
-  
-  // Unmaintained packages have higher impact
-  if (info.isMaintained === false) score += 1;
-  
-  // Cap at maximum of 5
-  return Math.min(score, 5);
+  // Update other metadata fields for specific packages
+  if (name.toLowerCase() === 'jquery') {
+    metadata.latestVersion = '3.6.4';
+    metadata.isDeprecated = true;
+    metadata.deprecationReason = 'Modern browsers have native APIs that make jQuery unnecessary';
+    metadata.alternatives = ['Vanilla JavaScript', 'Alpine.js'];
+    metadata.downloadCount = 100000000; // Very popular
+  } else if (name.toLowerCase() === 'react') {
+    metadata.latestVersion = '18.2.0';
+    metadata.isDeprecated = false;
+    metadata.downloadCount = 80000000; // Very popular
+    metadata.license = 'MIT';
+  } else if (name.toLowerCase() === 'vue') {
+    metadata.latestVersion = '3.3.4';
+    metadata.isDeprecated = false;
+    metadata.downloadCount = 45000000; // Very popular
+    metadata.license = 'MIT';
+  } else if (name.toLowerCase() === 'express') {
+    metadata.latestVersion = '4.18.2';
+    metadata.isDeprecated = false;
+    metadata.downloadCount = 50000000; // Very popular
+    metadata.license = 'MIT';
+  } else if (name.toLowerCase() === 'webpack') {
+    metadata.latestVersion = '5.88.2';
+    metadata.isDeprecated = false;
+    metadata.downloadCount = 40000000; // Very popular
+    metadata.license = 'MIT';
+  }
 }
 
 /**
- * Calculate update effort for a dependency
+ * Check if a version is outdated based on threshold
  */
-function calculateUpdateEffort(
-  dependency: DetectedDependency,
-  info: DependencyInfo
-): number {
-  // Start with moderate effort
-  let effort = 2;
-  
-  // Calculate version difference
-  if (info.latestVersion) {
-    const currentMajor = parseInt(dependency.currentVersion.split('.')[0], 10) || 0;
-    const latestMajor = parseInt(info.latestVersion.split('.')[0], 10) || 0;
+function isOutdatedVersion(
+  currentVersion: string,
+  latestVersion: string,
+  threshold: { major: number; minor: number; patch: number }
+): boolean {
+  try {
+    // Parse versions
+    const current = parseVersion(currentVersion);
+    const latest = parseVersion(latestVersion);
     
-    const majorDiff = latestMajor - currentMajor;
+    // Compare based on threshold
+    if (latest.major - current.major > threshold.major) return true;
+    if (latest.major === current.major && latest.minor - current.minor > threshold.minor) return true;
+    if (latest.major === current.major && latest.minor === current.minor && 
+        latest.patch - current.patch > threshold.patch) return true;
     
-    // Major version upgrades are more difficult
-    if (majorDiff > 1) effort += 2;
-    else if (majorDiff === 1) effort += 1;
+    return false;
+  } catch (error) {
+    log.warn(`Error comparing versions: ${currentVersion} vs ${latestVersion}`, { error });
+    return false;
   }
-  
-  // Deprecated packages are harder to update (requires replacement)
-  if (info.isDeprecated) effort += 1;
-  
-  // Popular packages are usually easier to update (better docs, examples)
-  if (info.downloadCount && info.downloadCount > 1000000) effort -= 1;
-  
-  // Different dependency types have different update complexities
-  switch (dependency.type) {
-    case 'peer':
-      // Peer dependencies are tricky to update
-      effort += 1;
-      break;
-    case 'development':
-      // Dev dependencies are usually easier
-      effort -= 1;
-      break;
-  }
-  
-  // Cap at 1-5 range
-  return Math.max(1, Math.min(5, effort));
 }
 
 /**
- * Generate a recommendation for a dependency issue
+ * Parse version string into components
  */
-function generateRecommendation(
-  dependency: DetectedDependency,
-  info: DependencyInfo
-): string {
-  const recommendations: string[] = [];
+function parseVersion(version: string): { major: number; minor: number; patch: number } {
+  // Try using semver first
+  try {
+    const parsed = semver.coerce(version);
+    if (parsed) {
+      return {
+        major: parsed.major,
+        minor: parsed.minor,
+        patch: parsed.patch
+      };
+    }
+  } catch (error) {
+    // Proceed to fallback parsing
+  }
   
-  if (info.hasSecurityIssues) {
-    const highestSeverity = info.securityIssues?.reduce(
+  // Fallback version parsing
+  const parts = version.split('.').map(p => parseInt(p, 10) || 0);
+  
+  return {
+    major: parts[0] || 0,
+    minor: parts[1] || 0,
+    patch: parts[2] || 0
+  };
+}
+
+/**
+ * Calculate business impact score for a dependency
+ */
+function calculateBusinessImpact(dep: ParsedDependency, metadata: DependencyMetadata): number {
+  let score = 3; // Default medium impact
+  
+  // Higher impact for production dependencies
+  if (dep.type === 'production') score += 1;
+  
+  // Security issues raise impact significantly
+  if (metadata.hasSecurityIssues) {
+    // Find the highest severity
+    const highestSeverity = metadata.securityIssues?.reduce(
       (highest, current) => {
         const severityRank = { 'low': 1, 'medium': 2, 'high': 3, 'critical': 4 };
         const currentRank = severityRank[current.severity] || 0;
@@ -576,576 +830,166 @@ function generateRecommendation(
       'low' as 'low' | 'medium' | 'high' | 'critical'
     );
     
-    recommendations.push(
-      `Update ${dependency.name} immediately to fix ${highestSeverity} severity security ${info.securityIssues?.length === 1 ? 'issue' : 'issues'}`
-    );
-  } else if (info.isDeprecated) {
-    if (info.alternatives?.length) {
-      recommendations.push(
-        `Replace deprecated package ${dependency.name} with one of the recommended alternatives: ${info.alternatives.join(', ')}`
-      );
-    } else {
-      recommendations.push(
-        `Replace deprecated package ${dependency.name} with a maintained alternative`
-      );
-    }
-  } else if (info.isOutdated) {
-    recommendations.push(
-      `Update ${dependency.name} from ${dependency.currentVersion} to ${info.latestVersion}`
-    );
+    if (highestSeverity === 'critical') score += 2;
+    else if (highestSeverity === 'high') score += 1.5;
+    else if (highestSeverity === 'medium') score += 1;
+    else score += 0.5;
   }
   
-  // Add testing recommendation for major updates
-  if (info.latestVersion) {
-    const currentMajor = parseInt(dependency.currentVersion.split('.')[0], 10) || 0;
-    const latestMajor = parseInt(info.latestVersion.split('.')[0], 10) || 0;
-    
-    if (latestMajor > currentMajor) {
-      recommendations.push(
-        `Test thoroughly after updating as this is a major version change (${currentMajor} → ${latestMajor})`
-      );
-    }
-  }
+  // Very popular packages may have higher impact
+  if (metadata.downloadCount && metadata.downloadCount > 10000000) score += 0.5;
   
-  if (recommendations.length === 0) {
-    recommendations.push(`No immediate action required for ${dependency.name} ${dependency.currentVersion}`);
-  }
+  // Deprecated packages without alternatives are concerning
+  if (metadata.isDeprecated && !metadata.alternatives?.length) score += 0.5;
   
-  return recommendations.join('. ');
+  // Bound the score between 1 and 5
+  return Math.max(1, Math.min(5, score));
 }
 
 /**
- * Generate tags for categorizing dependency issues
+ * Calculate update effort score for a dependency
+ */
+function calculateUpdateEffort(dep: ParsedDependency, metadata: DependencyMetadata): number {
+  let score = 2; // Default somewhat easy to update
+  
+  // Version jump size
+  if (dep.version && metadata.latestVersion) {
+    const current = parseVersion(dep.version);
+    const latest = parseVersion(metadata.latestVersion);
+    
+    if (latest.major !== current.major) {
+      // Major version changes are harder
+      score += latest.major - current.major;
+    } else if (latest.minor - current.minor > 5) {
+      // Many minor versions behind
+      score += 0.5;
+    }
+  }
+  
+  // Deprecated packages without clear alternatives are harder to update
+  if (metadata.isDeprecated) {
+    score += metadata.alternatives?.length ? 1 : 2;
+  }
+  
+  // Dependencies used in production code are generally harder to update
+  if (dep.type === 'production') score += 0.5;
+  
+  // Bound the score between 1 and 5
+  return Math.max(1, Math.min(5, score));
+}
+
+/**
+ * Generate tags for a dependency issue
  */
 function generateTags(
-  dependency: DetectedDependency,
-  info: DependencyInfo
+  dep: ParsedDependency, 
+  metadata: DependencyMetadata, 
+  isOutdated: boolean
 ): string[] {
-  const tags: string[] = [dependency.packageManager, dependency.type];
+  const tags: string[] = [dep.packageManager, dep.type];
   
-  if (info.isOutdated) tags.push('outdated');
-  if (info.isDeprecated) tags.push('deprecated');
+  if (isOutdated) tags.push('outdated');
+  if (metadata.isDeprecated) tags.push('deprecated');
+  if (metadata.hasSecurityIssues) tags.push('security-issue');
   
-  // Add security tags
-  if (info.hasSecurityIssues) {
-    tags.push('security');
-    
-    // Add tag for highest severity
-    const severities = info.securityIssues?.map(v => v.severity) || [];
+  // Add severity tag for security issues
+  if (metadata.securityIssues?.length) {
+    const severities = metadata.securityIssues.map(issue => issue.severity);
     if (severities.includes('critical')) tags.push('critical-severity');
     else if (severities.includes('high')) tags.push('high-severity');
     else if (severities.includes('medium')) tags.push('medium-severity');
     else if (severities.includes('low')) tags.push('low-severity');
   }
   
-  // Add license tags
-  if (info.license) {
-    if (isPermissiveLicense(info.license)) {
-      tags.push('permissive-license');
-    } else if (isCopyleftLicense(info.license)) {
-      tags.push('copyleft-license');
-    }
+  // Add license tag if available
+  if (metadata.license) {
+    tags.push(`license-${metadata.license.toLowerCase().replace(/[^a-z0-9]/g, '-')}`);
   }
   
-  // Maintenance status
-  if (info.isMaintained === false) {
-    tags.push('unmaintained');
+  // Add popularity tag
+  if (metadata.downloadCount) {
+    if (metadata.downloadCount > 10000000) tags.push('very-popular');
+    else if (metadata.downloadCount > 1000000) tags.push('popular');
+    else if (metadata.downloadCount > 100000) tags.push('moderately-popular');
+    else tags.push('niche');
   }
   
   return tags;
 }
 
-/* ---- Helper Functions and Definitions ---- */
-
 /**
- * Get manifest definitions for various package managers
+ * Generate a recommendation for the dependency issue
  */
-function getManifestDefinitions(): DependencyManifest[] {
-  return [
-    // NPM / Yarn / PNPM
-    {
-      packageManager: PackageManager.NPM,
-      filePattern: '**/package.json',
-      parser: (content) => {
-        try {
-          const pkg = JSON.parse(content);
-          return pkg.dependencies || {};
-        } catch (error) {
-          return null;
-        }
+function generateRecommendation(
+  dep: ParsedDependency, 
+  metadata: DependencyMetadata, 
+  isOutdated: boolean
+): string {
+  const recommendations: string[] = [];
+  
+  if (metadata.hasSecurityIssues) {
+    // Find the highest severity
+    const highestSeverity = metadata.securityIssues?.reduce(
+      (highest, current) => {
+        const severityRank = { 'low': 1, 'medium': 2, 'high': 3, 'critical': 4 };
+        const currentRank = severityRank[current.severity] || 0;
+        const highestRank = severityRank[highest] || 0;
+        return currentRank > highestRank ? current.severity : highest;
       },
-      devDependenciesParser: (content) => {
-        try {
-          const pkg = JSON.parse(content);
-          return pkg.devDependencies || {};
-        } catch (error) {
-          return null;
-        }
-      },
-      peerDependenciesParser: (content) => {
-        try {
-          const pkg = JSON.parse(content);
-          return pkg.peerDependencies || {};
-        } catch (error) {
-          return null;
-        }
-      },
-      optionalDependenciesParser: (content) => {
-        try {
-          const pkg = JSON.parse(content);
-          return pkg.optionalDependencies || {};
-        } catch (error) {
-          return null;
-        }
-      }
-    },
-    // Python pip
-    {
-      packageManager: PackageManager.PIP,
-      filePattern: '**/requirements.txt',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('#') || !line.trim()) continue;
-          
-          // Parse requirement line
-          const match = line.match(/^([a-zA-Z0-9_.-]+)([<>=~!]+)([a-zA-Z0-9_.-]+)/);
-          if (match) {
-            const [, name, , version] = match;
-            result[name.trim()] = version.trim();
-          } else {
-            // Handle case where no version is specified
-            const simpleName = line.trim().split(/\s+/)[0];
-            if (simpleName) {
-              result[simpleName] = '*';
-            }
-          }
-        }
-        
-        return result;
-      }
-    },
-    // Python Poetry
-    {
-      packageManager: PackageManager.POETRY,
-      filePattern: '**/pyproject.toml',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        let inDependencies = false;
-        
-        for (const line of lines) {
-          if (line.trim() === '[tool.poetry.dependencies]') {
-            inDependencies = true;
-            continue;
-          } else if (line.trim().startsWith('[') && inDependencies) {
-            inDependencies = false;
-          }
-          
-          if (inDependencies) {
-            const match = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_.-]+)\s*=\s*'([^']+)'/);
-            if (match) {
-              const name = match[1] || match[3];
-              const version = match[2] || match[4] || '*';
-              
-              if (name && name !== 'python') {
-                result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
-              }
-            }
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      },
-      devDependenciesParser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        let inDevDependencies = false;
-        
-        for (const line of lines) {
-          if (line.trim() === '[tool.poetry.dev-dependencies]') {
-            inDevDependencies = true;
-            continue;
-          } else if (line.trim().startsWith('[') && inDevDependencies) {
-            inDevDependencies = false;
-          }
-          
-          if (inDevDependencies) {
-            const match = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_.-]+)\s*=\s*'([^']+)'/);
-            if (match) {
-              const name = match[1] || match[3];
-              const version = match[2] || match[4] || '*';
-              
-              if (name && name !== 'python') {
-                result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
-              }
-            }
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // Maven
-    {
-      packageManager: PackageManager.MAVEN,
-      filePattern: '**/pom.xml',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        
-        // Extract dependencies
-        const dependencyMatches = content.matchAll(/<dependency>\s*<groupId>([^<]+)<\/groupId>\s*<artifactId>([^<]+)<\/artifactId>\s*<version>([^<]+)<\/version>/g);
-        
-        for (const match of dependencyMatches) {
-          const groupId = match[1].trim();
-          const artifactId = match[2].trim();
-          const version = match[3].trim();
-          
-          result[`${groupId}:${artifactId}`] = version;
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // Gradle
-    {
-      packageManager: PackageManager.GRADLE,
-      filePattern: '**/*.gradle',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        
-        // Match different dependency formats
-        const depMatches = [
-          ...content.matchAll(/implementation\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
-          ...content.matchAll(/api\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
-          ...content.matchAll(/compile\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
-          ...content.matchAll(/runtime\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g)
-        ];
-        
-        for (const match of depMatches) {
-          const groupId = match[1].trim();
-          const artifactId = match[2].trim();
-          const version = match[3].trim();
-          
-          result[`${groupId}:${artifactId}`] = version;
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      },
-      devDependenciesParser: (content) => {
-        const result: Record<string, string> = {};
-        
-        // Match test dependencies
-        const depMatches = [
-          ...content.matchAll(/testImplementation\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g),
-          ...content.matchAll(/testCompile\s+['"]([-\w.]+):([-\w.]+):([-\w.]+)['"]\s*/g)
-        ];
-        
-        for (const match of depMatches) {
-          const groupId = match[1].trim();
-          const artifactId = match[2].trim();
-          const version = match[3].trim();
-          
-          result[`${groupId}:${artifactId}`] = version;
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // Composer (PHP)
-    {
-      packageManager: PackageManager.COMPOSER,
-      filePattern: '**/composer.json',
-      parser: (content) => {
-        try {
-          const pkg = JSON.parse(content);
-          return pkg.require || {};
-        } catch (error) {
-          return null;
-        }
-      },
-      devDependenciesParser: (content) => {
-        try {
-          const pkg = JSON.parse(content);
-          return pkg['require-dev'] || {};
-        } catch (error) {
-          return null;
-        }
-      }
-    },
-    // Cargo (Rust)
-    {
-      packageManager: PackageManager.CARGO,
-      filePattern: '**/Cargo.toml',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        let inDependencies = false;
-        
-        for (const line of lines) {
-          if (line.trim() === '[dependencies]') {
-            inDependencies = true;
-            continue;
-          } else if (line.trim().startsWith('[') && inDependencies) {
-            inDependencies = false;
-          }
-          
-          if (inDependencies) {
-            // Match lines like package = "version" or package = { version = "version" }
-            const simpleMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_-]+)\s*=\s*'([^']+)'/);
-            const complexMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*\{[^\}]*version\s*=\s*"([^"]+)"[^\}]*\}/);
-            
-            if (simpleMatch) {
-              const name = simpleMatch[1] || simpleMatch[3];
-              const version = simpleMatch[2] || simpleMatch[4] || '*';
-              result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
-            } else if (complexMatch) {
-              result[complexMatch[1].trim()] = complexMatch[2];
-            }
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      },
-      devDependenciesParser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        let inDevDependencies = false;
-        
-        for (const line of lines) {
-          if (line.trim() === '[dev-dependencies]') {
-            inDevDependencies = true;
-            continue;
-          } else if (line.trim().startsWith('[') && inDevDependencies) {
-            inDevDependencies = false;
-          }
-          
-          if (inDevDependencies) {
-            // Match lines like package = "version" or package = { version = "version" }
-            const simpleMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"|([a-zA-Z0-9_-]+)\s*=\s*'([^']+)'/);
-            const complexMatch = line.match(/([a-zA-Z0-9_-]+)\s*=\s*\{[^\}]*version\s*=\s*"([^"]+)"[^\}]*\}/);
-            
-            if (simpleMatch) {
-              const name = simpleMatch[1] || simpleMatch[3];
-              const version = simpleMatch[2] || simpleMatch[4] || '*';
-              result[name.trim()] = version.replace(/\^|~|=|>|<|\*|\|/g, '');
-            } else if (complexMatch) {
-              result[complexMatch[1].trim()] = complexMatch[2];
-            }
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // Go modules
-    {
-      packageManager: PackageManager.GO,
-      filePattern: '**/go.mod',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        
-        for (const line of lines) {
-          // Match lines like: require github.com/pkg/errors v0.9.1
-          const directMatch = line.match(/^require\s+([^\s]+)\s+([^\s]+)/);
-          
-          // Match lines in a require block: github.com/pkg/errors v0.9.1
-          const blockMatch = line.match(/^\s+([^\s]+)\s+([^\s]+)/);
-          
-          if (directMatch || blockMatch) {
-            const match = directMatch || blockMatch;
-            const name = match[1].trim();
-            let version = match[2].trim();
-            
-            // Remove 'v' prefix if present
-            if (version.startsWith('v')) {
-              version = version.substring(1);
-            }
-            
-            result[name] = version;
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // Ruby Gemfile
-    {
-      packageManager: PackageManager.GEM,
-      filePattern: '**/Gemfile',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('#') || !line.trim()) continue;
-          
-          // Match gem specifications: gem 'name', '~> 1.2.3'
-          const match = line.match(/gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?/);
-          if (match) {
-            const name = match[1].trim();
-            let version = match[2] ? match[2].trim() : '*';
-            
-            // Clean up version string
-            version = version.replace(/^[~><]=?\s*/, '');
-            
-            result[name] = version;
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      },
-      devDependenciesParser: (content) => {
-        const result: Record<string, string> = {};
-        const lines = content.split('\n');
-        let inDevelopmentGroup = false;
-        let inTestGroup = false;
-        
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('#') || !line.trim()) continue;
-          
-          // Check if we're entering/exiting a development or test group
-          if (line.match(/^group\s+:(?:development|dev)(?:,|\s|$)/)) {
-            inDevelopmentGroup = true;
-          } else if (line.match(/^group\s+:test(?:,|\s|$)/)) {
-            inTestGroup = true;
-          } else if (line.trim() === 'end' && (inDevelopmentGroup || inTestGroup)) {
-            inDevelopmentGroup = false;
-            inTestGroup = false;
-          }
-          
-          // Only process gems in development or test groups
-          if (inDevelopmentGroup || inTestGroup) {
-            const match = line.match(/gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?/);
-            if (match) {
-              const name = match[1].trim();
-              let version = match[2] ? match[2].trim() : '*';
-              
-              // Clean up version string
-              version = version.replace(/^[~><]=?\s*/, '');
-              
-              result[name] = version;
-            }
-          }
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // Swift Package Manager
-    {
-      packageManager: PackageManager.SWIFT,
-      filePattern: '**/Package.swift',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        
-        // Match package dependencies: .package(url: "https://github.com/user/package.git", from: "1.0.0")
-        const matches = content.matchAll(/\.package\((?:url|name):\s*"([^"]+)",\s*(?:from|exact|branch|revision|version|range):\s*"([^"]+)"\)/g);
-        
-        for (const match of matches) {
-          // Extract the package name from the URL
-          const url = match[1].trim();
-          const version = match[2].trim();
-          
-          // Get the package name from the URL
-          const urlParts = url.split('/');
-          const packageName = urlParts[urlParts.length - 1].replace('.git', '');
-          
-          result[packageName] = version;
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    },
-    // NuGet packages (C#)
-    {
-      packageManager: PackageManager.NUGET,
-      filePattern: '**/*.csproj',
-      parser: (content) => {
-        const result: Record<string, string> = {};
-        
-        // Match package references: <PackageReference Include="Package.Name" Version="1.2.3" />
-        const matches = content.matchAll(/<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"\s*\/?>/g);
-        
-        for (const match of matches) {
-          const name = match[1].trim();
-          const version = match[2].trim();
-          
-          result[name] = version;
-        }
-        
-        return Object.keys(result).length > 0 ? result : null;
-      }
-    }
-  ];
-}
-
-/**
- * Parse a custom manifest file
- */
-function parseCustomManifest(content: string): Record<string, string> | null {
-  try {
-    // Try parsing as JSON first
-    const json = JSON.parse(content);
+      'low' as 'low' | 'medium' | 'high' | 'critical'
+    );
     
-    // Check common locations for dependencies
-    if (json.dependencies) {
-      return json.dependencies;
-    } else if (json.require) {
-      return json.require;
-    }
-  } catch (e) {
-    // Not JSON, try line-by-line parsing for simple key-value formats
-    const result: Record<string, string> = {};
-    const lines = content.split('\n');
+    const issueCount = metadata.securityIssues?.length || 0;
     
-    for (const line of lines) {
-      // Skip comments and empty lines
-      if (line.trim().startsWith('#') || line.trim().startsWith('//') || !line.trim()) continue;
-      
-      // Try matching key-value pairs in various formats
-      const match = line.match(/([\w.-]+)[=:]\s*['"]?([\w.-]+)['"]?/) ||
-                   line.match(/([\w.-]+)\s+([\w.-]+)/);
-      
-      if (match) {
-        result[match[1].trim()] = match[2].trim();
-      }
+    recommendations.push(
+      `Update ${dep.name} immediately from ${dep.version} to ${metadata.latestVersion} to fix ${issueCount} ${highestSeverity} severity security ${issueCount === 1 ? 'issue' : 'issues'}`
+    );
+  } else if (metadata.isDeprecated) {
+    recommendations.push(
+      `Replace deprecated dependency ${dep.name} ${dep.version}`
+    );
+    
+    if (metadata.deprecationReason) {
+      recommendations.push(`Reason: ${metadata.deprecationReason}`);
     }
     
-    if (Object.keys(result).length > 0) {
-      return result;
+    if (metadata.alternatives?.length) {
+      recommendations.push(
+        `Consider these alternatives: ${metadata.alternatives.join(', ')}`
+      );
     }
+  } else if (isOutdated) {
+    recommendations.push(
+      `Update ${dep.name} from ${dep.version} to ${metadata.latestVersion}`
+    );
   }
   
-  return null;
+  // If we have no recommendations yet, add a general one
+  if (recommendations.length === 0) {
+    recommendations.push(
+      `No immediate actions needed for ${dep.name} ${dep.version}`
+    );
+  }
+  
+  return recommendations.join('. ');
 }
 
-/**
- * Clean up version string by removing version range operators
- */
-function cleanVersionString(version: string): string {
-  if (!version) return '';
-  
-  // Remove common version range operators
-  return version
-    .replace(/^[\^~>=<]+\s*/, '') // Remove operators at the start
-    .replace(/[*xX]/, '0')        // Replace wildcards with 0
-    .split(/\s+/)[0]               // Take only the first part if there are multiple
-    .split(/[|,]/)[0];             // Take only the first part if there are OR conditions
-}
+/* ---- Helper Functions ---- */
 
 /**
  * Increment a version for demonstration purposes
  */
 function incrementVersion(version: string): string {
   try {
-    const parts = version.split('.');
+    // Clean up version string to ensure it's parseable
+    const cleanVersion = version.replace(/[^0-9.]/g, '');
+    
+    // Handle 'latest' or empty versions
+    if (!cleanVersion || cleanVersion === 'latest') {
+      return '1.0.0';
+    }
+    
+    const parts = cleanVersion.split('.');
     
     if (parts.length < 3) {
       // Ensure we have at least 3 parts
@@ -1176,39 +1020,12 @@ function incrementVersion(version: string): string {
     
     return parts.join('.');
   } catch (error) {
-    return `${version}.1`; // Fallback
+    return `${version || '1.0.0'}.1`; // Fallback
   }
 }
 
 /**
- * Get a random license for mock data
- */
-function getRandomLicense(): string {
-  const licenses = [
-    'MIT', 'Apache-2.0', 'BSD-3-Clause', 'GPL-3.0', 'LGPL-2.1',
-    'ISC', 'MPL-2.0', 'AGPL-3.0', 'Unlicense', 'proprietary'
-  ];
-  return licenses[Math.floor(Math.random() * licenses.length)];
-}
-
-/**
- * Check if a license is permissive
- */
-function isPermissiveLicense(license: string): boolean {
-  const permissiveLicenses = ['MIT', 'Apache-2.0', 'BSD-3-Clause', 'ISC', 'Unlicense'];
-  return permissiveLicenses.some(l => license.includes(l));
-}
-
-/**
- * Check if a license is copyleft
- */
-function isCopyleftLicense(license: string): boolean {
-  const copyleftLicenses = ['GPL', 'LGPL', 'AGPL', 'MPL'];
-  return copyleftLicenses.some(l => license.includes(l));
-}
-
-/**
- * Get a random security vulnerability severity
+ * Get a random severity level
  */
 function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
   const severities: Array<'low' | 'medium' | 'high' | 'critical'> = [
@@ -1230,57 +1047,86 @@ function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
 }
 
 /**
- * Get a random vulnerability type for mock data
+ * Get a random vulnerability type
  */
 function getRandomVulnerabilityType(): string {
   const types = [
-    'prototype pollution',
-    'cross-site scripting',
-    'path traversal',
-    'command injection',
-    'insecure deserialization',
-    'buffer overflow',
     'SQL injection',
+    'cross-site scripting',
+    'remote code execution',
+    'denial of service',
+    'buffer overflow',
+    'path traversal',
+    'privilege escalation',
+    'open redirect',
+    'insecure deserialization',
+    'information disclosure',
+    'authentication bypass',
+    'memory corruption',
+    'prototype pollution',
     'regular expression denial of service',
-    'arbitrary code execution',
-    'memory leak',
-    'information disclosure'
+    'stack overflow',
+    'injection',
+    'race condition'
   ];
   return types[Math.floor(Math.random() * types.length)];
 }
 
 /**
- * Get random alternatives for deprecated packages
+ * Get random deprecation reason
+ */
+function getRandomDeprecationReason(): string {
+  const reasons = [
+    'Package is no longer maintained',
+    'Package has been superseded by newer alternatives',
+    'Security concerns that cannot be fixed',
+    'Functionality now included in the language/framework',
+    'API fundamentally flawed',
+    'Project merged into another package',
+    'Author has discontinued development',
+    'Performance issues that cannot be resolved',
+    'Deprecated by the platform/language',
+    'Unmaintained and contains security issues'
+  ];
+  return reasons[Math.floor(Math.random() * reasons.length)];
+}
+
+/**
+ * Get random alternatives based on package manager
  */
 function getRandomAlternatives(name: string, packageManager: string): string[] {
-  // This would be powered by a real database in a production system
-  // Here we just generate some mock alternatives
+  // Default alternatives by package manager
+  const defaultAlternatives: Record<string, string[]> = {
+    npm: ['newer-lib', 'modern-package', 'maintained-tool'],
+    composer: ['better-php-lib', 'modern-php-package'],
+    pip: ['better-python-lib', 'modern-python-tool'],
+    maven: ['better-java-lib', 'modern-java-tool'],
+    cargo: ['better-rust-lib', 'modern-rust-tool'],
+    bundler: ['better-ruby-gem', 'modern-ruby-tool']
+  };
+  
+  // Use defaults or generate random count of alternatives
   const count = 1 + Math.floor(Math.random() * 3);
-  const result: string[] = [];
+  const alternatives = defaultAlternatives[packageManager] || ['alternative-lib'];
   
-  for (let i = 0; i < count; i++) {
-    // Generate alternatives by adding prefixes/suffixes
-    const prefixes = ['modern-', 'better-', 'secure-', 'new-'];
-    const suffixes = ['-next', '-improved', '-2', '.js'];
-    
-    const usePrefix = Math.random() > 0.5;
-    
-    if (usePrefix) {
-      const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-      result.push(prefix + name);
-    } else {
-      const nameParts = name.split('/');
-      const baseName = nameParts[nameParts.length - 1];
-      const suffix = suffixes[Math.floor(Math.random() * suffixes.length)];
-      
-      if (nameParts.length > 1) {
-        const scope = nameParts.slice(0, -1).join('/');
-        result.push(`${scope}/${baseName}${suffix}`);
-      } else {
-        result.push(baseName + suffix);
-      }
-    }
-  }
-  
-  return result;
+  // Return a subset of alternatives
+  return alternatives.slice(0, count);
+}
+
+/**
+ * Get a random license
+ */
+function getRandomLicense(): string {
+  const licenses = [
+    'MIT',
+    'Apache-2.0',
+    'GPL-3.0',
+    'BSD-3-Clause',
+    'ISC',
+    'LGPL-2.1',
+    'MPL-2.0',
+    'AGPL-3.0',
+    'Proprietary'
+  ];
+  return licenses[Math.floor(Math.random() * licenses.length)];
 }
