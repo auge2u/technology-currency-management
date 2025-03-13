@@ -1,270 +1,274 @@
 /**
- * Represents a pattern to check for deprecated code/technology
+ * Types for scanning and technology currency management
  */
-export interface DeprecationPattern {
-  // Unique identifier for this pattern
-  id: string;
-  
-  // Technology category (e.g., 'javascript', 'react', 'python')
-  technology: string;
-  
-  // Short description of the issue
-  message: string;
-  
-  // Detailed description of why this is deprecated/problematic
-  description: string;
-  
-  // How to fix the issue
-  remediation: string;
-  
-  // URL to documentation about this issue
-  documentationUrl: string;
-  
-  // Regular expression to match this pattern
-  regex: string;
-  
-  // Optional regex to exclude certain matches
-  exclusionRegex?: string;
-  
-  // Severity of the issue
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  
-  // File types this pattern applies to
-  fileTypes: string[]; // e.g., ['js', 'jsx', 'ts', 'tsx']
-}
 
 /**
- * Represents a deprecated technology or pattern found in code
+ * Severity level for security vulnerabilities
  */
-export interface CodePatternIssue {
-  // Unique identifier for this instance
-  id: string;
-  
-  // ID of the pattern that matched
-  patternId: string;
-  
-  // File where the issue was found
-  file: string;
-  
-  // Line number where the issue was found
-  line: number;
-  
-  // Column where the issue was found
-  column: number;
-  
-  // The actual code snippet containing the issue
-  snippet: string;
-  
-  // The specific text that matched the pattern
-  match: string;
-  
-  // Short description of the issue
-  message: string;
-  
-  // Detailed description of why this is deprecated/problematic
-  description: string;
-  
-  // How to fix the issue
-  remediation: string;
-  
-  // URL to documentation about this issue
-  documentationUrl: string;
-  
-  // Severity of the issue
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  
-  // Technology category
-  technology: string;
-  
-  // When this issue was detected
-  detectedAt: Date;
-}
+export type SeverityLevel = 'low' | 'medium' | 'high' | 'critical';
 
 /**
- * Represents a dependency with associated vulnerabilities and outdated status
- */
-export interface DependencyIssue {
-  // Dependency name
-  name: string;
-  
-  // Current version
-  currentVersion: string;
-  
-  // Latest available version
-  latestVersion: string;
-  
-  // Is the dependency outdated?
-  isOutdated: boolean;
-  
-  // Is this a direct or transitive dependency?
-  isDirect: boolean;
-  
-  // Package ecosystem (npm, pip, maven, etc.)
-  ecosystem: string;
-  
-  // Path to the dependency definition file (package.json, requirements.txt, etc.)
-  definitionFile: string;
-  
-  // Known vulnerabilities
-  vulnerabilities: VulnerabilityInfo[];
-  
-  // When this dependency was last updated
-  lastUpdated?: Date;
-  
-  // When this dependency will reach end-of-life/end-of-support
-  eolDate?: Date;
-  
-  // Whether this is a deprecated package
-  isDeprecated: boolean;
-  
-  // Deprecation message if available
-  deprecationMessage?: string;
-  
-  // When this issue was detected
-  detectedAt: Date;
-  
-  // Suggested fix (e.g., upgrade command)
-  suggestedFix?: string;
-}
-
-/**
- * Represents vulnerability information for a dependency
+ * Information about a vulnerability
  */
 export interface VulnerabilityInfo {
-  // Unique identifier (e.g., CVE ID)
+  // Unique identifier for the vulnerability
   id: string;
+  
+  // CVSS score (0.0-10.0)
+  cvssScore?: number;
+  
+  // Severity level
+  severity: SeverityLevel;
   
   // Vulnerability title
   title: string;
   
   // Detailed description
-  description: string;
-  
-  // Severity level
-  severity: 'low' | 'medium' | 'high' | 'critical';
+  description?: string;
   
   // URL to vulnerability details
-  url: string;
+  infoUrl?: string;
   
-  // Versions affected
-  affectedVersions: string;
+  // When the vulnerability was published
+  publishedDate?: Date;
   
-  // Versions that fix this vulnerability
-  patchedVersions: string;
+  // Affected versions range
+  affectedVersions?: string;
   
-  // Published date of the vulnerability
-  publishedDate: Date;
+  // Fixed versions
+  patchedVersions?: string;
   
-  // Recommended action to fix
-  remediation: string;
+  // Recommended action
+  recommendation?: string;
 }
 
 /**
- * Represents a browser extension that requires updating
+ * Base issue interface for all scanners
  */
-export interface BrowserExtensionIssue {
-  // Extension name
+export interface BaseIssue {
+  // Name of the component
   name: string;
   
-  // Extension identifier
+  // Current version
+  currentVersion: string;
+  
+  // Latest available version
+  latestVersion: string;
+  
+  // Whether the component is outdated
+  isOutdated: boolean;
+  
+  // Whether the component is deprecated
+  isDeprecated?: boolean;
+  
+  // Deprecation message if available
+  deprecationMessage?: string;
+  
+  // When the issue was detected
+  detectedAt: Date;
+}
+
+/**
+ * Issue detected by the dependency scanner
+ */
+export interface DependencyIssue extends BaseIssue {
+  // Whether this is a direct or transitive dependency
+  isDirect: boolean;
+  
+  // Ecosystem (npm, pip, maven, etc.)
+  ecosystem: string;
+  
+  // Path to the definition file (package.json, requirements.txt, etc.)
+  definitionFile: string;
+  
+  // List of security vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // Command to upgrade the dependency
+  suggestedFix?: string;
+}
+
+/**
+ * Issue detected by the browser extension scanner
+ */
+export interface BrowserExtensionIssue extends BaseIssue {
+  // Extension ID
   id: string;
   
-  // Current version
-  currentVersion: string;
-  
-  // Latest available version
-  latestVersion: string;
-  
-  // Browser this extension is for
+  // Browser name
   browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera';
   
-  // Is the extension outdated?
-  isOutdated: boolean;
-  
-  // Is the extension deprecated?
-  isDeprecated: boolean;
-  
-  // Does the extension have security issues?
+  // Whether the extension has security issues
   hasSecurityIssues: boolean;
   
-  // Has the extension been removed from the store?
+  // Whether the extension has been removed from the store
   isRemovedFromStore: boolean;
   
-  // Known vulnerabilities
+  // List of security vulnerabilities
   vulnerabilities: VulnerabilityInfo[];
   
-  // URL to the extension in the browser store
+  // URL to the extension in the store
   storeUrl: string;
-  
-  // When this issue was detected
-  detectedAt: Date;
 }
 
 /**
- * Represents a framework, library, or system component that is outdated
+ * Issue detected by the framework scanner
  */
-export interface SystemComponentIssue {
-  // Component name
-  name: string;
+export interface FrameworkIssue extends BaseIssue {
+  // Framework category
+  category: 'frontend' | 'backend' | 'mobile' | 'database' | 'devops' | 'system' | 'other';
   
-  // Component type (framework, library, system)
-  type: 'framework' | 'library' | 'system';
+  // Type of the framework/technology
+  type: string;
   
-  // Current version
-  currentVersion: string;
+  // Location where the framework is used
+  location: string;
   
-  // Latest available version
-  latestVersion: string;
+  // End of life date if available
+  endOfLifeDate?: Date;
   
-  // Is the component outdated?
-  isOutdated: boolean;
+  // End of support date if available
+  endOfSupportDate?: Date;
   
-  // Minimum version recommended for security
-  minimumRecommendedVersion: string;
-  
-  // End of life/support date
-  eolDate?: Date;
-  
-  // Is this component reaching EOL soon?
-  isApproachingEol: boolean;
-  
-  // Time until EOL
-  timeUntilEol?: string;
-  
-  // Known vulnerabilities
+  // List of security vulnerabilities
   vulnerabilities: VulnerabilityInfo[];
   
-  // Suggested upgrade path
-  upgradeInstructions?: string;
+  // Migration path to a newer version
+  migrationPath?: string;
   
-  // Potential impact of upgrading
-  upgradeDifficulty: 'low' | 'medium' | 'high';
+  // Estimated migration effort (1-5)
+  migrationEffort?: number;
   
-  // Estimated time to upgrade (in person-days)
-  estimatedUpgradeEffort: number;
+  // Business impact of not migrating (1-5)
+  businessImpact?: number;
   
-  // When this issue was detected
-  detectedAt: Date;
+  // Security impact of not migrating (1-5)
+  securityImpact?: number;
 }
 
 /**
- * Report summarizing all types of currency issues
+ * Issue detected by the database technology scanner
  */
-export interface TechnologyCurrencyReport {
-  // Project summary
-  projectName: string;
-  scanDate: Date;
+export interface DatabaseIssue extends BaseIssue {
+  // Database type (MySQL, PostgreSQL, etc.)
+  dbType: string;
   
-  // Overall scores
-  overallCurrencyScore: number; // 0-100
-  securityScore: number; // 0-100
-  technicalDebtScore: number; // 0-100
+  // Database instance identifier
+  instanceId: string;
+  
+  // Connection details
+  connectionInfo?: string;
+  
+  // End of life date if available
+  endOfLifeDate?: Date;
+  
+  // End of support date if available
+  endOfSupportDate?: Date;
+  
+  // List of security vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // Migration path to a newer version
+  migrationPath?: string;
+}
+
+/**
+ * Issue detected by the infrastructure scanner
+ */
+export interface InfrastructureIssue extends BaseIssue {
+  // Infrastructure type (VM, container, etc.)
+  infraType: string;
+  
+  // Provider (AWS, Azure, GCP, etc.)
+  provider?: string;
+  
+  // Resource identifier
+  resourceId: string;
+  
+  // Location (region, zone, etc.)
+  location?: string;
+  
+  // End of life date if available
+  endOfLifeDate?: Date;
+  
+  // End of support date if available
+  endOfSupportDate?: Date;
+  
+  // List of security vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // Migration path to a newer version
+  migrationPath?: string;
+}
+
+/**
+ * Issue detected by the security scanner
+ */
+export interface SecurityIssue extends BaseIssue {
+  // Security component type
+  securityType: 'certificate' | 'encryption' | 'protocol' | 'algorithm' | 'key' | 'other';
+  
+  // Severity level
+  severity: SeverityLevel;
+  
+  // Where the security component is used
+  usageLocation: string;
+  
+  // List of vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // Remediation steps
+  remediation?: string;
+}
+
+/**
+ * Issue detected by the language runtime scanner
+ */
+export interface LanguageRuntimeIssue extends BaseIssue {
+  // Language name
+  language: string;
+  
+  // Runtime identifier
+  runtimeId: string;
+  
+  // Where the runtime is used
+  usageLocation: string;
+  
+  // End of life date if available
+  endOfLifeDate?: Date;
+  
+  // End of support date if available
+  endOfSupportDate?: Date;
+  
+  // List of security vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // Migration path to a newer version
+  migrationPath?: string;
+}
+
+/**
+ * Aggregated result from all scanners
+ */
+export interface TechnologyCurrencyScanResult {
+  // Scan metadata
+  scanId: string;
+  startTime: Date;
+  endTime: Date;
+  duration: number; // milliseconds
+  
+  // Organization and environment info
+  organization?: string;
+  environment?: string;
   
   // Issues by category
-  codePatternIssues: CodePatternIssue[];
   dependencyIssues: DependencyIssue[];
+  frameworkIssues: FrameworkIssue[];
   browserExtensionIssues: BrowserExtensionIssue[];
-  systemComponentIssues: SystemComponentIssue[];
+  databaseIssues: DatabaseIssue[];
+  infrastructureIssues: InfrastructureIssue[];
+  securityIssues: SecurityIssue[];
+  languageRuntimeIssues: LanguageRuntimeIssue[];
   
   // Summary statistics
   totalIssues: number;
@@ -273,10 +277,7 @@ export interface TechnologyCurrencyReport {
   mediumIssues: number;
   lowIssues: number;
   
-  // Remediation summary
-  estimatedRemediationEffort: number; // In person-days
-  priorityRemediationItems: Array<CodePatternIssue | DependencyIssue | BrowserExtensionIssue | SystemComponentIssue>;
-  
-  // Historical data for trending
-  historicalScores?: { date: Date; score: number; }[];
+  // Technical debt estimation
+  estimatedRemediationDays?: number;
+  estimatedRemediationCost?: number;
 }
