@@ -1,309 +1,302 @@
 /**
- * Types for technology currency scanning
- */
-
-/**
- * Base issue interface with common properties
+ * Base issue interface that all specific issues extend
  */
 export interface BaseIssue {
-  // Name of the technology/component
-  name: string;
-  
-  // Current version
-  currentVersion?: string;
-  
-  // Latest available version
-  latestVersion?: string;
-  
-  // Whether the component is outdated
-  isOutdated?: boolean;
-  
-  // Whether the component is deprecated
-  isDeprecated?: boolean;
-  
-  // Location in the system
-  location: string;
-  
   // When the issue was detected
   detectedAt: Date;
-  
-  // Vulnerabilities associated with this issue
-  vulnerabilities?: VulnerabilityInfo[];
   
   // Business impact score (1-5)
   businessImpact?: number;
   
-  // Security impact score (1-5)
-  securityImpact?: number;
-  
-  // Estimated migration effort (1-5)
-  migrationEffort?: number;
-  
-  // Recommended migration path
-  migrationPath?: string;
-  
-  // Specific recommendation to fix the issue
+  // Recommended action
   recommendation?: string;
   
-  // Tags for categorization
+  // Categorization tags
   tags?: string[];
+  
+  // Where the issue was found
+  location: string;
 }
 
 /**
- * Framework or technology issue
+ * Dependency issue (npm packages, pip packages, gems, etc.)
  */
-export interface FrameworkIssue extends BaseIssue {
-  // Framework category
-  category: 'frontend' | 'backend' | 'mobile' | 'database' | 'devops' | 'system' | 'other';
+export interface DependencyIssue extends BaseIssue {
+  // Name of the dependency
+  name: string;
   
-  // Framework type (e.g., 'js-framework', 'php-cms', 'database')
+  // Type of dependency (npm, pip, etc.)
   type: string;
   
-  // End of life date
-  endOfLifeDate?: Date;
+  // Current version installed
+  currentVersion: string;
   
-  // End of support date
-  endOfSupportDate?: Date;
+  // Latest version available
+  latestVersion: string;
+  
+  // Whether the dependency is outdated
+  isOutdated: boolean;
+  
+  // Whether the dependency is deprecated
+  isDeprecated: boolean;
+  
+  // Whether the dependency is unused
+  isUnused?: boolean;
+  
+  // License issue if any
+  licenseIssue?: {
+    issue: string;
+    severity: 'low' | 'medium' | 'high';
+  };
+  
+  // Security vulnerabilities
+  vulnerabilities?: VulnerabilityInfo[];
+  
+  // Security impact score (1-5)
+  securityImpact?: number;
+  
+  // Migration effort score (1-5)
+  migrationEffort?: number;
 }
 
 /**
  * Browser extension issue
  */
-export interface BrowserExtensionIssue extends BaseIssue {
-  // Extension ID
+export interface ExtensionIssue extends BaseIssue {
+  // Extension identifier
   id: string;
   
-  // Browser this extension is for
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera';
+  // Extension name
+  name: string;
+  
+  // Browser (chrome, firefox, edge, safari)
+  browser: string;
+  
+  // Current version installed
+  currentVersion: string;
+  
+  // Latest version available
+  latestVersion: string;
+  
+  // Whether the extension is outdated
+  isOutdated: boolean;
+  
+  // Whether the extension is deprecated
+  isDeprecated: boolean;
   
   // Whether the extension has been removed from the store
-  isRemovedFromStore?: boolean;
+  isRemoved: boolean;
   
-  // Whether the extension has security issues
-  hasSecurityIssues?: boolean;
+  // Number of users
+  userCount?: number;
   
-  // Store URL
+  // Rating in extension store
+  rating?: number;
+  
+  // Link to extension in store
   storeUrl?: string;
+  
+  // Last update timestamp
+  lastUpdated?: Date;
+  
+  // When the latest version was released
+  latestUpdateDate?: Date;
+  
+  // Security vulnerabilities
+  vulnerabilities?: Array<{
+    id: string;
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    fixedInVersion?: string;
+  }>;
 }
 
 /**
- * Dependency issue
+ * Framework, language or platform issue
  */
-export interface DependencyIssue extends BaseIssue {
-  // Dependency type
-  type: 'npm' | 'pip' | 'gem' | 'composer' | 'maven' | 'gradle' | 'nuget' | 'cargo' | 'go';
+export interface FrameworkIssue extends BaseIssue {
+  // Framework name
+  name: string;
   
-  // Whether it's unused
-  isUnused?: boolean;
+  // Framework type (nodejs, python, react, etc.)
+  type: string;
   
-  // License compliance issue
-  licenseIssue?: {
-    issue: string;
-    severity: 'low' | 'medium' | 'high';
-  };
+  // Current version
+  currentVersion: string;
+  
+  // Latest version available
+  latestVersion: string;
+  
+  // Latest LTS version if applicable
+  latestLtsVersion?: string;
+  
+  // Whether the framework is outdated
+  isOutdated: boolean;
+  
+  // Whether the framework is deprecated
+  isDeprecated: boolean;
+  
+  // Whether the framework is end-of-life
+  isEol: boolean;
+  
+  // Current support status
+  supportStatus: 'supported' | 'maintenance' | 'deprecated' | 'eol';
+  
+  // When support ends
+  supportEndDate?: Date;
+  
+  // Migration effort score (1-5)
+  migrationEffort?: number;
+  
+  // Security vulnerabilities
+  vulnerabilities?: Array<{
+    id: string;
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    fixedInVersion?: string;
+  }>;
+  
+  // URL to migration guide
+  migrationGuideUrl?: string;
+  
+  // URL to release notes
+  releaseNotesUrl?: string;
 }
 
 /**
- * System component issue
- */
-export interface SystemComponentIssue extends BaseIssue {
-  // Component type
-  type: 'os' | 'runtime' | 'database' | 'container' | 'vm' | 'library' | 'api' | 'other';
-  
-  // Environment
-  environment: 'development' | 'testing' | 'staging' | 'production' | 'other';
-  
-  // Whether it's a critical component
-  isCritical?: boolean;
-  
-  // End of life date
-  endOfLifeDate?: Date;
-  
-  // End of support date
-  endOfSupportDate?: Date;
-}
-
-/**
- * API issue
- */
-export interface ApiIssue extends BaseIssue {
-  // API type
-  type: 'rest' | 'graphql' | 'grpc' | 'soap' | 'other';
-  
-  // API version
-  version: string;
-  
-  // Provider of the API
-  provider: string;
-  
-  // Whether it's a critical API
-  isCritical?: boolean;
-  
-  // End of life date
-  endOfLifeDate?: Date;
-}
-
-/**
- * Vulnerability information
+ * Information about a security vulnerability
  */
 export interface VulnerabilityInfo {
-  // Vulnerability ID (e.g., CVE)
+  // Vulnerability identifier
   id: string;
   
   // Severity level
   severity: 'low' | 'medium' | 'high' | 'critical';
   
-  // CVSS score
-  cvssScore?: number;
-  
-  // Vulnerability title
+  // Short title
   title: string;
   
   // Detailed description
   description: string;
   
-  // URL for more information
-  infoUrl?: string;
-  
-  // Published date
+  // When the vulnerability was published
   publishedDate?: Date;
   
-  // Affected versions
+  // Affected version range
   affectedVersions?: string;
   
-  // Patched versions
+  // Versions that include a fix
   patchedVersions?: string;
   
-  // Recommendation to fix
+  // Recommended action
   recommendation?: string;
+  
+  // URL to vulnerability details
+  url?: string;
+  
+  // CVSS score if available
+  cvssScore?: number;
 }
 
 /**
- * Scan result
+ * Scanning result containing all issues
  */
-export interface ScanResult {
-  // Scan timestamp
-  timestamp: Date;
-  
-  // Scan ID
-  id: string;
-  
-  // Framework issues
-  frameworkIssues: FrameworkIssue[];
-  
-  // Browser extension issues
-  extensionIssues: BrowserExtensionIssue[];
+export interface ScanningResult {
+  // When the scan was performed
+  scanTime: Date;
   
   // Dependency issues
   dependencyIssues: DependencyIssue[];
   
-  // System component issues
-  systemIssues: SystemComponentIssue[];
+  // Extension issues
+  extensionIssues: ExtensionIssue[];
   
-  // API issues
-  apiIssues: ApiIssue[];
+  // Framework issues
+  frameworkIssues: FrameworkIssue[];
   
-  // Summary metrics
+  // Summary stats
   summary: {
-    // Total issues found
     totalIssues: number;
-    
-    // Issues by severity
-    criticalIssues: number;
-    highIssues: number;
-    mediumIssues: number;
-    lowIssues: number;
-    
-    // Issues by category
-    frameworkIssuesCount: number;
-    extensionIssuesCount: number;
-    dependencyIssuesCount: number;
-    systemIssuesCount: number;
-    apiIssuesCount: number;
-    
-    // Vulnerabilities
-    vulnerabilitiesCount: number;
-    
-    // Technical debt score (calculated from all issues)
-    technicalDebtScore: number;
-  };
-  
-  // Scan configuration
-  config: {
-    scanTypes: string[];
-    targetDirectory: string;
-    scanDepth: 'shallow' | 'normal' | 'deep';
-    includedPatterns: string[];
-    excludedPatterns: string[];
+    highImpactIssues: number;
+    securityIssues: number;
+    deprecatedTechnologies: number;
+    outdatedDependencies: number;
+    endOfLifeComponents: number;
   };
 }
 
 /**
- * Report configuration
+ * Technical debt report
  */
-export interface ReportConfig {
-  // Report format
-  format: 'html' | 'pdf' | 'json' | 'csv' | 'markdown';
+export interface TechnicalDebtReport {
+  // When the report was generated
+  generatedAt: Date;
   
-  // Report title
-  title: string;
+  // Overall health score (0-100)
+  healthScore: number;
   
-  // Include executive summary
-  includeExecutiveSummary: boolean;
+  // Debt categories
+  categories: {
+    securityDebt: number;
+    compatibilityDebt: number;
+    performanceDebt: number;
+    supportabilityDebt: number;
+  };
   
-  // Include recommendations
-  includeRecommendations: boolean;
+  // Issues organized by priority
+  issuesByPriority: {
+    critical: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
+    high: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
+    medium: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
+    low: Array<DependencyIssue | ExtensionIssue | FrameworkIssue>;
+  };
   
-  // Include detailed issues
-  includeDetailedIssues: boolean;
+  // Top recommendations
+  recommendations: string[];
   
-  // Include vulnerability details
-  includeVulnerabilities: boolean;
-  
-  // Include charts and visualizations
-  includeCharts: boolean;
-  
-  // Group issues by
-  groupBy: 'severity' | 'type' | 'location' | 'none';
-  
-  // Minimum severity to include
-  minimumSeverity: 'low' | 'medium' | 'high' | 'critical';
-  
-  // Output path
-  outputPath: string;
+  // Historical metrics
+  historicalMetrics?: {
+    timestamp: Date;
+    healthScore: number;
+    totalIssues: number;
+  }[];
 }
 
 /**
- * Notification configuration
+ * Notification settings
  */
-export interface NotificationConfig {
-  // Enable notifications
-  enabled: boolean;
+export interface NotificationSettings {
+  // Who to notify
+  recipients: string[];
   
   // Notification channels
   channels: Array<'email' | 'slack' | 'teams' | 'webhook'>;
   
-  // Notification recipients
-  recipients: string[];
+  // Notification thresholds
+  thresholds: {
+    securityIssues: 'all' | 'criticalOnly' | 'highAndAbove';
+    outdatedDependencies: 'all' | 'majorOnly' | 'criticalOnly';
+    deprecatedTechnologies: boolean;
+    endOfLifeComponents: boolean;
+  };
   
-  // Minimum severity to notify
-  minimumSeverity: 'low' | 'medium' | 'high' | 'critical';
+  // Notification frequency
+  frequency: 'immediate' | 'daily' | 'weekly';
   
-  // Include vulnerability details
-  includeVulnerabilities: boolean;
-  
-  // Include recommendations
-  includeRecommendations: boolean;
-  
-  // Channel-specific configuration
-  channelConfig: {
+  // Notification templates
+  templates?: {
     email?: {
-      smtpServer: string;
-      smtpPort: number;
-      fromAddress: string;
       subject: string;
-      useTls: boolean;
+      body: string;
     };
+    slack?: {
+      title: string;
+      message: string;
+    };
+  };
+  
+  // Integration settings
+  integrationSettings?: {
     slack?: {
       webhookUrl: string;
       channel: string;
@@ -311,10 +304,107 @@ export interface NotificationConfig {
     teams?: {
       webhookUrl: string;
     };
+    email?: {
+      smtpServer: string;
+      port: number;
+      username: string;
+      password: string;
+      from: string;
+    };
     webhook?: {
       url: string;
-      headers: Record<string, string>;
-      method: 'POST' | 'PUT';
+      method: 'GET' | 'POST';
+      headers?: Record<string, string>;
     };
   };
+}
+
+/**
+ * Version control integration settings
+ */
+export interface VersionControlSettings {
+  // Provider type
+  provider: 'github' | 'gitlab' | 'bitbucket' | 'azure-devops';
+  
+  // API token or credentials
+  credentials: {
+    token?: string;
+    username?: string;
+    password?: string;
+  };
+  
+  // Repository information
+  repository: {
+    owner: string;
+    name: string;
+    branch?: string;
+  };
+  
+  // Pull request settings
+  pullRequestSettings?: {
+    enabled: boolean;
+    automatic: boolean;
+    prefix: string;
+    assignees?: string[];
+    reviewers?: string[];
+    labels?: string[];
+  };
+  
+  // Issue tracking settings
+  issueSettings?: {
+    enabled: boolean;
+    automatic: boolean;
+    prefix: string;
+    labels?: string[];
+  };
+  
+  // Hook settings
+  hookSettings?: {
+    preCommit: boolean;
+    preReceive: boolean;
+  };
+}
+
+/**
+ * Scanner configuration
+ */
+export interface ScannerConfig {
+  // Root directory to scan
+  rootDirectory: string;
+  
+  // Scanners to run
+  enabledScanners: {
+    dependencies: boolean;
+    extensions: boolean;
+    frameworks: boolean;
+  };
+  
+  // Scanner-specific configurations
+  dependencyScannerConfig?: any;
+  extensionScannerConfig?: any;
+  frameworkScannerConfig?: any;
+  
+  // Whether to use offline mode
+  offlineMode: boolean;
+  
+  // Output directory for reports
+  outputDir: string;
+  
+  // Notification settings
+  notificationSettings?: NotificationSettings;
+  
+  // Version control settings
+  versionControlSettings?: VersionControlSettings;
+  
+  // Include patterns
+  includePatterns?: string[];
+  
+  // Exclude patterns
+  excludePatterns?: string[];
+  
+  // Cache directory
+  cacheDir?: string;
+  
+  // Cache TTL in seconds
+  cacheTTL?: number;
 }
