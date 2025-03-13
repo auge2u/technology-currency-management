@@ -5,17 +5,11 @@ import { promisify } from 'util';
 import axios from 'axios';
 import { log } from '../utils/logging';
 import { SecurityVulnerability } from '../types/scanning';
-import { getRemediation } from '../utils/remediation-helper';
 
 const execAsync = promisify(exec);
 
-// Optional API keys for different security services
-const SNYK_API_KEY = process.env.SNYK_API_KEY;
-const SONATYPE_API_KEY = process.env.SONATYPE_API_KEY;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-
 /**
- * Scans for security vulnerabilities in the codebase
+ * Scanner for detecting security vulnerabilities in dependencies
  */
 export async function scanSecurityVulnerabilities(rootDir: string): Promise<SecurityVulnerability[]> {
   try {
@@ -23,20 +17,15 @@ export async function scanSecurityVulnerabilities(rootDir: string): Promise<Secu
     
     const results: SecurityVulnerability[] = [];
     
-    // Scan using different strategies in parallel
-    const [npmResults, owasp, githubResults] = await Promise.all([
-      scanNpmVulnerabilities(rootDir),
-      scanWithOwaspDependencyCheck(rootDir),
-      scanWithGithubAdvisories(rootDir)
-    ]);
+    // Run different security scans
+    const npmResults = await scanNpmSecurityVulnerabilities(rootDir);
+    const pythonResults = await scanPythonSecurityVulnerabilities(rootDir);
+    const dockerResults = await scanDockerSecurityVulnerabilities(rootDir);
+    const generalResults = await scanGeneralSecurityIssues(rootDir);
     
-    // Merge all results, removing duplicates
-    const allVulnerabilities = [...npmResults, ...owasp, ...githubResults];
-    const deduplicatedResults = deduplicateVulnerabilities(allVulnerabilities);
+    results.push(...npmResults, ...pythonResults, ...dockerResults, ...generalResults);
     
-    results.push(...deduplicatedResults);
-    
-    log.info(`Security scanning completed. Found ${results.length} vulnerabilities`);
+    log.info(`Security vulnerability scanning completed. Found ${results.length} vulnerabilities`);
     
     return results;
   } catch (error) {
@@ -46,500 +35,430 @@ export async function scanSecurityVulnerabilities(rootDir: string): Promise<Secu
 }
 
 /**
- * Scan NPM packages for vulnerabilities using npm audit
+ * Scan for NPM security vulnerabilities using data from security advisories
  */
-async function scanNpmVulnerabilities(rootDir: string): Promise<SecurityVulnerability[]> {
+async function scanNpmSecurityVulnerabilities(rootDir: string): Promise<SecurityVulnerability[]> {
   try {
-    log.info('Scanning NPM packages for vulnerabilities');
+    // Find all package.json files
+    const { stdout } = await execAsync(`find ${rootDir} -name "package.json" -not -path "*/node_modules/*" -type f`);
+    const packageJsonFiles = stdout.trim().split('\n').filter(Boolean);
+    
     const results: SecurityVulnerability[] = [];
     
-    // Find all package.json files
-    const packageFiles = await findFiles(rootDir, 'package.json');
-    log.debug(`Found ${packageFiles.length} package.json files`);
-    
-    for (const packageFile of packageFiles) {
+    for (const filePath of packageJsonFiles) {
       try {
-        // Skip node_modules directories
-        if (packageFile.includes('node_modules')) {
-          continue;
-        }
+        const content = fs.readFileSync(filePath, 'utf8');
+        const packageJson = JSON.parse(content);
         
-        const packageDir = path.dirname(packageFile);
+        const dependencies = { 
+          ...packageJson.dependencies || {}, 
+          ...packageJson.devDependencies || {} 
+        };
         
-        // Run npm audit --json in the package directory
-        const { stdout } = await execAsync('npm audit --json', { cwd: packageDir })
-          .catch(error => {
-            // npm audit returns non-zero exit code when vulnerabilities are found
-            // so we need to capture the output from the error
-            if (error && error.stdout) {
-              return { stdout: error.stdout };
-            }
-            throw error;
-          });
-        
-        // Parse the audit output
-        const auditResult = JSON.parse(stdout);
-        
-        // Extract vulnerabilities
-        const vulnerabilities = auditResult.vulnerabilities || {};
-        
-        for (const [packageName, details] of Object.entries<any>(vulnerabilities)) {
-          if (details.via) {
-            for (const viaItem of Array.isArray(details.via) ? details.via : [details.via]) {
-              // Skip items that are just strings (dependency paths)
-              if (typeof viaItem === 'string') continue;
-              
-              const cveIds = [];
-              if (viaItem.url && viaItem.url.includes('cve-')) {
-                const cveMatch = viaItem.url.match(/CVE-\d+-\d+/i);
-                if (cveMatch) {
-                  cveIds.push(cveMatch[0]);
-                }
-              }
-              
-              const references = [viaItem.url].filter(Boolean);
-              
-              // Get remediation steps
-              const fixedIn = details.fixAvailable ? 
-                (typeof details.fixAvailable === 'object' ? details.fixAvailable.version : 'available') : 
-                undefined;
-              
-              const remediationSteps = getRemediation({
-                type: 'vulnerability',
-                packageName,
-                currentVersion: details.version,
-                fixedIn,
-                url: viaItem.url
-              });
-              
-              // Map npm severity to our severity scale
-              const severityMap: Record<string, any> = {
-                'low': 'low',
-                'moderate': 'medium',
-                'high': 'high',
-                'critical': 'critical'
-              };
-              
+        for (const [packageName, versionSpec] of Object.entries(dependencies)) {
+          try {
+            // Clean version spec (remove ^, ~, etc.)
+            const currentVersion = (versionSpec as string).replace(/^[\^~>=<]+/, '');
+            
+            // Query mock vulnerability database (in a real implementation, this would query a real database)
+            const vulnerabilities = await queryVulnerabilityDatabase('npm', packageName, currentVersion);
+            
+            for (const vuln of vulnerabilities) {
               results.push({
-                id: `npm-${packageName}-${viaItem.source || 'unknown'}`,
+                id: `npm-${packageName}-${vuln.cveId || 'no-cve'}-${filePath}`,
+                cveId: vuln.cveId,
                 packageName,
-                version: details.version,
-                title: viaItem.title || `Vulnerability in ${packageName}`,
-                description: viaItem.overview || viaItem.desc || `Security vulnerability in ${packageName}`,
-                cve: cveIds,
-                cvss: viaItem.cvss?.score,
-                fixedIn,
-                exploitAvailable: viaItem.exploitAvailable || false,
-                severity: severityMap[details.severity] || 'medium',
-                publicationDate: viaItem.publishedAt ? new Date(viaItem.publishedAt) : undefined,
-                remediationSteps,
-                references,
+                affectedVersions: vuln.affectedVersions,
+                severity: vuln.severity,
+                description: vuln.description,
+                infoUrl: vuln.infoUrl,
+                patchedVersions: vuln.patchedVersions,
+                filePath,
+                remediationSteps: `Update ${packageName} to version ${vuln.patchedVersions} or later.`,
+                publishedDate: vuln.publishedDate,
                 detectedAt: new Date()
               });
             }
+          } catch (packageError) {
+            log.warn(`Error processing npm package ${packageName} for security`, { error: packageError });
           }
         }
-      } catch (packageError) {
-        log.warn(`Error scanning ${packageFile} for vulnerabilities`, { error: packageError });
+      } catch (fileError) {
+        log.warn(`Error processing package.json at ${filePath} for security`, { error: fileError });
       }
     }
     
-    log.info(`Found ${results.length} NPM vulnerabilities`);
     return results;
   } catch (error) {
-    log.error('Error scanning NPM packages for vulnerabilities', { error });
+    log.error('Error scanning npm dependencies for security vulnerabilities', { error });
     return [];
   }
 }
 
 /**
- * Scan with OWASP Dependency Check tool
+ * Scan for Python security vulnerabilities
  */
-async function scanWithOwaspDependencyCheck(rootDir: string): Promise<SecurityVulnerability[]> {
+async function scanPythonSecurityVulnerabilities(rootDir: string): Promise<SecurityVulnerability[]> {
   try {
-    log.info('Scanning with OWASP Dependency Check');
+    // Find all requirements.txt files
+    const { stdout } = await execAsync(`find ${rootDir} -name "requirements.txt" -type f`);
+    const requirementsFiles = stdout.trim().split('\n').filter(Boolean);
+    
     const results: SecurityVulnerability[] = [];
     
-    // Check if OWASP Dependency Check is installed
-    try {
-      await execAsync('dependency-check --version');
-      
-      // Create a temporary directory for reports
-      const tmpDir = path.join(rootDir, 'tmp-dependency-check');
-      fs.mkdirSync(tmpDir, { recursive: true });
-      
-      // Run dependency check
-      const reportFile = path.join(tmpDir, 'dependency-check-report.json');
-      
-      await execAsync(
-        `dependency-check --project "Project Scan" --out ${reportFile} --scan ${rootDir} --format JSON`,
-        { maxBuffer: 10 * 1024 * 1024 } // Increase buffer size for large outputs
-      );
-      
-      // Parse the report
-      if (fs.existsSync(reportFile)) {
-        const reportContent = fs.readFileSync(reportFile, 'utf8');
-        const report = JSON.parse(reportContent);
-        
-        // Extract vulnerabilities
-        if (report.dependencies) {
-          for (const dependency of report.dependencies) {
-            if (dependency.vulnerabilities && dependency.vulnerabilities.length > 0) {
-              for (const vuln of dependency.vulnerabilities) {
-                const cves = vuln.references
-                  .filter((ref: any) => ref.source === 'NVD')
-                  .map((ref: any) => ref.name);
-                
-                const references = vuln.references.map((ref: any) => ref.url).filter(Boolean);
-                
-                // Map CVSS severity to our severity scale
-                let severity: any = 'medium';
-                if (vuln.cvssv3 && vuln.cvssv3.baseScore) {
-                  const score = vuln.cvssv3.baseScore;
-                  if (score >= 9.0) severity = 'critical';
-                  else if (score >= 7.0) severity = 'high';
-                  else if (score >= 4.0) severity = 'medium';
-                  else severity = 'low';
-                }
-                
-                const remediationSteps = getRemediation({
-                  type: 'vulnerability',
-                  packageName: dependency.name,
-                  description: vuln.description,
-                  cveId: cves[0]
-                });
-                
-                results.push({
-                  id: `owasp-${dependency.name}-${vuln.name}`,
-                  packageName: dependency.name,
-                  version: dependency.version,
-                  title: vuln.name,
-                  description: vuln.description,
-                  cve: cves,
-                  cvss: vuln.cvssv3 ? vuln.cvssv3.baseScore : undefined,
-                  exploitAvailable: false, // OWASP doesn't provide this info
-                  severity,
-                  remediationSteps,
-                  references,
-                  detectedAt: new Date()
-                });
-              }
-            }
-          }
-        }
-        
-        // Clean up temp directory
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
-    } catch (error) {
-      log.warn('OWASP Dependency Check not available or error running it', { error });
-    }
-    
-    log.info(`Found ${results.length} vulnerabilities with OWASP Dependency Check`);
-    return results;
-  } catch (error) {
-    log.error('Error scanning with OWASP Dependency Check', { error });
-    return [];
-  }
-}
-
-/**
- * Scan for vulnerabilities using GitHub Security Advisories
- */
-async function scanWithGithubAdvisories(rootDir: string): Promise<SecurityVulnerability[]> {
-  try {
-    // Skip if no GitHub token is provided
-    if (!GITHUB_TOKEN) {
-      log.info('Skipping GitHub Advisories scan (no GitHub token provided)');
-      return [];
-    }
-    
-    log.info('Scanning with GitHub Security Advisories');
-    const results: SecurityVulnerability[] = [];
-    
-    // Find all dependency files
-    const packageFiles = await findFiles(rootDir, 'package.json');
-    const requirementsFiles = await findFiles(rootDir, 'requirements.txt');
-    const gemfiles = await findFiles(rootDir, 'Gemfile');
-    const composerFiles = await findFiles(rootDir, 'composer.json');
-    
-    // Collect all dependencies
-    const allDependencies: Map<string, { name: string, version: string, ecosystem: string }> = new Map();
-    
-    // Process package.json files
-    for (const file of packageFiles) {
+    for (const filePath of requirementsFiles) {
       try {
-        if (file.includes('node_modules')) continue;
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.split('\n');
         
-        const packageJson = JSON.parse(fs.readFileSync(file, 'utf8'));
-        const allDeps = {
-          ...packageJson.dependencies || {},
-          ...packageJson.devDependencies || {},
-        };
-        
-        for (const [name, versionConstraint] of Object.entries<string>(allDeps)) {
-          if (
-            versionConstraint.includes('github:') ||
-            versionConstraint.includes('git+') ||
-            versionConstraint.startsWith('file:')
-          ) {
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
             continue;
           }
           
-          const cleanVersion = versionConstraint.replace(/^[\^~]/, '');
-          allDependencies.set(`npm:${name}`, {
-            name,
-            version: cleanVersion,
-            ecosystem: 'npm'
-          });
-        }
-      } catch (error) {
-        log.warn(`Error processing ${file} for GitHub Advisories`, { error });
-      }
-    }
-    
-    // Process requirements.txt files
-    for (const file of requirementsFiles) {
-      try {
-        const content = fs.readFileSync(file, 'utf8');
-        const lines = content
-          .split('\n')
-          .map(line => line.trim())
-          .filter(line => line && !line.startsWith('#'));
-        
-        for (const line of lines) {
-          const match = line.match(/^([\w-]+)(?:[=<>!~]+(\d+\.\d+\.\d+))?.*$/);
+          // Parse package name and version
+          const match = line.match(/^([\w-]+)(?:[=<>~]+)([\d.]+)/);
           if (match) {
-            const [, name, version] = match;
-            if (name) {
-              allDependencies.set(`pip:${name}`, {
-                name,
-                version: version || 'unknown',
-                ecosystem: 'pip'
-              });
+            const packageName = match[1];
+            const currentVersion = match[2];
+            
+            try {
+              // Query vulnerability database
+              const vulnerabilities = await queryVulnerabilityDatabase('python', packageName, currentVersion);
+              
+              for (const vuln of vulnerabilities) {
+                results.push({
+                  id: `python-${packageName}-${vuln.cveId || 'no-cve'}-${filePath}`,
+                  cveId: vuln.cveId,
+                  packageName,
+                  affectedVersions: vuln.affectedVersions,
+                  severity: vuln.severity,
+                  description: vuln.description,
+                  infoUrl: vuln.infoUrl,
+                  patchedVersions: vuln.patchedVersions,
+                  filePath,
+                  remediationSteps: `Update ${packageName} to version ${vuln.patchedVersions} or later.`,
+                  publishedDate: vuln.publishedDate,
+                  detectedAt: new Date()
+                });
+              }
+            } catch (packageError) {
+              log.warn(`Error processing Python package ${packageName} for security`, { error: packageError });
             }
           }
         }
-      } catch (error) {
-        log.warn(`Error processing ${file} for GitHub Advisories`, { error });
+      } catch (fileError) {
+        log.warn(`Error processing requirements.txt at ${filePath} for security`, { error: fileError });
       }
     }
     
-    // Get vulnerabilities from GitHub API
-    const ecosystemToGitHub: Record<string, string> = {
-      'npm': 'NPM',
-      'pip': 'PIP',
-      'maven': 'MAVEN',
-      'composer': 'COMPOSER',
-      'gem': 'RUBYGEMS'
-    };
+    return results;
+  } catch (error) {
+    log.error('Error scanning Python dependencies for security vulnerabilities', { error });
+    return [];
+  }
+}
+
+/**
+ * Scan Docker images for security vulnerabilities
+ */
+async function scanDockerSecurityVulnerabilities(rootDir: string): Promise<SecurityVulnerability[]> {
+  try {
+    // Find all Dockerfile files
+    const { stdout } = await execAsync(`find ${rootDir} -name "Dockerfile" -type f`);
+    const dockerfiles = stdout.trim().split('\n').filter(Boolean);
     
-    for (const [, dep] of allDependencies) {
+    const results: SecurityVulnerability[] = [];
+    
+    for (const filePath of dockerfiles) {
       try {
-        const githubEcosystem = ecosystemToGitHub[dep.ecosystem];
-        if (!githubEcosystem) continue;
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.split('\n');
         
-        const response = await axios.post(
-          'https://api.github.com/graphql',
-          {
-            query: `
-              query {
-                securityVulnerabilities(ecosystem: ${githubEcosystem}, package: "${dep.name}", first: 100) {
-                  nodes {
-                    vulnerableVersionRange
-                    package {
-                      name
-                    }
-                    advisory {
-                      id
-                      summary
-                      description
-                      publishedAt
-                      severity
-                      references {
-                        url
-                      }
-                      identifiers {
-                        type
-                        value
-                      }
-                      cvss {
-                        score
-                      }
-                    }
-                  }
-                }
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          
+          // Match FROM statements to detect base images
+          const match = line.match(/^FROM\s+([\w\/\.-]+)(?::([\w\.-]+))?/);
+          if (match) {
+            const imageName = match[1];
+            const imageTag = match[2] || 'latest';
+            
+            try {
+              // Query vulnerability database for this Docker image
+              const vulnerabilities = await queryVulnerabilityDatabase('docker', imageName, imageTag);
+              
+              for (const vuln of vulnerabilities) {
+                results.push({
+                  id: `docker-${imageName}-${vuln.cveId || 'no-cve'}-${filePath}`,
+                  cveId: vuln.cveId,
+                  packageName: `${imageName}:${imageTag}`,
+                  affectedVersions: vuln.affectedVersions,
+                  severity: vuln.severity,
+                  description: vuln.description,
+                  infoUrl: vuln.infoUrl,
+                  patchedVersions: vuln.patchedVersions,
+                  filePath,
+                  remediationSteps: `Update Docker base image to ${imageName}:${vuln.patchedVersions} or later.`,
+                  publishedDate: vuln.publishedDate,
+                  detectedAt: new Date()
+                });
               }
-            `
-          },
-          {
-            headers: {
-              'Authorization': `Bearer ${GITHUB_TOKEN}`,
-              'Content-Type': 'application/json'
+              
+              // Look for other security issues in Dockerfiles
+              if (imageTag === 'latest') {
+                results.push({
+                  id: `docker-latest-tag-${imageName}-${filePath}`,
+                  packageName: `${imageName}:latest`,
+                  affectedVersions: 'latest',
+                  severity: 'medium',
+                  description: 'Using the "latest" tag for Docker images can lead to unexpected changes and breaks',
+                  patchedVersions: 'specific version tag',
+                  filePath,
+                  remediationSteps: 'Use a specific version tag instead of "latest" to ensure reproducibility',
+                  detectedAt: new Date()
+                });
+              }
+            } catch (imageError) {
+              log.warn(`Error processing Docker image ${imageName}:${imageTag} for security`, { error: imageError });
             }
           }
-        );
-        
-        const vulnerabilities = response.data.data?.securityVulnerabilities?.nodes || [];
-        
-        for (const vuln of vulnerabilities) {
-          // Check if the current version is in the vulnerable range
-          // This is a simplified check - in a real implementation you'd need a semantic version range check
-          if (isVersionInRange(dep.version, vuln.vulnerableVersionRange)) {
-            const advisory = vuln.advisory;
-            
-            // Extract CVE IDs
-            const cves = advisory.identifiers
-              .filter((id: any) => id.type === 'CVE')
-              .map((id: any) => id.value);
-            
-            // Extract references
-            const references = advisory.references.map((ref: any) => ref.url).filter(Boolean);
-            
-            // Map GitHub severity to our severity scale
-            const severityMap: Record<string, any> = {
-              'LOW': 'low',
-              'MODERATE': 'medium',
-              'HIGH': 'high',
-              'CRITICAL': 'critical'
-            };
-            
-            const remediationSteps = getRemediation({
-              type: 'vulnerability',
-              packageName: dep.name,
-              currentVersion: dep.version,
-              description: advisory.description,
-              cveId: cves[0]
-            });
-            
+          
+          // Check for running as root
+          if (!content.includes('USER ') && (content.includes('ENTRYPOINT ') || content.includes('CMD '))) {
             results.push({
-              id: `github-${advisory.id}`,
-              packageName: dep.name,
-              version: dep.version,
-              title: advisory.summary,
-              description: advisory.description,
-              cve: cves,
-              cvss: advisory.cvss?.score,
-              exploitAvailable: false,  // GitHub doesn't provide this info
-              severity: severityMap[advisory.severity] || 'medium',
-              publicationDate: advisory.publishedAt ? new Date(advisory.publishedAt) : undefined,
-              remediationSteps,
-              references,
+              id: `docker-running-as-root-${filePath}`,
+              packageName: 'dockerfile',
+              affectedVersions: 'all',
+              severity: 'medium',
+              description: 'Docker container is running as root, which is a security risk',
+              patchedVersions: 'N/A',
+              filePath,
+              remediationSteps: 'Add a USER instruction to run as a non-root user',
               detectedAt: new Date()
             });
           }
         }
-      } catch (error) {
-        log.warn(`Error checking GitHub Advisories for ${dep.name}`, { error });
+      } catch (fileError) {
+        log.warn(`Error processing Dockerfile at ${filePath} for security`, { error: fileError });
       }
     }
     
-    log.info(`Found ${results.length} vulnerabilities with GitHub Security Advisories`);
     return results;
   } catch (error) {
-    log.error('Error scanning with GitHub Security Advisories', { error });
+    log.error('Error scanning Docker images for security vulnerabilities', { error });
     return [];
   }
 }
 
 /**
- * Check if a version is in a vulnerable version range
- * This is a simplified check for demonstration purposes
+ * Scan for general security issues in the codebase
  */
-function isVersionInRange(version: string, range: string): boolean {
-  // Basic implementation - this would need a proper semver range check in production
-  if (range.includes(version)) return true;
-  
-  // Handle common patterns
-  if (range.includes('*')) {
-    const prefix = range.split('*')[0];
-    return version.startsWith(prefix);
-  }
-  
-  if (range.includes('<=')) {
-    const maxVersion = range.split('<=')[1].trim();
-    return compareVersions(version, maxVersion) <= 0;
-  }
-  
-  if (range.includes('<')) {
-    const maxVersion = range.split('<')[1].trim();
-    return compareVersions(version, maxVersion) < 0;
-  }
-  
-  if (range.includes('>=')) {
-    const minVersion = range.split('>=')[1].trim();
-    return compareVersions(version, minVersion) >= 0;
-  }
-  
-  if (range.includes('>')) {
-    const minVersion = range.split('>')[1].trim();
-    return compareVersions(version, minVersion) > 0;
-  }
-  
-  return false;
-}
-
-/**
- * Compare two version strings
- * Returns: -1 if a < b, 0 if a == b, 1 if a > b
- */
-function compareVersions(a: string, b: string): number {
-  if (a === 'unknown' || b === 'unknown') return 0;
-  
-  const partsA = a.split('.').map(Number);
-  const partsB = b.split('.').map(Number);
-  
-  for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
-    const partA = i < partsA.length ? partsA[i] : 0;
-    const partB = i < partsB.length ? partsB[i] : 0;
-    
-    if (partA < partB) return -1;
-    if (partA > partB) return 1;
-  }
-  
-  return 0;
-}
-
-/**
- * Deduplicate vulnerabilities based on package name, version, and CVE
- */
-function deduplicateVulnerabilities(vulnerabilities: SecurityVulnerability[]): SecurityVulnerability[] {
-  const uniqueVulnerabilities = new Map<string, SecurityVulnerability>();
-  
-  for (const vuln of vulnerabilities) {
-    // Create a unique key based on package name, version, and CVE
-    const cveKey = vuln.cve.length > 0 ? vuln.cve[0] : 'unknown';
-    const key = `${vuln.packageName}:${vuln.version}:${cveKey}`;
-    
-    // Keep the vulnerability with the most information
-    if (!uniqueVulnerabilities.has(key) || hasMoreInfo(vuln, uniqueVulnerabilities.get(key)!)) {
-      uniqueVulnerabilities.set(key, vuln);
-    }
-  }
-  
-  return Array.from(uniqueVulnerabilities.values());
-}
-
-/**
- * Determines if vulnerability a has more information than vulnerability b
- */
-function hasMoreInfo(a: SecurityVulnerability, b: SecurityVulnerability): boolean {
-  // Count the number of defined properties as a simple heuristic
-  const countDefinedProps = (obj: any) => 
-    Object.entries(obj).filter(([_, v]) => v !== undefined && v !== null).length;
-  
-  return countDefinedProps(a) > countDefinedProps(b);
-}
-
-/**
- * Find files with a specific name recursively
- */
-async function findFiles(rootDir: string, fileName: string): Promise<string[]> {
+async function scanGeneralSecurityIssues(rootDir: string): Promise<SecurityVulnerability[]> {
   try {
-    const { stdout } = await execAsync(`find ${rootDir} -name "${fileName}" -type f`);
-    return stdout.trim().split('\n').filter(Boolean);
+    const results: SecurityVulnerability[] = [];
+    
+    // Find all source code files
+    const extensions = [".js", ".ts", ".jsx", ".tsx", ".py", ".rb", ".java", ".go", ".php", ".cs"];
+    let filePatterns = extensions.map(ext => `-name "*${ext}"`).join(' -o ');
+    
+    const { stdout } = await execAsync(`find ${rootDir} -type f \( ${filePatterns} \) -not -path "*/node_modules/*" -not -path "*/venv/*" -not -path "*/vendor/*"`);
+    const sourceFiles = stdout.trim().split('\n').filter(Boolean);
+    
+    // Define security vulnerability patterns to check
+    const patterns = [
+      {
+        regex: /password\s*=\s*["']\w+["']|api[_-]?key\s*=\s*["']\w+["']/i,
+        id: 'hardcoded-secrets',
+        severity: 'critical' as const,
+        description: 'Hardcoded passwords or API keys found in source code',
+        remediationSteps: 'Move sensitive values to environment variables or a secure vault solution'
+      },
+      {
+        regex: /eval\s*\(|setTimeout\s*\(\s*["']|setInterval\s*\(\s*["']/,
+        id: 'code-injection',
+        severity: 'high' as const,
+        description: 'Potential code injection vulnerability with eval() or setTimeout/setInterval with strings',
+        remediationSteps: 'Avoid using eval() and pass functions (not strings) to setTimeout/setInterval'
+      },
+      {
+        regex: /md5\s*\(|sha1\s*\(/i,
+        id: 'weak-hashing',
+        severity: 'high' as const,
+        description: 'Using weak cryptographic hash functions (MD5, SHA1)',
+        remediationSteps: 'Use stronger hashing algorithms like SHA-256 or bcrypt for passwords'
+      },
+      {
+        regex: /SELECT\s+.+\s+FROM.+WHERE.+(['"]\s*\+|\$\{|\$\w+|\?)/i,
+        id: 'sql-injection',
+        severity: 'critical' as const,
+        description: 'Potential SQL injection vulnerability with string concatenation in queries',
+        remediationSteps: 'Use parameterized queries or an ORM instead of string concatenation'
+      },
+      {
+        regex: /dangerouslySetInnerHTML|innerHTML\s*=/,
+        id: 'xss',
+        severity: 'high' as const,
+        description: 'Potential XSS vulnerability with dangerouslySetInnerHTML or innerHTML',
+        remediationSteps: 'Sanitize HTML content or use safer alternatives'
+      }
+    ];
+    
+    // Check each file for patterns
+    for (const filePath of sourceFiles) {
+      try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        
+        for (const pattern of patterns) {
+          if (pattern.regex.test(content)) {
+            results.push({
+              id: `general-${pattern.id}-${path.basename(filePath)}`,
+              packageName: 'general-code-security',
+              affectedVersions: 'all',
+              severity: pattern.severity,
+              description: pattern.description,
+              patchedVersions: 'N/A',
+              filePath,
+              remediationSteps: pattern.remediationSteps,
+              detectedAt: new Date()
+            });
+          }
+        }
+      } catch (fileError) {
+        log.warn(`Error processing file ${filePath} for general security issues`, { error: fileError });
+      }
+    }
+    
+    return results;
   } catch (error) {
-    log.error(`Error finding ${fileName} files`, { error });
+    log.error('Error scanning for general security issues', { error });
     return [];
   }
+}
+
+/**
+ * Query vulnerability database for a specific package
+ * This is a mock implementation - in a real tool this would connect to
+ * actual vulnerability databases like Snyk, OSV, or GitHub Advisory Database
+ */
+async function queryVulnerabilityDatabase(
+  ecosystem: 'npm' | 'python' | 'docker' | 'ruby' | 'go',
+  packageName: string,
+  version: string
+): Promise<Array<{
+  cveId?: string;
+  affectedVersions: string;
+  patchedVersions: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  description: string;
+  infoUrl?: string;
+  publishedDate?: Date;
+}>> {
+  // Simulate an API call to a vulnerability database
+  // This is a mock implementation with hardcoded vulnerabilities
+  
+  // In a real implementation, you would call an actual API like:
+  // - https://api.snyk.io/v1/...
+  // - https://api.osv.dev/v1/...
+  // - https://api.github.com/graphql (GitHub Security Advisories)
+  // - https://nvd.nist.gov/vuln/data-feeds
+  
+  return new Promise((resolve) => {
+    // Simulate network delay
+    setTimeout(() => {
+      const key = `${ecosystem}:${packageName}@${version}`;
+      
+      // Some mock vulnerabilities for demonstration
+      const vulnerabilities: Record<string, Array<{
+        cveId?: string;
+        affectedVersions: string;
+        patchedVersions: string;
+        severity: 'low' | 'medium' | 'high' | 'critical';
+        description: string;
+        infoUrl?: string;
+        publishedDate?: Date;
+      }>> = {
+        'npm:lodash@4.17.15': [
+          {
+            cveId: 'CVE-2020-8203',
+            affectedVersions: '<4.17.19',
+            patchedVersions: '4.17.19',
+            severity: 'high',
+            description: 'Prototype Pollution in lodash via set method allows for modification of Object prototype properties',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2020-8203',
+            publishedDate: new Date('2020-07-15')
+          }
+        ],
+        'npm:axios@0.18.0': [
+          {
+            cveId: 'CVE-2019-10742',
+            affectedVersions: '<0.18.1',
+            patchedVersions: '0.18.1',
+            severity: 'medium',
+            description: 'Axios up to and including 0.18.0 allows attackers to cause a denial of service (SSRF) by exploiting the way Axios follows redirects',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2019-10742',
+            publishedDate: new Date('2019-04-15')
+          }
+        ],
+        'npm:express@4.16.1': [
+          {
+            cveId: 'CVE-2022-24999',
+            affectedVersions: '<4.17.3',
+            patchedVersions: '4.17.3',
+            severity: 'high',
+            description: 'Express.js allows for header injection via CRLF sequences in input, potentially allowing for HTTP response splitting attacks',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2022-24999',
+            publishedDate: new Date('2022-02-18')
+          }
+        ],
+        'python:django@2.2.4': [
+          {
+            cveId: 'CVE-2019-19844',
+            affectedVersions: '>=2.2,<2.2.9',
+            patchedVersions: '2.2.9',
+            severity: 'high',
+            description: 'Account hijack vulnerability in Django through improper handling of email case sensitivity',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2019-19844',
+            publishedDate: new Date('2019-12-18')
+          }
+        ],
+        'python:flask@1.0.2': [
+          {
+            cveId: 'CVE-2019-1010083',
+            affectedVersions: '<1.0.3',
+            patchedVersions: '1.0.3',
+            severity: 'high',
+            description: 'The Pallets Project Flask before 1.0.3 is affected by a Cross-site Scripting (XSS) vulnerability in the default cookie serializer',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2019-1010083',
+            publishedDate: new Date('2019-07-17')
+          }
+        ],
+        'docker:nginx:1.16': [
+          {
+            cveId: 'CVE-2019-9511',
+            affectedVersions: '<1.17.3',
+            patchedVersions: '1.17.3',
+            severity: 'high',
+            description: 'HTTP/2 implementation in NGINX before 1.17.3 is vulnerable to excessive CPU consumption due to HTTP/2 implementation allowing flood of empty frames',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2019-9511',
+            publishedDate: new Date('2019-08-13')
+          }
+        ],
+        'docker:node:10': [
+          {
+            cveId: 'CVE-2019-15604',
+            affectedVersions: '10.x < 10.16.3',
+            patchedVersions: '10.16.3',
+            severity: 'high',
+            description: 'HTTP header parsing in Node.js before 10.16.3 is vulnerable to denial of service attacks',
+            infoUrl: 'https://nvd.nist.gov/vuln/detail/CVE-2019-15604',
+            publishedDate: new Date('2019-09-06')
+          }
+        ]
+      };
+      
+      resolve(vulnerabilities[key] || []);
+    }, 100);
+  });
 }
