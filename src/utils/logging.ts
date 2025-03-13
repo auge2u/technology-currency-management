@@ -1,234 +1,210 @@
 /**
- * Logging utilities for technology currency management
+ * Logging utility for technology currency management
  */
 
-// Log levels
+// Different log levels
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-// Log entry with metadata
+// Log entry structure
 interface LogEntry {
-  timestamp: Date;
+  timestamp: string;
   level: LogLevel;
   message: string;
-  context?: any;
-  component?: string;
+  context?: Record<string, any>;
 }
 
-// Logger configuration
-interface LoggerConfig {
-  minLevel: LogLevel;
-  enableConsole: boolean;
-  enableFile: boolean;
-  filePath?: string;
-  enableMetrics: boolean;
-  metricsSink?: (metrics: any) => void;
-}
-
-// Default configuration
-const defaultConfig: LoggerConfig = {
-  minLevel: 'info',
-  enableConsole: true,
-  enableFile: false,
-  enableMetrics: false,
-};
-
-// Current configuration
-let currentConfig: LoggerConfig = { ...defaultConfig };
-
-// In-memory log buffer for last N entries
-const logBuffer: LogEntry[] = [];
-const LOG_BUFFER_SIZE = 1000;
-
-/**
- * Convert log level to numeric value for comparison
- */
-function levelToNumber(level: LogLevel): number {
-  switch (level) {
-    case 'debug': return 0;
-    case 'info': return 1;
-    case 'warn': return 2;
-    case 'error': return 3;
-    default: return 1;
-  }
+// Logger interface
+interface Logger {
+  debug(message: string, context?: Record<string, any>): void;
+  info(message: string, context?: Record<string, any>): void;
+  warn(message: string, context?: Record<string, any>): void;
+  error(message: string, context?: Record<string, any>): void;
+  setLevel(level: LogLevel): void;
+  getEntries(): LogEntry[];
 }
 
 /**
- * Format a log entry as a string
+ * Logger implementation for technology currency management
  */
-function formatLogEntry(entry: LogEntry): string {
-  const timestamp = entry.timestamp.toISOString();
-  const level = entry.level.toUpperCase().padEnd(5);
-  const component = entry.component ? `[${entry.component}] ` : '';
-  let message = `${timestamp} ${level} ${component}${entry.message}`;
-  
-  // Add context if available
-  if (entry.context) {
-    try {
-      // For errors, extract the message
-      if (entry.context.error instanceof Error) {
-        message += ` - ${entry.context.error.message}`;
-        if (entry.context.error.stack) {
-          message += `\n${entry.context.error.stack}`;
-        }
-      } else {
-        // For other context, stringify
-        const contextStr = JSON.stringify(entry.context);
-        if (contextStr !== '{}') {
-          message += ` - ${contextStr}`;
-        }
-      }
-    } catch (e) {
-      message += ` - [Context serialization failed]`;
-    }
-  }
-  
-  return message;
-}
-
-/**
- * Write a log entry
- */
-function writeLog(entry: LogEntry): void {
-  // Check minimum log level
-  if (levelToNumber(entry.level) < levelToNumber(currentConfig.minLevel)) {
-    return;
-  }
-  
-  // Format the entry
-  const formattedEntry = formatLogEntry(entry);
-  
-  // Console output
-  if (currentConfig.enableConsole) {
-    switch (entry.level) {
-      case 'debug':
-        console.debug(formattedEntry);
-        break;
-      case 'info':
-        console.info(formattedEntry);
-        break;
-      case 'warn':
-        console.warn(formattedEntry);
-        break;
-      case 'error':
-        console.error(formattedEntry);
-        break;
-    }
-  }
-  
-  // File output (would be implemented with fs.appendFile in a real implementation)
-  if (currentConfig.enableFile && currentConfig.filePath) {
-    // In a real implementation:
-    // fs.appendFile(currentConfig.filePath, formattedEntry + '\n', (err) => {
-    //   if (err) console.error(`Failed to write to log file: ${err.message}`);
-    // });
-  }
-  
-  // Metrics output
-  if (currentConfig.enableMetrics && currentConfig.metricsSink) {
-    const metricData = {
-      timestamp: entry.timestamp,
-      level: entry.level,
-      component: entry.component || 'unknown'
-    };
-    currentConfig.metricsSink(metricData);
-  }
-  
-  // Add to in-memory buffer
-  logBuffer.push(entry);
-  if (logBuffer.length > LOG_BUFFER_SIZE) {
-    logBuffer.shift();
-  }
-}
-
-/**
- * Create a log entry
- */
-function createLogEntry(
-  level: LogLevel,
-  message: string,
-  context?: any,
-  component?: string
-): LogEntry {
-  return {
-    timestamp: new Date(),
-    level,
-    message,
-    context,
-    component
-  };
-}
-
-/**
- * Configure the logger
- */
-export function configureLogger(config: Partial<LoggerConfig>): void {
-  currentConfig = { ...currentConfig, ...config };
-}
-
-/**
- * Get recent log entries
- */
-export function getRecentLogs(
-  count: number = 100,
-  level?: LogLevel
-): LogEntry[] {
-  let logs = [...logBuffer];
-  
-  // Filter by level if specified
-  if (level) {
-    const minLevelValue = levelToNumber(level);
-    logs = logs.filter(entry => levelToNumber(entry.level) >= minLevelValue);
-  }
-  
-  // Return the most recent entries
-  return logs.slice(-count);
-}
-
-/**
- * Clear the log buffer
- */
-export function clearLogBuffer(): void {
-  logBuffer.length = 0;
-}
-
-/**
- * The logger object with methods for each log level
- */
-export const log = {
-  debug: (message: string, context?: any, component?: string) => {
-    writeLog(createLogEntry('debug', message, context, component));
-  },
-  
-  info: (message: string, context?: any, component?: string) => {
-    writeLog(createLogEntry('info', message, context, component));
-  },
-  
-  warn: (message: string, context?: any, component?: string) => {
-    writeLog(createLogEntry('warn', message, context, component));
-  },
-  
-  error: (message: string, context?: any, component?: string) => {
-    writeLog(createLogEntry('error', message, context, component));
-  },
+class TechCurrencyLogger implements Logger {
+  private level: LogLevel = 'info';
+  private entries: LogEntry[] = [];
+  private maxEntries: number = 1000;
+  private outputToConsole: boolean = true;
   
   /**
-   * Log with component context
+   * Create a new logger instance
+   * @param options Logger configuration options
    */
-  withComponent: (component: string) => ({
-    debug: (message: string, context?: any) => {
-      writeLog(createLogEntry('debug', message, context, component));
-    },
-    
-    info: (message: string, context?: any) => {
-      writeLog(createLogEntry('info', message, context, component));
-    },
-    
-    warn: (message: string, context?: any) => {
-      writeLog(createLogEntry('warn', message, context, component));
-    },
-    
-    error: (message: string, context?: any) => {
-      writeLog(createLogEntry('error', message, context, component));
+  constructor(options?: {
+    level?: LogLevel;
+    maxEntries?: number;
+    outputToConsole?: boolean;
+  }) {
+    if (options) {
+      if (options.level) {
+        this.level = options.level;
+      }
+      if (options.maxEntries !== undefined) {
+        this.maxEntries = options.maxEntries;
+      }
+      if (options.outputToConsole !== undefined) {
+        this.outputToConsole = options.outputToConsole;
+      }
     }
-  })
-};
+  }
+  
+  /**
+   * Log a debug message
+   * @param message Message to log
+   * @param context Additional context data
+   */
+  debug(message: string, context?: Record<string, any>): void {
+    this.log('debug', message, context);
+  }
+  
+  /**
+   * Log an info message
+   * @param message Message to log
+   * @param context Additional context data
+   */
+  info(message: string, context?: Record<string, any>): void {
+    this.log('info', message, context);
+  }
+  
+  /**
+   * Log a warning message
+   * @param message Message to log
+   * @param context Additional context data
+   */
+  warn(message: string, context?: Record<string, any>): void {
+    this.log('warn', message, context);
+  }
+  
+  /**
+   * Log an error message
+   * @param message Message to log
+   * @param context Additional context data
+   */
+  error(message: string, context?: Record<string, any>): void {
+    this.log('error', message, context);
+  }
+  
+  /**
+   * Set the minimum log level
+   * @param level Minimum log level
+   */
+  setLevel(level: LogLevel): void {
+    this.level = level;
+  }
+  
+  /**
+   * Get all log entries
+   * @returns Array of log entries
+   */
+  getEntries(): LogEntry[] {
+    return this.entries;
+  }
+  
+  /**
+   * Get entries filtered by level
+   * @param level Log level to filter by
+   * @returns Filtered log entries
+   */
+  getEntriesByLevel(level: LogLevel): LogEntry[] {
+    return this.entries.filter(entry => entry.level === level);
+  }
+  
+  /**
+   * Clear all log entries
+   */
+  clear(): void {
+    this.entries = [];
+  }
+  
+  /**
+   * Export logs to JSON
+   * @returns JSON string of log entries
+   */
+  exportToJson(): string {
+    return JSON.stringify(this.entries, null, 2);
+  }
+  
+  /**
+   * Base log method used by all level-specific methods
+   * @param level Log level
+   * @param message Message to log
+   * @param context Additional context data
+   */
+  private log(level: LogLevel, message: string, context?: Record<string, any>): void {
+    // Check if this level should be logged based on minimum level
+    if (!this.shouldLog(level)) {
+      return;
+    }
+    
+    const timestamp = new Date().toISOString();
+    const entry: LogEntry = {
+      timestamp,
+      level,
+      message,
+      context
+    };
+    
+    // Add to log entries, maintaining max size
+    this.entries.push(entry);
+    if (this.entries.length > this.maxEntries) {
+      this.entries.shift();
+    }
+    
+    // Output to console if enabled
+    if (this.outputToConsole) {
+      this.outputToConsoleLog(entry);
+    }
+  }
+  
+  /**
+   * Check if a log level should be processed
+   * @param level Log level to check
+   * @returns Whether the level should be logged
+   */
+  private shouldLog(level: LogLevel): boolean {
+    const levelOrder: Record<LogLevel, number> = {
+      debug: 0,
+      info: 1,
+      warn: 2,
+      error: 3
+    };
+    
+    return levelOrder[level] >= levelOrder[this.level];
+  }
+  
+  /**
+   * Output a log entry to the console
+   * @param entry Log entry to output
+   */
+  private outputToConsoleLog(entry: LogEntry): void {
+    const { timestamp, level, message, context } = entry;
+    const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+    
+    switch (level) {
+      case 'debug':
+        console.debug(prefix, message, context || '');
+        break;
+      case 'info':
+        console.info(prefix, message, context || '');
+        break;
+      case 'warn':
+        console.warn(prefix, message, context || '');
+        break;
+      case 'error':
+        console.error(prefix, message, context || '');
+        break;
+    }
+  }
+}
+
+// Create and export a singleton instance
+export const log = new TechCurrencyLogger();
+
+// Export the types for consumers
+export type { LogLevel, LogEntry, Logger };
