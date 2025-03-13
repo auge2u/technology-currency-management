@@ -1,109 +1,90 @@
 /**
- * Utility functions for technology scanners
+ * Utility functions for technology currency scanners
  */
 
 /**
- * Compare two version strings
- * @param version1 First version string
- * @param version2 Second version string
- * @returns -1 if version1 < version2, 0 if equal, 1 if version1 > version2
+ * Compare version numbers
+ * @param a First version
+ * @param b Second version
+ * @returns Negative if a < b, positive if a > b, 0 if equal
  */
-export function compareVersions(version1: string, version2: string): number {
-  if (!version1 && !version2) return 0;
-  if (!version1) return -1;
-  if (!version2) return 1;
+export function compareVersions(a: string, b: string): number {
+  // Handle undefined/null values
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
   
-  // Split versions into components
-  const v1Components = version1.split(/[.-]/);
-  const v2Components = version2.split(/[.-]/);
+  // Split version strings into components
+  const aParts = a.split(/[.-]/).map(part => {
+    // If component is numeric, parse it
+    return /^\d+$/.test(part) ? parseInt(part, 10) : part;
+  });
+  
+  const bParts = b.split(/[.-]/).map(part => {
+    return /^\d+$/.test(part) ? parseInt(part, 10) : part;
+  });
   
   // Compare each component
-  const maxLength = Math.max(v1Components.length, v2Components.length);
+  const maxLength = Math.max(aParts.length, bParts.length);
   
   for (let i = 0; i < maxLength; i++) {
-    // If a component is missing, treat it as 0
-    const v1Component = i < v1Components.length ? parseInt(v1Components[i], 10) || 0 : 0;
-    const v2Component = i < v2Components.length ? parseInt(v2Components[i], 10) || 0 : 0;
+    // Treat missing components as lower than any existing component
+    if (i >= aParts.length) return -1;
+    if (i >= bParts.length) return 1;
     
-    if (v1Component < v2Component) return -1;
-    if (v1Component > v2Component) return 1;
+    const aVal = aParts[i];
+    const bVal = bParts[i];
+    
+    // If types don't match, try to convert
+    if (typeof aVal !== typeof bVal) {
+      // If one is a number and one is a string, compare the string representation
+      if (typeof aVal === 'number' && typeof bVal === 'string') {
+        const comp = String(aVal).localeCompare(bVal);
+        if (comp !== 0) return comp;
+      } else if (typeof aVal === 'string' && typeof bVal === 'number') {
+        const comp = aVal.localeCompare(String(bVal));
+        if (comp !== 0) return comp;
+      } else {
+        // Different types that can't be compared, treat as equal for this component
+        continue;
+      }
+    } else {
+      // Same types, compare directly
+      if (aVal < bVal) return -1;
+      if (aVal > bVal) return 1;
+    }
   }
   
+  // All components are equal
   return 0;
 }
 
 /**
- * Format a date for display
- * @param date Date to format
- * @returns Formatted date string
+ * Get the number of days between two dates
+ * @param start Start date
+ * @param end End date
+ * @returns Number of days between dates (negative if end is before start)
  */
-export function formatDate(date?: Date): string {
-  if (!date) return 'Unknown';
-  return date.toISOString().split('T')[0];
-}
-
-/**
- * Calculate days between two dates
- * @param date1 First date
- * @param date2 Second date (defaults to current date)
- * @returns Number of days between dates
- */
-export function daysBetween(date1: Date, date2: Date = new Date()): number {
-  const oneDay = 24 * 60 * 60 * 1000; // hours*minutes*seconds*milliseconds
-  const diffDays = Math.round(Math.abs((date1.getTime() - date2.getTime()) / oneDay));
-  return diffDays;
-}
-
-/**
- * Check if a version string is a valid semantic version
- * @param version Version string to check
- * @returns True if valid semver
- */
-export function isValidSemver(version: string): boolean {
-  const semverRegex = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
-  return semverRegex.test(version);
-}
-
-/**
- * Parse a semantic version string into its components
- * @param version Semver string
- * @returns Object with version components
- */
-export function parseSemver(version: string): {
-  major: number;
-  minor: number;
-  patch: number;
-  prerelease: string;
-  buildmetadata: string;
-} {
-  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?(?:\+([\w.-]+))?$/);
+export function daysBetween(start: Date, end: Date): number {
+  const startDate = new Date(start);
+  const endDate = new Date(end);
   
-  if (!match) {
-    return {
-      major: 0,
-      minor: 0,
-      patch: 0,
-      prerelease: '',
-      buildmetadata: ''
-    };
-  }
+  // Set both dates to midnight
+  startDate.setHours(0, 0, 0, 0);
+  endDate.setHours(0, 0, 0, 0);
   
-  return {
-    major: parseInt(match[1], 10),
-    minor: parseInt(match[2], 10),
-    patch: parseInt(match[3], 10),
-    prerelease: match[4] || '',
-    buildmetadata: match[5] || ''
-  };
+  // Calculate milliseconds between dates and convert to days
+  const diffMs = endDate.getTime() - startDate.getTime();
+  return Math.round(diffMs / (1000 * 60 * 60 * 24));
 }
 
 /**
- * Estimate the business impact of outdated technology
- * @param isOutdated Whether the technology is outdated
- * @param isDeprecated Whether the technology is deprecated
- * @param hasVulnerabilities Whether the technology has vulnerabilities
- * @param isCriticalSystem Whether this is a critical system component
- * @returns Business impact score from 1-5
+ * Estimate business impact of outdated technology
+ * @param isOutdated Whether technology is outdated
+ * @param isDeprecated Whether technology is deprecated
+ * @param hasVulnerabilities Whether technology has known vulnerabilities
+ * @param isCriticalSystem Whether this is a critical system
+ * @returns Business impact score (1-5)
  */
 export function estimateBusinessImpact(
   isOutdated: boolean,
@@ -111,140 +92,231 @@ export function estimateBusinessImpact(
   hasVulnerabilities: boolean,
   isCriticalSystem: boolean
 ): number {
-  // Start with a base impact level
-  let impact = 1;
+  let score = 1; // Start with minimal impact
   
-  // Adjust based on conditions
-  if (isOutdated) impact += 1;
-  if (isDeprecated) impact += 2;
-  if (hasVulnerabilities) impact += 2;
-  if (isCriticalSystem) impact += 1;
+  if (isOutdated) score += 1;
+  if (isDeprecated) score += 2;
+  if (hasVulnerabilities) score += 2;
+  if (isCriticalSystem) score += 1;
   
-  // Cap at 5
-  return Math.min(5, impact);
+  // Cap at maximum of 5
+  return Math.min(score, 5);
 }
 
 /**
- * Calculate percentage difference between two versions
+ * Estimate migration difficulty based on version differences
  * @param currentVersion Current version
- * @param latestVersion Latest version
- * @returns Percentage behind (0-100)
- */
-export function calculateVersionDifference(
-  currentVersion: string,
-  latestVersion: string
-): number {
-  const current = parseSemver(currentVersion);
-  const latest = parseSemver(latestVersion);
-  
-  // For major version differences, use a scale based on semantic versioning
-  const majorDiff = latest.major - current.major;
-  
-  if (majorDiff > 0) {
-    // Calculate percentage based on major version difference
-    // Each major version is considered a 20% gap
-    return Math.min(100, majorDiff * 20);
-  }
-  
-  // For minor version differences
-  const minorDiff = latest.minor - current.minor;
-  
-  if (minorDiff > 0) {
-    // Each minor version is a 5% gap
-    return Math.min(19, minorDiff * 5);
-  }
-  
-  // For patch version differences
-  const patchDiff = latest.patch - current.patch;
-  
-  if (patchDiff > 0) {
-    // Each patch is a 1% gap
-    return Math.min(4, patchDiff);
-  }
-  
-  return 0;
-}
-
-/**
- * Generate a migration score based on how challenging it would be to update
- * @param currentVersion Current version
- * @param latestVersion Latest version
- * @param type Technology type
- * @returns Migration difficulty score from 1-5
+ * @param targetVersion Target version
+ * @param type Type of technology
+ * @returns Migration effort score (1-5)
  */
 export function estimateMigrationDifficulty(
   currentVersion: string,
-  latestVersion: string,
+  targetVersion: string,
   type: string
 ): number {
-  // Start with a base difficulty level
-  let difficulty = 1;
+  // Calculate version gap
+  const versionGap = calculateVersionGap(currentVersion, targetVersion);
   
-  // Check version difference
-  const versionDiff = calculateVersionDifference(currentVersion, latestVersion);
+  // Base difficulty on technology type and version gap
+  let baseDifficulty: number;
   
-  // Adjust difficulty based on version difference
-  if (versionDiff >= 50) {
-    difficulty += 3; // Major version jump (multiple major versions behind)
-  } else if (versionDiff >= 20) {
-    difficulty += 2; // Major version jump
-  } else if (versionDiff >= 10) {
-    difficulty += 1; // Significant minor version jump
+  switch (type) {
+    case 'js-framework':
+    case 'node-framework':
+      // JavaScript frameworks often have more breaking changes
+      baseDifficulty = 2 + versionGap * 0.7;
+      break;
+    case 'python-framework':
+    case 'java-framework':
+    case 'php-framework':
+      // More stable frameworks typically
+      baseDifficulty = 1.5 + versionGap * 0.6;
+      break;
+    case 'database':
+      // Database migrations can be complex
+      baseDifficulty = 3 + versionGap * 0.5;
+      break;
+    case 'library':
+      // Libraries are usually easier to upgrade
+      baseDifficulty = 1 + versionGap * 0.4;
+      break;
+    default:
+      // Default for unknown types
+      baseDifficulty = 2 + versionGap * 0.5;
   }
   
-  // Adjust based on known difficult migrations
-  const highDifficultyTypes = ['database', 'core-framework', 'language-runtime'];
-  if (highDifficultyTypes.some(t => type.includes(t))) {
-    difficulty += 1;
+  // Major version changes are often more difficult
+  const majorVersionChange = getMajorVersionChange(currentVersion, targetVersion);
+  if (majorVersionChange > 0) {
+    baseDifficulty += majorVersionChange * 0.5;
   }
   
-  // Cap at 5
-  return Math.min(5, difficulty);
+  // Cap at minimum 1 and maximum 5
+  return Math.max(1, Math.min(Math.round(baseDifficulty), 5));
 }
 
 /**
- * Calculate the age of a technology version in days
- * @param releaseDate Release date of the version
- * @returns Age in days
+ * Calculate a normalized version gap score
+ * @param currentVersion Current version
+ * @param targetVersion Target version
+ * @returns Version gap score (0-5)
  */
-export function calculateVersionAge(releaseDate?: Date): number {
-  if (!releaseDate) return 0;
-  return daysBetween(releaseDate);
+function calculateVersionGap(currentVersion: string, targetVersion: string): number {
+  // Extract major and minor versions
+  const current = parseVersionParts(currentVersion);
+  const target = parseVersionParts(targetVersion);
+  
+  // Calculate gap score based on major, minor, and patch differences
+  const majorDiff = Math.max(0, target.major - current.major);
+  const minorDiff = Math.max(0, target.minor - current.minor);
+  const patchDiff = Math.max(0, target.patch - current.patch);
+  
+  // Weight the differences
+  return Math.min(5, (majorDiff * 2) + (minorDiff * 0.5) + (patchDiff * 0.1));
 }
 
 /**
- * Check if a version is within its support lifecycle
- * @param version Version to check
- * @param endOfSupportDate End of support date
- * @returns True if supported
+ * Get the major version change between two versions
+ * @param currentVersion Current version
+ * @param targetVersion Target version
+ * @returns Number of major version increments
  */
-export function isVersionSupported(version: string, endOfSupportDate?: Date): boolean {
-  if (!endOfSupportDate) return true;
-  return new Date() < endOfSupportDate;
+function getMajorVersionChange(currentVersion: string, targetVersion: string): number {
+  const current = parseVersionParts(currentVersion);
+  const target = parseVersionParts(targetVersion);
+  
+  return Math.max(0, target.major - current.major);
 }
 
 /**
- * Format a timeframe into a human-readable string
- * @param days Number of days
- * @returns Human-readable timeframe
+ * Parse version string into major, minor, and patch components
+ * @param version Version string
+ * @returns Object with major, minor, and patch numbers
  */
-export function formatTimeframe(days: number): string {
-  if (days < 0) return 'Already passed';
-  if (days === 0) return 'Today';
-  if (days < 30) return `${days} days`;
-  if (days < 365) return `${Math.round(days / 30)} months`;
-  return `${Math.round(days / 365)} years`;
+function parseVersionParts(version: string): { major: number; minor: number; patch: number } {
+  // Default values
+  const result = { major: 0, minor: 0, patch: 0 };
+  
+  if (!version) return result;
+  
+  // Extract version parts
+  const parts = version.split(/[.-]/);
+  
+  // Parse numeric values
+  result.major = parseInt(parts[0]) || 0;
+  
+  if (parts.length > 1) {
+    result.minor = parseInt(parts[1]) || 0;
+  }
+  
+  if (parts.length > 2) {
+    result.patch = parseInt(parts[2]) || 0;
+  }
+  
+  return result;
 }
 
 /**
- * Prioritize issues based on urgency and impact
- * @param issues Array of issues with impact and urgency scores
- * @returns Sorted array of issues
+ * Generate a random ID
+ * @param length Length of ID (default: 12)
+ * @returns Random ID string
  */
-export function prioritizeIssues<T extends { businessImpact?: number; securityImpact?: number }>(issues: T[]): T[] {
-  return [...issues].sort((a, b) => {
-    const aImpact = Math.max(a.businessImpact || 0, a.securityImpact || 0);
-    const bImpact = Math.max(b.businessImpact || 0, b.securityImpact || 0);
-    return bImpact - aImpact;
-  });
+export function generateId(length: number = 12): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let result = '';
+  
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  
+  return result;
+}
+
+/**
+ * Filter out false positive outdated dependencies
+ * @param dependencyName Name of dependency
+ * @param currentVersion Current version
+ * @param latestVersion Latest version
+ * @returns Whether the dependency should be considered outdated
+ */
+export function isReallyOutdated(
+  dependencyName: string,
+  currentVersion: string,
+  latestVersion: string
+): boolean {
+  // Skip checking dependencies that use exact versions for a reason
+  const exemptDependencies = [
+    // Common dependencies that may have pinned versions
+    'react-scripts',
+    'typescript',
+    'webpack'
+  ];
+  
+  if (exemptDependencies.includes(dependencyName)) {
+    // For exempt dependencies, only consider major version differences
+    const current = parseVersionParts(currentVersion);
+    const latest = parseVersionParts(latestVersion);
+    
+    return latest.major > current.major;
+  }
+  
+  // For other dependencies, check if the version difference is significant
+  return compareVersions(currentVersion, latestVersion) < 0;
+}
+
+/**
+ * Determine if a dependency is critical based on its usage
+ * @param dependencyName Name of dependency
+ * @returns Whether the dependency is critical
+ */
+export function isDependencyCritical(dependencyName: string): boolean {
+  // List of dependencies that are typically critical
+  const criticalDependencies = [
+    // Security-related
+    'helmet',
+    'jsonwebtoken',
+    'bcrypt',
+    'crypto',
+    'passport',
+    'auth0',
+    'oauth',
+    
+    // Core framework/runtime
+    'react',
+    'angular',
+    'vue',
+    'express',
+    'next',
+    'nuxt',
+    'nest',
+    'django',
+    'flask',
+    'spring',
+    'laravel',
+    'rails',
+    
+    // Database
+    'mongoose',
+    'sequelize',
+    'typeorm',
+    'prisma',
+    'knex',
+    'objection',
+    'pg',
+    'mongodb',
+    'mysql',
+    'sqlite',
+    
+    // State management
+    'redux',
+    'mobx',
+    'vuex',
+    'recoil',
+    'zustand'
+  ];
+  
+  return criticalDependencies.some(dep => 
+    dependencyName === dep || dependencyName.startsWith(`${dep}-`) || dependencyName.startsWith(`${dep}/`)
+  );
 }
