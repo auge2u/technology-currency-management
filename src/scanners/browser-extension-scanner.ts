@@ -2,12 +2,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { promisify } from 'util';
-import { exec } from 'child_process';
 import { BrowserExtensionIssue, VulnerabilityInfo } from '../types/scanning';
 import { compareVersions } from '../utils/scanner-utils';
 import { log } from '../utils/logging';
+import * as child_process from 'child_process';
 
-const execAsync = promisify(exec);
+const readFileAsync = promisify(fs.readFile);
+const readdirAsync = promisify(fs.readdir);
+const execAsync = promisify(child_process.exec);
 
 /**
  * Configuration for browser extension scanning
@@ -36,126 +38,204 @@ export interface BrowserExtensionScannerConfig {
 }
 
 /**
- * Extension information structure
+ * Information about a browser extension
  */
-interface ExtensionInfo {
+interface BrowserExtension {
+  // Extension ID
   id: string;
+  
+  // Extension name
   name: string;
+  
+  // Current version
   version: string;
+  
+  // Extension description
+  description?: string;
+  
+  // Whether the extension is enabled
+  enabled: boolean;
+  
+  // Location of the extension
+  path: string;
+  
+  // Browser this extension is for
   browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera';
-  installLocation: string;
-  storeUrl?: string;
-  isEnabled?: boolean;
+  
+  // User this extension is installed for
+  user?: string;
+  
+  // Permissions requested by the extension
+  permissions?: string[];
+  
+  // Extension metadata
+  metadata?: Record<string, any>;
 }
 
 /**
- * Scan browsers for outdated extensions
+ * Extension vulnerability information
+ */
+interface ExtensionVulnerability {
+  // Extension ID
+  extensionId: string;
+  
+  // Affected versions
+  affectedVersions: string;
+  
+  // Vulnerability title
+  title: string;
+  
+  // Detailed description
+  description: string;
+  
+  // Severity
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  
+  // URL for more information
+  infoUrl?: string;
+  
+  // Published date
+  publishedDate?: Date;
+  
+  // Recommendation to fix
+  recommendation?: string;
+  
+  // Whether the extension has been removed from the store
+  removedFromStore?: boolean;
+}
+
+/**
+ * Extension database with version and vulnerability information
+ */
+interface BrowserExtensionDatabase {
+  // Map of extension ID to latest version info
+  extensions: Record<string, {
+    latestVersion: string;
+    name: string;
+    storeUrl?: string;
+    isRemoved?: boolean;
+  }>;
+  
+  // Map of extension ID to known vulnerabilities
+  vulnerabilities: Record<string, ExtensionVulnerability[]>;
+  
+  // Last updated timestamp
+  lastUpdated: Date;
+}
+
+/**
+ * Scanner for detecting outdated or vulnerable browser extensions
  */
 export async function scanBrowserExtensions(
   config: BrowserExtensionScannerConfig
 ): Promise<BrowserExtensionIssue[]> {
   try {
     log.info('Starting browser extension scanner');
-    
     const issues: BrowserExtensionIssue[] = [];
-    const detectedExtensions: ExtensionInfo[] = [];
     
-    // For each browser, detect installed extensions
+    // Load extension database
+    const extensionDb = await loadExtensionDatabase(config);
+    
+    log.info(`Loaded extension database with ${Object.keys(extensionDb.extensions).length} extensions`);
+    
+    // Get users to scan
+    const users = config.users || [os.userInfo().username];
+    
+    // Scan extensions for each browser
     for (const browser of config.browsers) {
       try {
         log.info(`Scanning ${browser} extensions`);
-        const extensions = await detectBrowserExtensions(browser, config.users);
-        detectedExtensions.push(...extensions);
-        log.info(`Detected ${extensions.length} extensions for ${browser}`);
+        
+        // Get installed extensions for this browser
+        for (const user of users) {
+          try {
+            log.info(`Scanning ${browser} extensions for user ${user}`);
+            
+            const extensions = await getInstalledExtensions(browser, user);
+            
+            log.info(`Found ${extensions.length} installed ${browser} extensions for user ${user}`);
+            
+            // Check each extension
+            for (const extension of extensions) {
+              try {
+                // Skip ignored extensions
+                if (config.ignoreExtensions && config.ignoreExtensions.includes(extension.id)) {
+                  log.info(`Skipping ignored extension: ${extension.id} (${extension.name})`);
+                  continue;
+                }
+                
+                // Skip extensions matching ignore patterns
+                if (config.ignorePatterns && 
+                    config.ignorePatterns.some(pattern => new RegExp(pattern).test(extension.id))) {
+                  log.info(`Skipping extension matching ignore pattern: ${extension.id} (${extension.name})`);
+                  continue;
+                }
+                
+                // Get latest version information
+                const latestInfo = extensionDb.extensions[extension.id];
+                
+                if (!latestInfo) {
+                  log.info(`No version information found for extension: ${extension.id} (${extension.name})`);
+                  continue;
+                }
+                
+                // Check if outdated
+                const isOutdated = compareVersions(extension.version, latestInfo.latestVersion) < 0;
+                
+                // Check if removed from store
+                const isRemovedFromStore = latestInfo.isRemoved || false;
+                
+                // Get vulnerabilities
+                let vulnerabilities: VulnerabilityInfo[] = [];
+                let hasSecurityIssues = false;
+                
+                if (config.checkVulnerabilities) {
+                  vulnerabilities = await getExtensionVulnerabilities(
+                    extension.id, 
+                    extension.version, 
+                    extensionDb.vulnerabilities
+                  );
+                  hasSecurityIssues = vulnerabilities.length > 0;
+                }
+                
+                // Skip if not outdated, not removed, and no vulnerabilities
+                if (!isOutdated && !isRemovedFromStore && !hasSecurityIssues) {
+                  log.info(`Extension ${extension.name} (${extension.id}) is current and has no issues`);
+                  continue;
+                }
+                
+                // Create issue
+                const issue: BrowserExtensionIssue = {
+                  name: extension.name,
+                  id: extension.id,
+                  currentVersion: extension.version,
+                  latestVersion: latestInfo.latestVersion,
+                  isOutdated,
+                  browser: extension.browser,
+                  isRemovedFromStore,
+                  hasSecurityIssues,
+                  storeUrl: latestInfo.storeUrl,
+                  vulnerabilities,
+                  detectedAt: new Date()
+                };
+                
+                // Add to issues list
+                issues.push(issue);
+                log.info(`Added issue for extension ${extension.name} (${extension.id})`);
+              } catch (extensionError) {
+                log.warn(`Error processing extension: ${extension.id}`, { error: extensionError });
+              }
+            }
+          } catch (userError) {
+            log.warn(`Error scanning ${browser} extensions for user ${user}`, { error: userError });
+          }
+        }
       } catch (browserError) {
-        log.warn(`Error scanning ${browser} extensions`, { error: browserError });
+        log.error(`Error scanning ${browser} extensions`, { error: browserError });
       }
     }
     
-    log.info(`Total detected extensions: ${detectedExtensions.length}`);
-    
-    // Check each extension for issues
-    for (const extension of detectedExtensions) {
-      try {
-        // Skip ignored extensions
-        if (config.ignoreExtensions && config.ignoreExtensions.includes(extension.id)) {
-          continue;
-        }
-        
-        // Skip extensions matching ignore patterns
-        if (config.ignorePatterns && 
-            config.ignorePatterns.some(pattern => new RegExp(pattern).test(extension.name))) {
-          continue;
-        }
-        
-        // Get the latest version
-        const latestVersion = await getLatestExtensionVersion(extension.id, extension.browser);
-        
-        if (!latestVersion) {
-          continue; // Skip if we can't determine the latest version
-        }
-        
-        const isOutdated = compareVersions(extension.version, latestVersion) < 0;
-        let isRemovedFromStore = false;
-        
-        // Check if extension has been removed from store
-        if (extension.storeUrl) {
-          isRemovedFromStore = await checkExtensionRemovedFromStore(extension.storeUrl, config.apiTimeoutMs);
-        }
-        
-        let vulnerabilities: VulnerabilityInfo[] = [];
-        
-        // Check for vulnerabilities if enabled
-        if (config.checkVulnerabilities) {
-          vulnerabilities = await getExtensionVulnerabilities(
-            extension.id, 
-            extension.version,
-            extension.browser
-          );
-        }
-        
-        let compatibilityIssues: VulnerabilityInfo[] = [];
-        
-        // Check for compatibility issues if enabled
-        if (config.checkCompatibility) {
-          compatibilityIssues = await getExtensionCompatibilityIssues(
-            extension.id,
-            extension.version,
-            extension.browser
-          );
-          
-          // Add compatibility issues to vulnerabilities with "low" severity
-          vulnerabilities.push(...compatibilityIssues.map(issue => ({
-            ...issue,
-            severity: 'low' as const
-          })));
-        }
-        
-        // Create the issue if outdated, has vulnerabilities, or removed from store
-        if (isOutdated || vulnerabilities.length > 0 || isRemovedFromStore) {
-          const issue: BrowserExtensionIssue = {
-            id: extension.id,
-            name: extension.name,
-            browser: extension.browser,
-            currentVersion: extension.version,
-            latestVersion,
-            isOutdated,
-            isRemovedFromStore,
-            hasSecurityIssues: vulnerabilities.some(v => 
-              v.severity === 'high' || v.severity === 'critical'),
-            vulnerabilities,
-            storeUrl: extension.storeUrl || getBrowserStoreUrl(extension.browser, extension.id),
-            detectedAt: new Date()
-          };
-          
-          issues.push(issue);
-        }
-      } catch (extensionError) {
-        log.warn(`Error checking extension ${extension.name}@${extension.version}`, { error: extensionError });
-      }
-    }
-    
-    log.info(`Completed browser extension scanning. Found ${issues.length} issues`);
+    log.info(`Completed browser extension scanning. Found ${issues.length} total issues`);
     return issues;
   } catch (error) {
     log.error('Error during browser extension scanning', { error });
@@ -164,255 +244,307 @@ export async function scanBrowserExtensions(
 }
 
 /**
- * Detect installed browser extensions
+ * Load the browser extension database
  */
-async function detectBrowserExtensions(
+async function loadExtensionDatabase(
+  config: BrowserExtensionScannerConfig
+): Promise<BrowserExtensionDatabase> {
+  // In a real implementation, this would load from a file or API
+  // For this example, we'll return a small hardcoded database
+  
+  return {
+    extensions: {
+      'react-developer-tools': {
+        name: 'React Developer Tools',
+        latestVersion: '4.28.0',
+        storeUrl: 'https://chrome.google.com/webstore/detail/react-developer-tools/fmkadmapgofadopljbjfkapdkoienihi'
+      },
+      'redux-devtools': {
+        name: 'Redux DevTools',
+        latestVersion: '3.1.0',
+        storeUrl: 'https://chrome.google.com/webstore/detail/redux-devtools/lmhkpmbekcpmknklioeibfkpmmfibljd'
+      },
+      'angular-devtools': {
+        name: 'Angular DevTools',
+        latestVersion: '1.0.6',
+        storeUrl: 'https://chrome.google.com/webstore/detail/angular-devtools/ienfalfjdbdpebioblfackkekamfmbnh'
+      },
+      'vue-devtools': {
+        name: 'Vue.js devtools',
+        latestVersion: '6.5.0',
+        storeUrl: 'https://chrome.google.com/webstore/detail/vuejs-devtools/nhdogjmejiglipccpnnnanhbledajbpd'
+      },
+      'unsafe-extension': {
+        name: 'Unsafe Extension (Example)',
+        latestVersion: '2.0.0',
+        isRemoved: true
+      }
+    },
+    vulnerabilities: {
+      'unsafe-extension': [
+        {
+          extensionId: 'unsafe-extension',
+          affectedVersions: '<2.0.0',
+          title: 'Data Exfiltration Vulnerability',
+          description: 'This extension contains a vulnerability that could allow attackers to exfiltrate sensitive data.',
+          severity: 'critical',
+          infoUrl: 'https://example.com/vulnerability',
+          publishedDate: new Date('2023-01-15'),
+          recommendation: 'Uninstall this extension immediately',
+          removedFromStore: true
+        }
+      ]
+    },
+    lastUpdated: new Date()
+  };
+}
+
+/**
+ * Get installed extensions for a specific browser and user
+ */
+async function getInstalledExtensions(
   browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera',
-  users?: string[]
-): Promise<ExtensionInfo[]> {
-  const extensions: ExtensionInfo[] = [];
-  const platform = os.platform();
-  
-  // If no users specified, use current user
-  if (!users || users.length === 0) {
-    const homeDir = os.homedir();
-    users = [path.basename(homeDir)];
-  }
-  
-  for (const user of users) {
-    try {
-      let extensionDir = '';
-      
-      // Find extension directory based on platform and browser
-      switch (platform) {
-        case 'win32':
-          extensionDir = getWindowsExtensionDir(browser, user);
-          break;
-        case 'darwin':
-          extensionDir = getMacExtensionDir(browser, user);
-          break;
-        case 'linux':
-          extensionDir = getLinuxExtensionDir(browser, user);
-          break;
-        default:
-          log.warn(`Unsupported platform for browser extension scanning: ${platform}`);
-          continue;
-      }
-      
-      if (!extensionDir || !fs.existsSync(extensionDir)) {
-        log.info(`Extension directory not found for ${browser} and user ${user}`);
-        continue;
-      }
-      
-      // List extensions in directory
-      const extensionFolders = fs.readdirSync(extensionDir);
-      
-      for (const extensionFolder of extensionFolders) {
-        const extensionPath = path.join(extensionDir, extensionFolder);
-        
-        // Skip if not a directory
-        if (!fs.statSync(extensionPath).isDirectory()) {
+  username: string
+): Promise<BrowserExtension[]> {
+  try {
+    // Get platform-specific extension directories
+    const extensionDirs = getBrowserExtensionDirectories(browser, username);
+    
+    const extensions: BrowserExtension[] = [];
+    
+    for (const dir of extensionDirs) {
+      try {
+        if (!fs.existsSync(dir)) {
+          log.info(`Extension directory does not exist: ${dir}`);
           continue;
         }
         
-        try {
-          // Look for manifest.json file (Web Extensions standard)
-          const manifestPath = path.join(extensionPath, 'manifest.json');
+        // For Chrome-based browsers
+        if (['chrome', 'edge', 'opera'].includes(browser)) {
+          const extensionFolders = await readdirAsync(dir);
           
-          if (fs.existsSync(manifestPath)) {
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-            
-            const extension: ExtensionInfo = {
-              id: extensionFolder,
-              name: manifest.name || extensionFolder,
-              version: manifest.version || '0.0.0',
-              browser,
-              installLocation: extensionPath,
-              storeUrl: getBrowserStoreUrl(browser, extensionFolder)
-            };
-            
-            extensions.push(extension);
+          for (const extId of extensionFolders) {
+            try {
+              const extensionPath = path.join(dir, extId);
+              const manifestPath = path.join(extensionPath, 'manifest.json');
+              
+              if (fs.existsSync(manifestPath)) {
+                const manifestContent = await readFileAsync(manifestPath, 'utf8');
+                const manifest = JSON.parse(manifestContent);
+                
+                extensions.push({
+                  id: extId,
+                  name: manifest.name || 'Unknown',
+                  version: manifest.version || '0.0.0',
+                  description: manifest.description,
+                  enabled: true, // Assuming enabled by default
+                  path: extensionPath,
+                  browser,
+                  user: username,
+                  permissions: manifest.permissions,
+                  metadata: {
+                    manifestVersion: manifest.manifest_version
+                  }
+                });
+              }
+            } catch (extError) {
+              log.warn(`Error processing extension: ${extId}`, { error: extError });
+            }
           }
-        } catch (manifestError) {
-          log.warn(`Error parsing manifest for extension in ${extensionPath}`, { error: manifestError });
         }
+        // For Firefox
+        else if (browser === 'firefox') {
+          // Firefox stores extensions in a more complex way
+          // This is a simplified approach
+          const extensionsIni = path.join(dir, 'extensions.json');
+          
+          if (fs.existsSync(extensionsIni)) {
+            const iniContent = await readFileAsync(extensionsIni, 'utf8');
+            const extensionsData = JSON.parse(iniContent);
+            
+            for (const addon of extensionsData.addons || []) {
+              try {
+                extensions.push({
+                  id: addon.id,
+                  name: addon.name || 'Unknown',
+                  version: addon.version || '0.0.0',
+                  description: addon.description,
+                  enabled: addon.active,
+                  path: addon.path,
+                  browser,
+                  user: username
+                });
+              } catch (addonError) {
+                log.warn(`Error processing Firefox addon: ${addon.id}`, { error: addonError });
+              }
+            }
+          }
+        }
+        // For Safari
+        else if (browser === 'safari') {
+          // Safari extensions are more complex to detect
+          // This is a placeholder for a real implementation
+          if (process.platform === 'darwin') {
+            try {
+              // On macOS, we could use the 'pluginkit' command
+              const { stdout } = await execAsync('pluginkit -v')
+              const lines = stdout.split('\n');
+              
+              // Process output to extract Safari extensions
+              // This is a simplified example
+              for (const line of lines) {
+                if (line.includes('safari-extension://')) {
+                  const match = line.match(/safari-extension:\/\/([^-]+)-([^/]+)/);
+                  if (match) {
+                    const [, name, version] = match;
+                    const id = `safari-${name}`;
+                    
+                    extensions.push({
+                      id,
+                      name,
+                      version,
+                      enabled: true,
+                      path: '',
+                      browser,
+                      user: username
+                    });
+                  }
+                }
+              }
+            } catch (safariError) {
+              log.warn('Error detecting Safari extensions', { error: safariError });
+            }
+          }
+        }
+      } catch (dirError) {
+        log.warn(`Error processing extension directory: ${dir}`, { error: dirError });
       }
-    } catch (userError) {
-      log.warn(`Error scanning extensions for user ${user}`, { error: userError });
+    }
+    
+    return extensions;
+  } catch (error) {
+    log.error(`Error getting installed ${browser} extensions`, { error });
+    return [];
+  }
+}
+
+/**
+ * Get browser extension directories for a specific browser and user
+ */
+function getBrowserExtensionDirectories(
+  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera',
+  username: string
+): string[] {
+  const platform = process.platform;
+  const homeDir = os.homedir();
+  
+  if (platform === 'win32') {
+    // Windows paths
+    switch (browser) {
+      case 'chrome':
+        return [
+          `C:\\Users\\${username}\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Extensions`
+        ];
+      case 'firefox':
+        return [
+          `C:\\Users\\${username}\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles`
+        ];
+      case 'edge':
+        return [
+          `C:\\Users\\${username}\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Extensions`
+        ];
+      case 'opera':
+        return [
+          `C:\\Users\\${username}\\AppData\\Roaming\\Opera Software\\Opera Stable\\Extensions`
+        ];
+      case 'safari':
+        return []; // Safari is not available on Windows
+    }
+  } else if (platform === 'darwin') {
+    // macOS paths
+    switch (browser) {
+      case 'chrome':
+        return [
+          `${homeDir}/Library/Application Support/Google/Chrome/Default/Extensions`
+        ];
+      case 'firefox':
+        return [
+          `${homeDir}/Library/Application Support/Firefox/Profiles`
+        ];
+      case 'edge':
+        return [
+          `${homeDir}/Library/Application Support/Microsoft Edge/Default/Extensions`
+        ];
+      case 'opera':
+        return [
+          `${homeDir}/Library/Application Support/com.operasoftware.Opera/Extensions`
+        ];
+      case 'safari':
+        return [
+          `${homeDir}/Library/Safari/Extensions`,
+          `${homeDir}/Library/Containers/com.apple.Safari/Data/Library/Safari/Extensions`
+        ];
+    }
+  } else if (platform === 'linux') {
+    // Linux paths
+    switch (browser) {
+      case 'chrome':
+        return [
+          `${homeDir}/.config/google-chrome/Default/Extensions`,
+          `${homeDir}/.config/chromium/Default/Extensions`
+        ];
+      case 'firefox':
+        return [
+          `${homeDir}/.mozilla/firefox`
+        ];
+      case 'edge':
+        return [
+          `${homeDir}/.config/microsoft-edge/Default/Extensions`
+        ];
+      case 'opera':
+        return [
+          `${homeDir}/.config/opera/Extensions`
+        ];
+      case 'safari':
+        return []; // Safari is not available on Linux
     }
   }
   
-  return extensions;
+  return [];
 }
 
 /**
- * Get the extension directory for Windows
- */
-function getWindowsExtensionDir(
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera',
-  user: string
-): string {
-  const appData = path.join('C:', 'Users', user, 'AppData');
-  
-  switch (browser) {
-    case 'chrome':
-      return path.join(appData, 'Local', 'Google', 'Chrome', 'User Data', 'Default', 'Extensions');
-    case 'firefox':
-      return path.join(appData, 'Roaming', 'Mozilla', 'Firefox', 'Profiles');
-    case 'edge':
-      return path.join(appData, 'Local', 'Microsoft', 'Edge', 'User Data', 'Default', 'Extensions');
-    case 'opera':
-      return path.join(appData, 'Roaming', 'Opera Software', 'Opera Stable', 'Extensions');
-    default:
-      return '';
-  }
-}
-
-/**
- * Get the extension directory for macOS
- */
-function getMacExtensionDir(
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera',
-  user: string
-): string {
-  const homeDir = path.join('/Users', user);
-  
-  switch (browser) {
-    case 'chrome':
-      return path.join(homeDir, 'Library', 'Application Support', 'Google', 'Chrome', 'Default', 'Extensions');
-    case 'firefox':
-      return path.join(homeDir, 'Library', 'Application Support', 'Firefox', 'Profiles');
-    case 'safari':
-      return path.join(homeDir, 'Library', 'Safari', 'Extensions');
-    case 'edge':
-      return path.join(homeDir, 'Library', 'Application Support', 'Microsoft Edge', 'Default', 'Extensions');
-    case 'opera':
-      return path.join(homeDir, 'Library', 'Application Support', 'com.operasoftware.Opera', 'Extensions');
-    default:
-      return '';
-  }
-}
-
-/**
- * Get the extension directory for Linux
- */
-function getLinuxExtensionDir(
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera',
-  user: string
-): string {
-  const homeDir = path.join('/home', user);
-  
-  switch (browser) {
-    case 'chrome':
-      return path.join(homeDir, '.config', 'google-chrome', 'Default', 'Extensions');
-    case 'firefox':
-      return path.join(homeDir, '.mozilla', 'firefox');
-    case 'edge':
-      return path.join(homeDir, '.config', 'microsoft-edge', 'Default', 'Extensions');
-    case 'opera':
-      return path.join(homeDir, '.config', 'opera', 'Extensions');
-    default:
-      return '';
-  }
-}
-
-/**
- * Get the URL to the extension in the browser's store
- */
-function getBrowserStoreUrl(
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera',
-  extensionId: string
-): string {
-  switch (browser) {
-    case 'chrome':
-      return `https://chrome.google.com/webstore/detail/${extensionId}`;
-    case 'firefox':
-      return `https://addons.mozilla.org/en-US/firefox/addon/${extensionId}/`;
-    case 'safari':
-      return `https://apps.apple.com/us/app/${extensionId}`;
-    case 'edge':
-      return `https://microsoftedge.microsoft.com/addons/detail/${extensionId}`;
-    case 'opera':
-      return `https://addons.opera.com/en/extensions/details/${extensionId}/`;
-    default:
-      return '';
-  }
-}
-
-/**
- * Get the latest version of a browser extension
- */
-async function getLatestExtensionVersion(
-  extensionId: string,
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera'
-): Promise<string | null> {
-  // In a real implementation, this would query the appropriate extension stores
-  // For this example, we'll return mock data
-  return '2.0.0'; // Mock version for demonstration
-}
-
-/**
- * Check if an extension has been removed from the store
- */
-async function checkExtensionRemovedFromStore(
-  storeUrl: string,
-  timeoutMs: number
-): Promise<boolean> {
-  // In a real implementation, this would make a request to the store URL
-  // and check for 404 or other indicators that the extension was removed
-  return false; // Mock result for demonstration
-}
-
-/**
- * Get vulnerabilities for a browser extension
+ * Get vulnerabilities for an extension version
  */
 async function getExtensionVulnerabilities(
   extensionId: string,
   version: string,
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera'
+  vulnerabilityDatabase: Record<string, ExtensionVulnerability[]>
 ): Promise<VulnerabilityInfo[]> {
-  // In a real implementation, this would query security advisories
-  // For this example, we'll return mock data for a specific extension
-  if (browser === 'chrome' && extensionId === 'mafpmfcccpbjnhfhjnllmmalhifmlcie') {
-    return [{
-      id: 'EXT-2023-001',
-      severity: 'high',
-      title: 'Data Exfiltration Vulnerability',
-      description: 'This extension version contains a vulnerability that could allow malicious websites to access sensitive data.',
-      infoUrl: 'https://example.com/advisories/EXT-2023-001',
-      publishedDate: new Date('2023-06-15'),
-      affectedVersions: '< 1.5.0',
-      patchedVersions: '>= 1.5.0',
-      recommendation: 'Update to version 1.5.0 or later.'
-    }];
+  try {
+    // Get vulnerabilities for this extension
+    const extensionVulnerabilities = vulnerabilityDatabase[extensionId] || [];
+    
+    // Filter to those affecting this version
+    const affectingVulnerabilities = extensionVulnerabilities.filter(v => {
+      // Check if this version is in the affected range
+      return v.affectedVersions.includes(version) || 
+             (v.affectedVersions.includes('<') && compareVersions(version, v.affectedVersions.replace('<', '')) < 0);
+    });
+    
+    // Map to VulnerabilityInfo format
+    return affectingVulnerabilities.map(v => ({
+      id: `${extensionId}-${v.title.replace(/\s+/g, '-').toLowerCase()}`,
+      severity: v.severity,
+      title: v.title,
+      description: v.description,
+      infoUrl: v.infoUrl,
+      publishedDate: v.publishedDate,
+      affectedVersions: v.affectedVersions,
+      recommendation: v.recommendation
+    }));
+  } catch (error) {
+    log.warn(`Error getting vulnerabilities for extension ${extensionId} ${version}`, { error });
+    return [];
   }
-  
-  return [];
-}
-
-/**
- * Get compatibility issues for a browser extension
- */
-async function getExtensionCompatibilityIssues(
-  extensionId: string,
-  version: string,
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera'
-): Promise<VulnerabilityInfo[]> {
-  // In a real implementation, this would check if the extension is compatible with the latest browser version
-  // For this example, we'll return mock data for a specific extension
-  if (browser === 'firefox' && extensionId === 'some-legacy-extension') {
-    return [{
-      id: 'COMPAT-2023-001',
-      severity: 'medium',
-      title: 'Manifest V3 Compatibility Issue',
-      description: 'This extension uses APIs that are deprecated in the latest browser version.',
-      infoUrl: 'https://example.com/compatibility-issues/COMPAT-2023-001',
-      publishedDate: new Date('2023-03-10'),
-      affectedVersions: '< 2.0.0',
-      patchedVersions: '>= 2.0.0',
-      recommendation: 'Update to version 2.0.0 or later which supports Manifest V3.'
-    }];
-  }
-  
-  return [];
 }
