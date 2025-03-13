@@ -2,79 +2,100 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import { glob } from 'glob';
-import * as child_process from 'child_process';
+import * as semver from 'semver';
 import { log } from '../utils/logging';
 import { FrameworkIssue } from '../types/scanning';
-import { compareVersions } from '../utils/scanner-utils';
+import { detectTechnology } from '../utils/technology-detection';
 
 const readFileAsync = promisify(fs.readFile);
-const execAsync = promisify(child_process.exec);
 
 /**
  * Configuration for framework scanning
  */
 export interface FrameworkScannerConfig {
   // Root directory to scan
-  rootDirectory: string;
+  rootDir: string;
   
-  // Which framework types to check
-  frameworkTypes: Array<
-    'nodejs' | 'python' | 'ruby' | 'php' | 'java' | 'dotnet' | 
-    'go' | 'rust' | 'react' | 'angular' | 'vue' | 'django' | 
-    'spring' | 'laravel' | 'rails' | 'flutter' | 'docker' | 'kubernetes'
-  >;
+  // File patterns to include
+  includePatterns: string[];
   
-  // Whether to use offline mode (don't make API calls)
-  offlineMode: boolean;
+  // File patterns to exclude
+  excludePatterns: string[];
   
-  // Whether to check for security vulnerabilities
-  checkVulnerabilities: boolean;
+  // Specific frameworks to scan for, empty means all
+  frameworks?: string[];
   
-  // Skip frameworks with specific IDs
-  ignoreFrameworks?: string[];
+  // Whether to include language scanning
+  includeLanguages: boolean;
+  
+  // Whether to include runtime scanning
+  includeRuntimes: boolean;
+  
+  // Whether to include database technology scanning
+  includeDatabases: boolean;
+  
+  // Whether to include infrastructure scanning
+  includeInfrastructure: boolean;
+  
+  // Minimum version age in days to consider outdated
+  minAgeForOutdated: number;
   
   // API timeout in milliseconds
   apiTimeoutMs: number;
   
   // Directory to store cached data
   cacheDir?: string;
+  
+  // Custom technology signatures file path
+  customSignaturesPath?: string;
+  
+  // Ignore certain technologies
+  ignoreTechnologies?: string[];
 }
 
 /**
- * Detected framework
+ * Technology detection result
  */
-interface DetectedFramework {
+interface DetectedTechnology {
   name: string;
-  type: string;
-  version: string;
-  location: string;
-  detectionMethod: 'file' | 'command' | 'package';
-  supportStatus?: 'supported' | 'maintenance' | 'deprecated' | 'eol';
-  supportEndDate?: Date;
+  version?: string;
+  type: 'framework' | 'language' | 'runtime' | 'database' | 'infrastructure' | 'other';
+  file: string;
+  signature: string;
+  confidence: number;
+  matcher?: 'regex' | 'ast' | 'content' | 'filename' | 'manifest';
+  lineNumber?: number;
 }
 
 /**
- * Framework version info
+ * Technology information from repository
  */
-interface FrameworkVersionInfo {
+interface TechnologyInfo {
   latestVersion: string;
-  latestReleaseDate?: Date;
-  latestLtsVersion?: string;
+  isOutdated: boolean;
   isDeprecated: boolean;
-  supportEndDate?: Date;
-  supportStatus: 'supported' | 'maintenance' | 'deprecated' | 'eol';
-  knownVulnerabilities: Array<{
-    id: string;
+  hasSecurityIssues: boolean;
+  endOfLifeDate?: Date;
+  endOfSupportDate?: Date;
+  securityIssues?: Array<{
     severity: 'low' | 'medium' | 'high' | 'critical';
     description: string;
     fixedInVersion?: string;
+    cve?: string;
   }>;
-  migrationGuideUrl?: string;
-  releaseNotesUrl?: string;
+  repo?: string;
+  license?: string;
+  lastRelease?: Date;
+  releaseFrequency?: number; // average days between releases
+  popularityMetric?: number; // a relative popularity score
+  migrationPath?: string;
+  migrationDifficulty?: 'easy' | 'medium' | 'hard' | 'very-hard';
+  alternatives?: string[];
+  businessImpact?: number; // 1-5 where 5 is highest
 }
 
 /**
- * Scanner for detecting outdated frameworks and languages
+ * Scanner for detecting frameworks and technologies
  */
 export async function scanFrameworks(
   config: FrameworkScannerConfig
@@ -83,116 +104,97 @@ export async function scanFrameworks(
     log.info('Starting framework scanner');
     const issues: FrameworkIssue[] = [];
     
-    // Detect frameworks
-    const frameworks = await detectFrameworks(config);
-    log.info(`Found ${frameworks.length} frameworks/languages`);
+    // Find files to scan
+    const filePaths = await findFilesToScan(config);
+    log.info(`Found ${filePaths.length} files to scan`);
     
-    // Check each framework
-    for (const framework of frameworks) {
+    // Track all detected technologies to consolidate later
+    const detectedTechnologies: DetectedTechnology[] = [];
+    
+    // Process each file
+    for (const filePath of filePaths) {
       try {
-        // Skip ignored frameworks
-        if (config.ignoreFrameworks && config.ignoreFrameworks.includes(framework.name)) {
-          log.info(`Skipping ignored framework: ${framework.name}`);
+        // Read the file content
+        const content = await readFileAsync(filePath, 'utf8');
+        
+        // Detect technologies in this file
+        const technologies = await detectTechnologiesInFile(
+          filePath,
+          content,
+          config
+        );
+        
+        detectedTechnologies.push(...technologies);
+      } catch (fileError) {
+        log.warn(`Error processing file: ${filePath}`, { error: fileError });
+      }
+    }
+    
+    // Consolidate technologies (merge duplicates, keeping track of files)
+    const consolidatedTechs = consolidateTechnologies(detectedTechnologies);
+    log.info(`Found ${consolidatedTechs.length} unique technologies in codebase`);
+    
+    // Get technology information and create issues
+    for (const tech of consolidatedTechs) {
+      try {
+        // Skip ignored technologies
+        if (config.ignoreTechnologies && config.ignoreTechnologies.includes(tech.name)) {
+          log.info(`Skipping ignored technology: ${tech.name}`);
           continue;
         }
         
-        // Get framework information
-        const frameworkInfo = await getFrameworkInfo(
-          framework.name,
-          framework.type,
-          framework.version,
-          config.offlineMode,
-          config.checkVulnerabilities,
+        // Get technology information
+        const techInfo = await getTechnologyInfo(
+          tech.name,
+          tech.version,
+          tech.type,
+          config.apiTimeoutMs,
           config.cacheDir
         );
         
-        // Check if outdated
-        const isOutdated = compareVersions(framework.version, frameworkInfo.latestVersion) < 0;
-        
-        // Check if end-of-life
-        const isEol = frameworkInfo.supportStatus === 'eol' || 
-          (frameworkInfo.supportEndDate && frameworkInfo.supportEndDate < new Date());
-        
-        // Only create an issue if there's at least one problem
-        if (isOutdated || isEol || frameworkInfo.isDeprecated || 
-            frameworkInfo.knownVulnerabilities.length > 0) {
+        // Create issue if needed
+        if (techInfo.isOutdated || techInfo.isDeprecated || techInfo.hasSecurityIssues ||
+            (techInfo.endOfLifeDate && techInfo.endOfLifeDate < new Date()) ||
+            (techInfo.endOfSupportDate && techInfo.endOfSupportDate < new Date())) {
           
           // Create the issue
           const issue: FrameworkIssue = {
-            name: framework.name,
-            type: framework.type,
-            currentVersion: framework.version,
-            latestVersion: frameworkInfo.latestVersion,
-            latestLtsVersion: frameworkInfo.latestLtsVersion,
-            location: framework.location,
-            isOutdated,
-            isDeprecated: frameworkInfo.isDeprecated,
-            isEol,
-            supportStatus: frameworkInfo.supportStatus,
-            supportEndDate: frameworkInfo.supportEndDate,
-            detectedAt: new Date()
+            detectedAt: new Date(),
+            name: tech.name,
+            currentVersion: tech.version || 'unknown',
+            latestVersion: techInfo.latestVersion,
+            type: tech.type,
+            files: tech.files,
+            isOutdated: techInfo.isOutdated,
+            isDeprecated: techInfo.isDeprecated,
+            hasSecurityIssues: techInfo.hasSecurityIssues,
+            endOfLifeDate: techInfo.endOfLifeDate,
+            endOfSupportDate: techInfo.endOfSupportDate,
+            usageCount: tech.files.length,
+            license: techInfo.license,
+            repo: techInfo.repo,
+            businessImpact: techInfo.businessImpact,
+            migrationPath: techInfo.migrationPath,
+            tags: generateTags(tech, techInfo),
+            recommendation: generateRecommendation(tech, techInfo)
           };
           
-          // Add vulnerability info if any exist
-          if (frameworkInfo.knownVulnerabilities.length > 0) {
-            issue.vulnerabilities = frameworkInfo.knownVulnerabilities.map(v => ({
-              id: v.id,
-              severity: v.severity,
-              description: v.description,
-              fixedInVersion: v.fixedInVersion
-            }));
+          // Add security issues if any
+          if (techInfo.securityIssues?.length) {
+            issue.securityIssues = techInfo.securityIssues;
           }
           
-          // Add migration information if available
-          if (frameworkInfo.migrationGuideUrl) {
-            issue.migrationGuideUrl = frameworkInfo.migrationGuideUrl;
-          }
-          
-          if (frameworkInfo.releaseNotesUrl) {
-            issue.releaseNotesUrl = frameworkInfo.releaseNotesUrl;
-          }
-          
-          // Calculate business impact
-          issue.businessImpact = calculateBusinessImpact(
-            framework.name,
-            framework.type,
-            isOutdated,
-            isEol,
-            frameworkInfo.isDeprecated,
-            frameworkInfo.knownVulnerabilities.length > 0
+          // Calculate update effort score
+          issue.updateEffort = calculateUpdateEffort(
+            tech, 
+            techInfo
           );
           
-          // Calculate migration difficulty
-          issue.migrationEffort = calculateMigrationEffort(
-            framework.name,
-            framework.type,
-            framework.version,
-            frameworkInfo.latestVersion
-          );
-          
-          // Generate recommendation
-          issue.recommendation = generateRecommendation(
-            framework,
-            frameworkInfo,
-            isOutdated,
-            isEol
-          );
-          
-          // Add appropriate tags
-          issue.tags = generateTags(
-            framework.type,
-            isOutdated,
-            isEol,
-            frameworkInfo.isDeprecated,
-            frameworkInfo.knownVulnerabilities.length > 0
-          );
-          
-          // Add to issues list
           issues.push(issue);
-          log.info(`Added issue for framework ${framework.name} ${framework.version}`);
+          log.info(`Added issue for technology ${tech.name} ${tech.version || 'unknown'}`);
         }
-      } catch (fwError) {
-        log.warn(`Error processing framework: ${framework.name}`, { error: fwError });
+      } catch (techError) {
+        log.warn(`Error processing technology: ${tech.name}`, { error: techError });
       }
     }
     
@@ -205,435 +207,633 @@ export async function scanFrameworks(
 }
 
 /**
- * Detect frameworks in a project
+ * Find files to scan based on configuration
  */
-async function detectFrameworks(
+async function findFilesToScan(
   config: FrameworkScannerConfig
-): Promise<DetectedFramework[]> {
+): Promise<string[]> {
   try {
-    const frameworks: DetectedFramework[] = [];
-    const rootDir = config.rootDirectory;
+    const allFiles: string[] = [];
     
-    // Detect frameworks based on type
-    for (const frameworkType of config.frameworkTypes) {
-      try {
-        log.info(`Detecting ${frameworkType} frameworks`);
-        
-        switch (frameworkType) {
-          case 'nodejs':
-            // Check for package.json
-            const packageJsonFiles = await glob(path.join(rootDir, '**/package.json'), {
-              ignore: ['**/node_modules/**', '**/.git/**']
-            });
-            
-            for (const packageJsonFile of packageJsonFiles) {
-              try {
-                const content = await readFileAsync(packageJsonFile, 'utf8');
-                const packageJson = JSON.parse(content);
-                
-                // Add Node.js as a framework
-                try {
-                  // Try to detect Node.js version
-                  const { stdout } = await execAsync('node --version');
-                  const nodeVersion = stdout.trim().replace(/^v/, '');
-                  
-                  frameworks.push({
-                    name: 'Node.js',
-                    type: 'nodejs',
-                    version: nodeVersion,
-                    location: packageJsonFile,
-                    detectionMethod: 'command'
-                  });
-                } catch (nodeError) {
-                  // If we can't detect Node.js version, use engines from package.json
-                  if (packageJson.engines && packageJson.engines.node) {
-                    const engineVersion = packageJson.engines.node.replace(/[^0-9.]/g, '');
-                    
-                    frameworks.push({
-                      name: 'Node.js',
-                      type: 'nodejs',
-                      version: engineVersion || '0.0.0',
-                      location: packageJsonFile,
-                      detectionMethod: 'package'
-                    });
-                  }
-                }
-                
-                // Detect frameworks from dependencies
-                const frameworkDeps = [
-                  { name: 'React', deps: ['react', 'react-dom'] },
-                  { name: 'Angular', deps: ['@angular/core'] },
-                  { name: 'Vue.js', deps: ['vue'] },
-                  { name: 'Express', deps: ['express'] },
-                  { name: 'Next.js', deps: ['next'] },
-                  { name: 'NestJS', deps: ['@nestjs/core'] },
-                  { name: 'Gatsby', deps: ['gatsby'] }
-                ];
-                
-                const allDeps = { 
-                  ...(packageJson.dependencies || {}), 
-                  ...(packageJson.devDependencies || {}) 
-                };
-                
-                for (const framework of frameworkDeps) {
-                  const depKey = framework.deps.find(dep => allDeps[dep]);
-                  
-                  if (depKey) {
-                    frameworks.push({
-                      name: framework.name,
-                      type: framework.name.toLowerCase().replace(/\.js$/, ''),
-                      version: allDeps[depKey].replace(/[^0-9.]/g, ''),
-                      location: packageJsonFile,
-                      detectionMethod: 'package'
-                    });
-                  }
-                }
-              } catch (fileError) {
-                log.warn(`Error processing package.json: ${packageJsonFile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          case 'python':
-            // Detect Python version
-            try {
-              const { stdout } = await execAsync('python --version 2>&1');
-              const pythonVersion = stdout.trim().replace(/^Python\s+/i, '');
-              
-              frameworks.push({
-                name: 'Python',
-                type: 'python',
-                version: pythonVersion,
-                location: rootDir,
-                detectionMethod: 'command'
-              });
-            } catch (pythonError) {
-              log.warn('Unable to detect Python version', { error: pythonError });
-            }
-            
-            // Check for requirements.txt to detect frameworks
-            const requirementsFiles = await glob(path.join(rootDir, '**/requirements*.txt'), {
-              ignore: ['**/venv/**', '**/.git/**', '**/.env/**']
-            });
-            
-            for (const requirementsFile of requirementsFiles) {
-              try {
-                const content = await readFileAsync(requirementsFile, 'utf8');
-                const lines = content.split('\n');
-                
-                // Common Python frameworks
-                const frameworkDetectors = [
-                  { name: 'Django', pattern: /^django==?([\d.]+)/i },
-                  { name: 'Flask', pattern: /^flask==?([\d.]+)/i },
-                  { name: 'FastAPI', pattern: /^fastapi==?([\d.]+)/i },
-                  { name: 'Pyramid', pattern: /^pyramid==?([\d.]+)/i },
-                  { name: 'SQLAlchemy', pattern: /^sqlalchemy==?([\d.]+)/i }
-                ];
-                
-                for (const line of lines) {
-                  for (const detector of frameworkDetectors) {
-                    const match = line.match(detector.pattern);
-                    
-                    if (match) {
-                      frameworks.push({
-                        name: detector.name,
-                        type: detector.name.toLowerCase(),
-                        version: match[1] || '0.0.0',
-                        location: requirementsFile,
-                        detectionMethod: 'file'
-                      });
-                    }
-                  }
-                }
-              } catch (fileError) {
-                log.warn(`Error processing requirements file: ${requirementsFile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          case 'java':
-            // Check for pom.xml (Maven)
-            const pomFiles = await glob(path.join(rootDir, '**/pom.xml'), {
-              ignore: ['**/target/**', '**/.git/**']
-            });
-            
-            for (const pomFile of pomFiles) {
-              try {
-                const content = await readFileAsync(pomFile, 'utf8');
-                
-                // Detect Java version
-                const javaVersionMatch = content.match(/<java.version>([\d.]+)<\/java.version>/);
-                if (javaVersionMatch) {
-                  frameworks.push({
-                    name: 'Java',
-                    type: 'java',
-                    version: javaVersionMatch[1],
-                    location: pomFile,
-                    detectionMethod: 'file'
-                  });
-                }
-                
-                // Detect Spring Boot
-                const springBootMatch = content.match(/<spring-boot.version>([\d.]+)<\/spring-boot.version>/) || 
-                                        content.match(/<version>([\d.]+)<\/version>[^<]*<artifactId>spring-boot/);
-                if (springBootMatch) {
-                  frameworks.push({
-                    name: 'Spring Boot',
-                    type: 'spring',
-                    version: springBootMatch[1],
-                    location: pomFile,
-                    detectionMethod: 'file'
-                  });
-                }
-              } catch (fileError) {
-                log.warn(`Error processing pom.xml: ${pomFile}`, { error: fileError });
-              }
-            }
-            
-            // Check for build.gradle (Gradle)
-            const gradleFiles = await glob(path.join(rootDir, '**/build.gradle*'), {
-              ignore: ['**/build/**', '**/.git/**']
-            });
-            
-            for (const gradleFile of gradleFiles) {
-              try {
-                const content = await readFileAsync(gradleFile, 'utf8');
-                
-                // Detect Java version
-                const javaVersionMatch = content.match(/sourceCompatibility\s*=\s*['"]([\d.]+)['"]/);
-                if (javaVersionMatch) {
-                  frameworks.push({
-                    name: 'Java',
-                    type: 'java',
-                    version: javaVersionMatch[1],
-                    location: gradleFile,
-                    detectionMethod: 'file'
-                  });
-                }
-                
-                // Detect Spring Boot
-                const springBootMatch = content.match(/spring-boot[^\n]*:([\d.]+)/);
-                if (springBootMatch) {
-                  frameworks.push({
-                    name: 'Spring Boot',
-                    type: 'spring',
-                    version: springBootMatch[1],
-                    location: gradleFile,
-                    detectionMethod: 'file'
-                  });
-                }
-              } catch (fileError) {
-                log.warn(`Error processing gradle file: ${gradleFile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          case 'php':
-            // Check for composer.json
-            const composerFiles = await glob(path.join(rootDir, '**/composer.json'), {
-              ignore: ['**/vendor/**', '**/.git/**']
-            });
-            
-            for (const composerFile of composerFiles) {
-              try {
-                const content = await readFileAsync(composerFile, 'utf8');
-                const composerJson = JSON.parse(content);
-                
-                // Detect PHP version
-                if (composerJson.require && composerJson.require.php) {
-                  const phpVersion = composerJson.require.php.replace(/[^\d.]/g, '');
-                  
-                  frameworks.push({
-                    name: 'PHP',
-                    type: 'php',
-                    version: phpVersion,
-                    location: composerFile,
-                    detectionMethod: 'file'
-                  });
-                }
-                
-                // Detect Laravel
-                if (composerJson.require && composerJson.require['laravel/framework']) {
-                  const laravelVersion = composerJson.require['laravel/framework'].replace(/[^\d.]/g, '');
-                  
-                  frameworks.push({
-                    name: 'Laravel',
-                    type: 'laravel',
-                    version: laravelVersion,
-                    location: composerFile,
-                    detectionMethod: 'file'
-                  });
-                }
-              } catch (fileError) {
-                log.warn(`Error processing composer.json: ${composerFile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          case 'docker':
-            // Check for Dockerfile
-            const dockerfiles = await glob(path.join(rootDir, '**/Dockerfile*'), {
-              ignore: ['**/node_modules/**', '**/.git/**']
-            });
-            
-            for (const dockerfile of dockerfiles) {
-              try {
-                const content = await readFileAsync(dockerfile, 'utf8');
-                
-                // Detect Docker base image version
-                const fromMatch = content.match(/FROM\s+([\w\-/.]+):(\w+)/);
-                if (fromMatch) {
-                  const baseImage = fromMatch[1];
-                  const baseVersion = fromMatch[2];
-                  
-                  frameworks.push({
-                    name: `Docker (${baseImage})`,
-                    type: 'docker',
-                    version: baseVersion,
-                    location: dockerfile,
-                    detectionMethod: 'file'
-                  });
-                }
-              } catch (fileError) {
-                log.warn(`Error processing Dockerfile: ${dockerfile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          case 'kubernetes':
-            // Check for Kubernetes manifests
-            const k8sFiles = await glob(path.join(rootDir, '**/*.{yaml,yml}'), {
-              ignore: ['**/node_modules/**', '**/.git/**']
-            });
-            
-            for (const k8sFile of k8sFiles) {
-              try {
-                const content = await readFileAsync(k8sFile, 'utf8');
-                
-                // Very basic check for Kubernetes manifests (apiVersion)
-                if (content.includes('apiVersion:')) {
-                  const apiVersionMatch = content.match(/apiVersion:\s*([\w./]+)/);
-                  
-                  if (apiVersionMatch) {
-                    const apiVersion = apiVersionMatch[1];
-                    
-                    // Simplified - in a real implementation we would parse YAML properly
-                    frameworks.push({
-                      name: 'Kubernetes API',
-                      type: 'kubernetes',
-                      version: apiVersion,
-                      location: k8sFile,
-                      detectionMethod: 'file'
-                    });
-                  }
-                }
-              } catch (fileError) {
-                log.warn(`Error processing K8s file: ${k8sFile}`, { error: fileError });
-              }
-            }
-            break;
-            
-          // Add more framework types as needed
-          default:
-            log.info(`Framework type not fully implemented: ${frameworkType}`);
-            break;
+    for (const pattern of config.includePatterns) {
+      const matchedFiles = await glob(
+        pattern, 
+        { 
+          cwd: config.rootDir,
+          ignore: config.excludePatterns,
+          absolute: true
         }
-      } catch (typeError) {
-        log.error(`Error scanning ${frameworkType} frameworks`, { error: typeError });
-      }
+      );
+      
+      allFiles.push(...matchedFiles);
     }
     
-    return frameworks;
+    return [...new Set(allFiles)]; // Remove duplicates
   } catch (error) {
-    log.error('Error detecting frameworks', { error });
+    log.error('Error finding files to scan', { error });
     return [];
   }
 }
 
 /**
- * Get framework information from registry or cache
+ * Detect technologies in a single file
  */
-async function getFrameworkInfo(
+async function detectTechnologiesInFile(
+  filePath: string,
+  content: string,
+  config: FrameworkScannerConfig
+): Promise<DetectedTechnology[]> {
+  try {
+    const fileExt = path.extname(filePath).toLowerCase();
+    const fileName = path.basename(filePath);
+    const detected: DetectedTechnology[] = [];
+    
+    // Skip binary files or very large files
+    if (content.length > 5 * 1024 * 1024 || isBinaryFile(content)) {
+      return [];
+    }
+    
+    // Check for special manifest files
+    if (isManifestFile(filePath)) {
+      const manifestTechs = await detectFromManifest(filePath, content);
+      detected.push(...manifestTechs);
+    }
+    
+    // Detect via technology detection utility
+    // This uses file extension, content patterns, and AST parsing
+    const detectedTechs = await detectTechnology(filePath, content, {
+      customSignaturesPath: config.customSignaturesPath,
+      includeFrameworks: true,
+      includeLanguages: config.includeLanguages,
+      includeRuntimes: config.includeRuntimes,
+      includeDatabases: config.includeDatabases,
+      includeInfrastructure: config.includeInfrastructure
+    });
+    
+    detected.push(...detectedTechs.map(dt => ({
+      name: dt.name,
+      version: dt.version,
+      type: mapTypeToCategory(dt.type),
+      file: filePath,
+      signature: dt.signature,
+      confidence: dt.confidence,
+      matcher: dt.matchType,
+      lineNumber: dt.lineNumber
+    })));
+    
+    return detected;
+  } catch (error) {
+    log.warn(`Error detecting technologies in ${filePath}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Check if a file is likely a binary file
+ * Very simple check that looks for null bytes in the first chunk
+ */
+function isBinaryFile(content: string): boolean {
+  // Check if the first 1000 characters contain a null byte
+  const sample = content.slice(0, 1000);
+  return sample.includes('\0');
+}
+
+/**
+ * Check if a file is a package manifest
+ */
+function isManifestFile(filePath: string): boolean {
+  const fileName = path.basename(filePath).toLowerCase();
+  
+  return [
+    'package.json',
+    'composer.json',
+    'pom.xml',
+    'build.gradle',
+    'build.gradle.kts',
+    'requirements.txt',
+    'pyproject.toml',
+    'gemfile',
+    'cargo.toml',
+    'go.mod',
+    'project.clj',
+    'mix.exs',
+    'yarn.lock',
+    'package-lock.json',
+    'bun.lockb',
+    'pubspec.yaml',
+    '.csproj',
+    '.fsproj'
+  ].some(manifest => fileName.includes(manifest.toLowerCase()));
+}
+
+/**
+ * Detect technologies from manifest files
+ */
+async function detectFromManifest(
+  filePath: string,
+  content: string
+): Promise<DetectedTechnology[]> {
+  try {
+    const fileName = path.basename(filePath).toLowerCase();
+    const detected: DetectedTechnology[] = [];
+    
+    if (fileName === 'package.json') {
+      // Parse JavaScript/Node.js package.json
+      const packageJson = JSON.parse(content);
+      
+      // Add the project framework/library itself
+      if (packageJson.name && packageJson.version) {
+        detected.push({
+          name: packageJson.name,
+          version: packageJson.version,
+          type: 'framework',
+          file: filePath,
+          signature: 'package.json name+version',
+          confidence: 1.0,
+          matcher: 'manifest'
+        });
+      }
+      
+      // Detect dependencies
+      for (const [depType, deps] of Object.entries({
+        dependencies: packageJson.dependencies || {},
+        devDependencies: packageJson.devDependencies || {},
+        peerDependencies: packageJson.peerDependencies || {},
+        optionalDependencies: packageJson.optionalDependencies || {}
+      })) {
+        for (const [name, version] of Object.entries(deps as Record<string, string>)) {
+          detected.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'framework',
+            file: filePath,
+            signature: `package.json ${depType}`,
+            confidence: 1.0,
+            matcher: 'manifest'
+          });
+        }
+      }
+      
+      // Add React if jsx or tsx is in the package.json config
+      if ((packageJson.babel?.presets?.includes('react') || 
+          packageJson.dependencies?.react ||
+          content.includes('"jsx"')) && 
+          !detected.some(d => d.name === 'react')) {
+        
+        const reactVersion = packageJson.dependencies?.react ||
+                            packageJson.peerDependencies?.react ||
+                            'unknown';
+        
+        detected.push({
+          name: 'react',
+          version: reactVersion.toString().replace(/[^0-9.]/g, ''),
+          type: 'framework',
+          file: filePath,
+          signature: 'package.json inferred',
+          confidence: 0.9,
+          matcher: 'manifest'
+        });
+      }
+    } else if (fileName === 'composer.json') {
+      // Parse PHP Composer.json
+      const composerJson = JSON.parse(content);
+      
+      // Add the project itself
+      if (composerJson.name && composerJson.version) {
+        detected.push({
+          name: composerJson.name,
+          version: composerJson.version,
+          type: 'framework',
+          file: filePath,
+          signature: 'composer.json name+version',
+          confidence: 1.0,
+          matcher: 'manifest'
+        });
+      }
+      
+      // Add PHP framework/version if specified
+      if (composerJson.require?.php) {
+        detected.push({
+          name: 'php',
+          version: composerJson.require.php.toString().replace(/[^0-9.]/g, ''),
+          type: 'language',
+          file: filePath,
+          signature: 'composer.json require.php',
+          confidence: 1.0,
+          matcher: 'manifest'
+        });
+      }
+      
+      // Detect dependencies
+      for (const [name, version] of Object.entries(composerJson.require || {})) {
+        if (name !== 'php') { // Skip PHP itself, already added
+          detected.push({
+            name,
+            version: version.toString().replace(/[^0-9.]/g, ''),
+            type: 'framework',
+            file: filePath,
+            signature: 'composer.json require',
+            confidence: 1.0,
+            matcher: 'manifest'
+          });
+        }
+      }
+    } else if (fileName === 'requirements.txt') {
+      // Parse Python requirements.txt
+      const lines = content.split('\n').map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'));
+      
+      for (const line of lines) {
+        // Basic format: package==version or package>=version
+        const match = line.match(/^([a-zA-Z0-9_.-]+)\s*([=><~!]+)\s*([0-9a-zA-Z.-]+)/);
+        if (match) {
+          const [_, name, operator, version] = match;
+          detected.push({
+            name,
+            version,
+            type: 'framework',
+            file: filePath,
+            signature: 'requirements.txt dependency',
+            confidence: 1.0,
+            matcher: 'manifest'
+          });
+        }
+      }
+    } else if (fileName === 'pyproject.toml') {
+      // Very basic TOML parsing for Python projects
+      const lines = content.split('\n');
+      let currentSection = '';
+      
+      for (const line of lines) {
+        // Section headers are in [brackets]
+        const sectionMatch = line.match(/^\[([^\]]+)\]/);
+        if (sectionMatch) {
+          currentSection = sectionMatch[1];
+          continue;
+        }
+        
+        // Look for dependencies in various sections
+        if (['project', 'tool.poetry.dependencies', 'dependencies', 'build-system.requires'].some(s => currentSection.includes(s))) {
+          const depMatch = line.match(/([a-zA-Z0-9_.-]+)\s*=\s*["']?([0-9a-zA-Z.-]+)["']?/);
+          if (depMatch) {
+            const [_, name, version] = depMatch;
+            detected.push({
+              name,
+              version,
+              type: 'framework',
+              file: filePath,
+              signature: `pyproject.toml ${currentSection}`,
+              confidence: 1.0,
+              matcher: 'manifest'
+            });
+          }
+        }
+      }
+    } else if (fileName === 'go.mod') {
+      // Parse Go modules
+      const lines = content.split('\n');
+      
+      // Extract module name
+      const moduleMatch = lines.find(line => line.startsWith('module '));
+      if (moduleMatch) {
+        const moduleName = moduleMatch.split(' ')[1].trim();
+        detected.push({
+          name: moduleName,
+          type: 'framework',
+          file: filePath,
+          signature: 'go.mod module',
+          confidence: 1.0,
+          matcher: 'manifest'
+        });
+      }
+      
+      // Extract Go version
+      const goMatch = lines.find(line => line.startsWith('go '));
+      if (goMatch) {
+        const goVersion = goMatch.split(' ')[1].trim();
+        detected.push({
+          name: 'go',
+          version: goVersion,
+          type: 'language',
+          file: filePath,
+          signature: 'go.mod go version',
+          confidence: 1.0,
+          matcher: 'manifest'
+        });
+      }
+      
+      // Extract dependencies
+      let inRequireBlock = false;
+      for (const line of lines) {
+        if (line.startsWith('require (')) {
+          inRequireBlock = true;
+          continue;
+        }
+        
+        if (inRequireBlock && line.startsWith(')')) {
+          inRequireBlock = false;
+          continue;
+        }
+        
+        // Check for single-line require
+        const singleRequireMatch = line.match(/^require\s+([^\s]+)\s+v([0-9.]+)/);
+        if (singleRequireMatch) {
+          detected.push({
+            name: singleRequireMatch[1],
+            version: singleRequireMatch[2],
+            type: 'framework',
+            file: filePath,
+            signature: 'go.mod require single',
+            confidence: 1.0,
+            matcher: 'manifest'
+          });
+          continue;
+        }
+        
+        // Check for require block entries
+        if (inRequireBlock) {
+          const blockRequireMatch = line.match(/\s+([^\s]+)\s+v([0-9.]+)/);
+          if (blockRequireMatch) {
+            detected.push({
+              name: blockRequireMatch[1],
+              version: blockRequireMatch[2],
+              type: 'framework',
+              file: filePath,
+              signature: 'go.mod require block',
+              confidence: 1.0,
+              matcher: 'manifest'
+            });
+          }
+        }
+      }
+    } else if (fileName === 'cargo.toml') {
+      // Very basic TOML parsing for Rust projects
+      const lines = content.split('\n');
+      let currentSection = '';
+      
+      for (const line of lines) {
+        // Section headers
+        const sectionMatch = line.match(/^\[([^\]]+)\]/);
+        if (sectionMatch) {
+          currentSection = sectionMatch[1];
+          continue;
+        }
+        
+        // Package info
+        if (currentSection === 'package') {
+          const nameMatch = line.match(/^name\s*=\s*["']([^"']+)["']/);
+          const versionMatch = line.match(/^version\s*=\s*["']([^"']+)["']/);
+          
+          if (nameMatch) {
+            detected.push({
+              name: nameMatch[1],
+              version: versionMatch ? versionMatch[1] : undefined,
+              type: 'framework',
+              file: filePath,
+              signature: 'cargo.toml package',
+              confidence: 1.0,
+              matcher: 'manifest'
+            });
+          }
+        }
+        
+        // Dependencies
+        if (currentSection === 'dependencies' || currentSection.startsWith('dependencies.')) {
+          // Simple key = "version"
+          const simpleDepMatch = line.match(/^([a-zA-Z0-9_-]+)\s*=\s*["']([^"']+)["']/);
+          if (simpleDepMatch) {
+            detected.push({
+              name: simpleDepMatch[1],
+              version: simpleDepMatch[2],
+              type: 'framework',
+              file: filePath,
+              signature: `cargo.toml ${currentSection}`,
+              confidence: 1.0,
+              matcher: 'manifest'
+            });
+          }
+          
+          // Table format with version
+          const tableDepMatch = line.match(/^([a-zA-Z0-9_-]+)\s*\.version\s*=\s*["']([^"']+)["']/);
+          if (tableDepMatch) {
+            detected.push({
+              name: tableDepMatch[1],
+              version: tableDepMatch[2],
+              type: 'framework',
+              file: filePath,
+              signature: `cargo.toml ${currentSection} table`,
+              confidence: 1.0,
+              matcher: 'manifest'
+            });
+          }
+        }
+      }
+    }
+    
+    return detected;
+  } catch (error) {
+    log.warn(`Error parsing manifest file: ${filePath}`, { error });
+    return [];
+  }
+}
+
+/**
+ * Map general type to category
+ */
+function mapTypeToCategory(type: string): 'framework' | 'language' | 'runtime' | 'database' | 'infrastructure' | 'other' {
+  const typeMap: Record<string, 'framework' | 'language' | 'runtime' | 'database' | 'infrastructure' | 'other'> = {
+    'framework': 'framework',
+    'library': 'framework',
+    'language': 'language',
+    'runtime': 'runtime',
+    'database': 'database',
+    'infrastructure': 'infrastructure',
+    'tool': 'other',
+    'platform': 'infrastructure'
+  };
+  
+  return typeMap[type.toLowerCase()] || 'other';
+}
+
+/**
+ * Consolidate detected technologies from multiple files
+ */
+function consolidateTechnologies(
+  detectedTechnologies: DetectedTechnology[]
+): Array<DetectedTechnology & { files: string[] }> {
+  const techMap = new Map<string, DetectedTechnology & { files: string[] }>();
+  
+  // Group by name and type
+  for (const tech of detectedTechnologies) {
+    const key = `${tech.name}|${tech.type}`;
+    
+    if (!techMap.has(key)) {
+      techMap.set(key, {
+        ...tech,
+        files: [tech.file]
+      });
+    } else {
+      const existing = techMap.get(key)!;
+      
+      // Add file if not already included
+      if (!existing.files.includes(tech.file)) {
+        existing.files.push(tech.file);
+      }
+      
+      // Use the more specific version if available
+      if (tech.version && (!existing.version || 
+          (tech.confidence > existing.confidence) ||
+          (tech.matcher === 'manifest' && existing.matcher !== 'manifest'))) {
+        existing.version = tech.version;
+        existing.confidence = tech.confidence;
+        existing.matcher = tech.matcher;
+      }
+    }
+  }
+  
+  return Array.from(techMap.values());
+}
+
+/**
+ * Get technology information from repository or cache
+ */
+async function getTechnologyInfo(
   name: string,
-  type: string,
-  version: string,
-  offlineMode: boolean,
-  checkVulnerabilities: boolean,
+  version: string | undefined,
+  type: 'framework' | 'language' | 'runtime' | 'database' | 'infrastructure' | 'other',
+  timeoutMs: number,
   cacheDir?: string
-): Promise<FrameworkVersionInfo> {
+): Promise<TechnologyInfo> {
   // Check cache first
   if (cacheDir) {
-    const cacheFile = path.join(cacheDir, `framework-${type}-${name.replace(/\s+/g, '-').toLowerCase()}.json`);
+    const cacheFile = path.join(cacheDir, `tech-${type}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
     
     if (fs.existsSync(cacheFile)) {
       try {
         const cacheContent = await readFileAsync(cacheFile, 'utf8');
-        const cachedInfo = JSON.parse(cacheContent) as FrameworkVersionInfo;
-        log.info(`Loaded ${name} info from cache`);
+        const cachedInfo = JSON.parse(cacheContent) as TechnologyInfo;
+        log.info(`Loaded ${name} technology info from cache`);
         return cachedInfo;
       } catch (cacheError) {
-        log.warn(`Error reading framework cache for ${name}`, { error: cacheError });
+        log.warn(`Error reading technology cache for ${name}`, { error: cacheError });
       }
     }
   }
   
-  // If in offline mode and no cache, return placeholder data
-  if (offlineMode) {
-    log.info(`Offline mode enabled for ${name}, using placeholder data`);
-    return {
-      latestVersion: version, // Assume current version is latest
-      supportStatus: 'supported',
-      isDeprecated: false,
-      knownVulnerabilities: []
-    };
-  }
-  
-  // In a real implementation, we would query the framework registry
-  // For this example, we'll return mock data
+  // In a real implementation, we would query technology repositories
+  // For this example, we'll use mock data
   try {
-    // Mock registry query
-    log.info(`Querying registry for ${type} framework: ${name}@${version}`);
+    log.info(`Querying info for technology: ${name} ${version || 'unknown'} (${type})`);
     
-    // Generate mock data based on the framework name and version
-    const info: FrameworkVersionInfo = {
-      latestVersion: incrementVersion(version),
-      supportStatus: getSupportStatus(name, version),
-      isDeprecated: isDeprecated(name, version),
-      knownVulnerabilities: []
+    // Simulate API call delay
+    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 200));
+    
+    // Generate latest version
+    let latestVersion = version ? incrementVersion(version) : '1.0.0';
+    
+    // Set technology-specific values
+    let isDeprecated = false;
+    let releaseFrequency = 30 + Math.floor(Math.random() * 60); // days
+    let endOfLifeDate: Date | undefined = undefined;
+    let endOfSupportDate: Date | undefined = undefined;
+    let migrationPath: string | undefined = undefined;
+    let migrationDifficulty: 'easy' | 'medium' | 'hard' | 'very-hard' | undefined = undefined;
+    let alternatives: string[] | undefined = undefined;
+    
+    // Customize based on some known technology names
+    if (name.toLowerCase() === 'jquery') {
+      isDeprecated = true;
+      latestVersion = '3.6.4';
+      migrationPath = 'Migrate to native JavaScript or modern frameworks';
+      migrationDifficulty = 'medium';
+      alternatives = ['Vanilla JavaScript', 'React', 'Vue.js', 'Alpine.js'];
+    } else if (name.toLowerCase() === 'php' && version && semver.lt(version, '7.4.0')) {
+      isDeprecated = true;
+      latestVersion = '8.2.0';
+      endOfLifeDate = new Date('2022-11-28');
+      endOfSupportDate = new Date('2023-11-28');
+      migrationPath = 'Upgrade to PHP 8.x';
+      migrationDifficulty = 'medium';
+    } else if (name.toLowerCase() === 'python' && version && semver.lt(version, '3.7.0')) {
+      isDeprecated = true;
+      latestVersion = '3.11.0';
+      endOfLifeDate = new Date('2023-06-27');
+      endOfSupportDate = new Date('2023-06-27');
+      migrationPath = 'Upgrade to Python 3.10+';
+      migrationDifficulty = 'medium';
+    } else if (name.toLowerCase() === 'react' && version && semver.lt(version, '16.0.0')) {
+      isDeprecated = false;
+      latestVersion = '18.2.0';
+      migrationPath = 'Upgrade to React 18';
+      migrationDifficulty = 'medium';
+    } else if (name.toLowerCase() === 'angular.js') {
+      isDeprecated = true;
+      latestVersion = '1.8.3';
+      endOfLifeDate = new Date('2022-01-01');
+      endOfSupportDate = new Date('2022-01-01');
+      migrationPath = 'Migrate to Angular 2+';
+      migrationDifficulty = 'hard';
+      alternatives = ['Angular', 'React', 'Vue.js'];
+    } else if (name.toLowerCase() === 'node' && version && semver.lt(version, '16.0.0')) {
+      isDeprecated = version.startsWith('15') || version.startsWith('13');
+      latestVersion = '20.0.0';
+      if (semver.lt(version, '14.0.0')) {
+        endOfLifeDate = new Date('2023-04-30');
+        endOfSupportDate = new Date('2023-04-30');
+      }
+      migrationPath = 'Upgrade to Node.js 20 LTS';
+      migrationDifficulty = 'easy';
+    }
+    
+    // Calculate if outdated based on version difference
+    const isOutdated = version && latestVersion ?
+      compareVersions(latestVersion, version) > 0 : false;
+    
+    // Generate mock security issues for some percentage of technologies
+    const hasSecurityIssues = Math.random() < 0.15; // 15% chance
+    
+    // Calculate business impact based on usage, criticality of the technology
+    const businessImpact = Math.min(5, Math.ceil(Math.random() * 5));
+    
+    // Create the technology info
+    const info: TechnologyInfo = {
+      latestVersion,
+      isOutdated,
+      isDeprecated,
+      hasSecurityIssues,
+      endOfLifeDate,
+      endOfSupportDate,
+      license: getRandomLicense(),
+      repo: `https://github.com/org/${name.toLowerCase()}`,
+      lastRelease: new Date(Date.now() - Math.random() * 180 * 24 * 60 * 60 * 1000), // Up to 180 days ago
+      releaseFrequency,
+      popularityMetric: Math.random() * 100,
+      migrationPath,
+      migrationDifficulty,
+      alternatives,
+      businessImpact
     };
     
-    // Add LTS version for some frameworks
-    if (['Node.js', 'Angular', 'React', 'Spring Boot'].includes(name)) {
-      const parts = version.split('.');
-      if (parts.length > 0) {
-        const majorVersion = parseInt(parts[0], 10);
-        info.latestLtsVersion = `${majorVersion}.${Math.floor(Math.random() * 20)}.${Math.floor(Math.random() * 10)}`;
-      }
-    }
-    
-    // Add support end date for some frameworks
-    if (info.supportStatus !== 'supported') {
-      // Random date in past or future
-      const offset = info.supportStatus === 'eol' ? -1 : 1; // EOL dates are in the past
-      info.supportEndDate = new Date(Date.now() + offset * Math.random() * 365 * 24 * 60 * 60 * 1000);
-    }
-    
-    // Add vulnerabilities for some frameworks (for demo purposes)
-    if (checkVulnerabilities && (isVulnerable(name, version) || Math.random() < 0.2)) {
-      info.knownVulnerabilities = [
+    // Add security issues if flagged
+    if (info.hasSecurityIssues) {
+      info.securityIssues = [
         {
-          id: `CVE-2023-${Math.floor(Math.random() * 10000)}`,
           severity: getRandomSeverity(),
-          description: `Security vulnerability in ${name} ${version} that could lead to ${getRandomVulnerabilityType()}`,
-          fixedInVersion: info.latestVersion
+          description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
+          fixedInVersion: latestVersion,
+          cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
         }
       ];
-    }
-    
-    // Add migration guide URLs
-    if (info.isDeprecated || info.supportStatus === 'eol') {
-      info.migrationGuideUrl = getMigrationGuideUrl(name, version, info.latestVersion);
-      info.releaseNotesUrl = getReleaseNotesUrl(name, info.latestVersion);
+      
+      // Sometimes add a second vulnerability
+      if (Math.random() < 0.3) {
+        info.securityIssues.push({
+          severity: getRandomSeverity(),
+          description: `${getRandomVulnerabilityType()} vulnerability in ${name}`,
+          fixedInVersion: latestVersion,
+          cve: `CVE-${new Date().getFullYear()}-${Math.floor(Math.random() * 10000)}`
+        });
+      }
     }
     
     // Save to cache if cacheDir is provided
@@ -643,157 +843,212 @@ async function getFrameworkInfo(
           fs.mkdirSync(cacheDir, { recursive: true });
         }
         
-        const cacheFile = path.join(cacheDir, `framework-${type}-${name.replace(/\s+/g, '-').toLowerCase()}.json`);
+        const cacheFile = path.join(cacheDir, `tech-${type}-${name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`);
         await fs.promises.writeFile(cacheFile, JSON.stringify(info, null, 2), 'utf8');
-        log.info(`Cached ${name} info`);
+        log.info(`Cached ${name} technology info`);
       } catch (cacheError) {
-        log.warn(`Error writing framework cache for ${name}`, { error: cacheError });
+        log.warn(`Error writing technology cache for ${name}`, { error: cacheError });
       }
     }
     
     return info;
   } catch (error) {
-    log.error(`Error querying registry for ${name}`, { error });
+    log.error(`Error querying info for technology ${name}`, { error });
     
-    // Return basic info if registry query fails
+    // Return basic info if query fails
     return {
-      latestVersion: version,
-      supportStatus: 'supported',
+      latestVersion: version || '1.0.0',
+      isOutdated: false,
       isDeprecated: false,
-      knownVulnerabilities: []
+      hasSecurityIssues: false
     };
   }
 }
 
 /**
- * Calculate business impact score
+ * Calculate update effort score for a technology
  */
-function calculateBusinessImpact(
-  name: string,
-  type: string,
-  isOutdated: boolean,
-  isEol: boolean,
-  isDeprecated: boolean,
-  hasVulnerabilities: boolean
+function calculateUpdateEffort(
+  tech: DetectedTechnology & { files: string[] },
+  info: TechnologyInfo
 ): number {
-  let score = 1; // Start with minimal impact
+  let score = 3; // Default medium effort
   
-  if (isOutdated) score += 1;
-  if (isDeprecated) score += 1;
-  if (isEol) score += 2;
-  if (hasVulnerabilities) score += 2;
+  // More files using this technology means higher effort
+  if (tech.files.length > 100) score += 2;
+  else if (tech.files.length > 30) score += 1;
   
-  // Core languages and frameworks typically have higher impact
-  const criticalFrameworks = ['python', 'java', 'nodejs', 'php', 'react', 'angular', 'spring', 'django', 'kubernetes'];
-  if (criticalFrameworks.includes(type.toLowerCase())) {
-    score += 1;
+  // Migration difficulty if specified
+  if (info.migrationDifficulty) {
+    switch (info.migrationDifficulty) {
+      case 'easy': score -= 1; break;
+      case 'medium': break; // No change
+      case 'hard': score += 1; break;
+      case 'very-hard': score += 2; break;
+    }
   }
   
-  // Cap at maximum of 5
-  return Math.min(score, 5);
+  // Major version changes are harder
+  if (tech.version && info.latestVersion) {
+    const versionDiff = calculateVersionDifference(tech.version, info.latestVersion);
+    if (versionDiff.major >= 2) score += 1;
+    if (versionDiff.major >= 5) score += 1;
+  }
+  
+  // Types of technology affect difficulty
+  if (tech.type === 'framework') score += 1;
+  if (tech.type === 'language') score += 2;
+  if (tech.type === 'database') score += 2;
+  
+  // Deprecated technologies often have poor upgrade paths
+  if (info.isDeprecated) score += 1;
+  
+  // Bound the score between 1 and 5
+  return Math.max(1, Math.min(5, score));
 }
 
 /**
- * Calculate migration effort
- */
-function calculateMigrationEffort(
-  name: string,
-  type: string,
-  currentVersion: string,
-  latestVersion: string
-): number {
-  // Start with base effort
-  let effort = 1;
-  
-  // Major version changes are more effort
-  const currentMajor = parseInt(currentVersion.split('.')[0], 10) || 0;
-  const latestMajor = parseInt(latestVersion.split('.')[0], 10) || 0;
-  const majorVersionGap = Math.max(0, latestMajor - currentMajor);
-  
-  effort += majorVersionGap;
-  
-  // Some frameworks are harder to migrate
-  const complexFrameworks = {
-    'angular': 2, // Angular has historically difficult upgrades
-    'spring': 1.5,
-    'django': 1.2,
-    'kubernetes': 1.8,
-    'java': 1.5
-  };
-  
-  const frameworkComplexity = complexFrameworks[type.toLowerCase()] || 1;
-  effort *= frameworkComplexity;
-  
-  // Cap at maximum of 5
-  return Math.min(Math.round(effort), 5);
-}
-
-/**
- * Generate a recommendation
- */
-function generateRecommendation(
-  framework: DetectedFramework,
-  frameworkInfo: FrameworkVersionInfo,
-  isOutdated: boolean,
-  isEol: boolean
-): string {
-  const recommendations: string[] = [];
-  
-  if (frameworkInfo.knownVulnerabilities.length > 0) {
-    recommendations.push(
-      `Update ${framework.name} immediately from ${framework.version} to at least ${frameworkInfo.latestVersion} to address security vulnerabilities`
-    );
-  } else if (isEol) {
-    recommendations.push(
-      `Migrate ${framework.name} from end-of-life version ${framework.version} to version ${frameworkInfo.latestVersion}`
-    );
-  } else if (frameworkInfo.isDeprecated) {
-    recommendations.push(
-      `Plan migration from deprecated ${framework.name} ${framework.version} to ${frameworkInfo.latestVersion}`
-    );
-  } else if (isOutdated) {
-    recommendations.push(
-      `Update ${framework.name} from ${framework.version} to ${frameworkInfo.latestVersion}`
-    );
-  }
-  
-  if (frameworkInfo.migrationGuideUrl) {
-    recommendations.push(`Migration guide available at: ${frameworkInfo.migrationGuideUrl}`);
-  }
-  
-  if (recommendations.length === 0) {
-    recommendations.push(`No immediate action required for ${framework.name} ${framework.version}`);
-  }
-  
-  return recommendations.join('. ');
-}
-
-/**
- * Generate tags for categorizing issues
+ * Generate tags for a technology issue
  */
 function generateTags(
-  type: string,
-  isOutdated: boolean,
-  isEol: boolean,
-  isDeprecated: boolean,
-  hasVulnerabilities: boolean
+  tech: DetectedTechnology & { files: string[] },
+  info: TechnologyInfo
 ): string[] {
-  const tags: string[] = [type];
+  const tags: string[] = [tech.type];
   
-  if (isOutdated) tags.push('outdated');
-  if (isEol) tags.push('end-of-life');
-  if (isDeprecated) tags.push('deprecated');
-  if (hasVulnerabilities) tags.push('security');
+  if (info.isOutdated) tags.push('outdated');
+  if (info.isDeprecated) tags.push('deprecated');
+  if (info.hasSecurityIssues) tags.push('security-issue');
+  
+  if (info.endOfLifeDate) {
+    const now = new Date();
+    if (info.endOfLifeDate < now) {
+      tags.push('end-of-life');
+    } else if (info.endOfLifeDate.getTime() - now.getTime() < 180 * 24 * 60 * 60 * 1000) {
+      tags.push('approaching-eol'); // Within 180 days of EOL
+    }
+  }
+  
+  // Add severity tag for security issues
+  if (info.securityIssues?.length) {
+    const severities = info.securityIssues.map(issue => issue.severity);
+    if (severities.includes('critical')) tags.push('critical-severity');
+    else if (severities.includes('high')) tags.push('high-severity');
+    else if (severities.includes('medium')) tags.push('medium-severity');
+    else if (severities.includes('low')) tags.push('low-severity');
+  }
+  
+  // Add usage extent
+  if (tech.files.length > 100) tags.push('widespread-usage');
+  else if (tech.files.length > 30) tags.push('moderate-usage');
+  else tags.push('limited-usage');
+  
+  // Add migration difficulty if available
+  if (info.migrationDifficulty) {
+    tags.push(`migration-${info.migrationDifficulty}`);
+  }
+  
+  // Add license tag if available
+  if (info.license) {
+    tags.push(`license-${info.license.toLowerCase().replace(/[^a-z0-9]/g, '-')}`);
+  }
   
   return tags;
 }
 
 /**
- * Helper function to increment a version for demo purposes
+ * Generate a recommendation for the technology issue
+ */
+function generateRecommendation(
+  tech: DetectedTechnology & { files: string[] },
+  info: TechnologyInfo
+): string {
+  const recommendations: string[] = [];
+  
+  if (info.hasSecurityIssues) {
+    // Find the highest severity
+    const highestSeverity = info.securityIssues?.reduce(
+      (highest, current) => {
+        const severityRank = { 'low': 1, 'medium': 2, 'high': 3, 'critical': 4 };
+        const currentRank = severityRank[current.severity] || 0;
+        const highestRank = severityRank[highest] || 0;
+        return currentRank > highestRank ? current.severity : highest;
+      },
+      'low' as 'low' | 'medium' | 'high' | 'critical'
+    );
+    
+    recommendations.push(
+      `Update ${tech.name} immediately to fix ${highestSeverity} severity security ${info.securityIssues?.length === 1 ? 'issue' : 'issues'}`
+    );
+  } else if (info.endOfLifeDate && info.endOfLifeDate < new Date()) {
+    recommendations.push(
+      `Replace end-of-life technology ${tech.name} ${tech.version || ''}`
+    );
+    
+    if (info.migrationPath) {
+      recommendations.push(info.migrationPath);
+    }
+    
+    if (info.alternatives?.length) {
+      recommendations.push(
+        `Consider these alternatives: ${info.alternatives.join(', ')}`
+      );
+    }
+  } else if (info.isDeprecated) {
+    recommendations.push(
+      `Plan migration away from deprecated technology ${tech.name} ${tech.version || ''}`
+    );
+    
+    if (info.migrationPath) {
+      recommendations.push(info.migrationPath);
+    }
+    
+    if (info.alternatives?.length) {
+      recommendations.push(
+        `Consider these alternatives: ${info.alternatives.join(', ')}`
+      );
+    }
+  } else if (info.endOfSupportDate && info.endOfSupportDate.getTime() - new Date().getTime() < 180 * 24 * 60 * 60 * 1000) {
+    // Within 180 days of end of support
+    const daysToEOS = Math.ceil((info.endOfSupportDate.getTime() - new Date().getTime()) / (24 * 60 * 60 * 1000));
+    
+    recommendations.push(
+      `Update ${tech.name} ${tech.version || ''} within ${daysToEOS} days before end of support`
+    );
+    
+    if (info.migrationPath) {
+      recommendations.push(info.migrationPath);
+    }
+  } else if (info.isOutdated) {
+    recommendations.push(
+      `Update ${tech.name} from ${tech.version || 'unknown'} to ${info.latestVersion}`
+    );
+    
+    if (info.migrationPath) {
+      recommendations.push(info.migrationPath);
+    }
+  }
+  
+  // If we have no recommendations yet, add a general one
+  if (recommendations.length === 0) {
+    recommendations.push(
+      `No immediate actions needed for ${tech.name} ${tech.version || ''}`
+    );
+  }
+  
+  return recommendations.join('. ');
+}
+
+/* ---- Helper Functions ---- */
+
+/**
+ * Increment a version for demonstration purposes
  */
 function incrementVersion(version: string): string {
   try {
-    const parts = version.split('.');
+    // Clean up version string to ensure it's parseable
+    const cleanVersion = version.replace(/[^0-9.]/g, '');
+    const parts = cleanVersion.split('.');
     
     if (parts.length < 3) {
       // Ensure we have at least 3 parts
@@ -802,10 +1057,25 @@ function incrementVersion(version: string): string {
       }
     }
     
-    // Increment a random part
-    const partToIncrement = Math.floor(Math.random() * parts.length);
-    const partValue = parseInt(parts[partToIncrement], 10) || 0;
-    parts[partToIncrement] = String(partValue + 1 + Math.floor(Math.random() * 5));
+    // Randomly decide which part to increment
+    const random = Math.random();
+    let incrementIndex = 2; // Default to patch increment
+    
+    if (random < 0.1) {
+      // 10% chance of major version increment
+      incrementIndex = 0;
+    } else if (random < 0.3) {
+      // 20% chance of minor version increment
+      incrementIndex = 1;
+    }
+    
+    // Increment the selected part
+    parts[incrementIndex] = String(parseInt(parts[incrementIndex], 10) + 1);
+    
+    // Reset subsequent parts to 0
+    for (let i = incrementIndex + 1; i < parts.length; i++) {
+      parts[i] = '0';
+    }
     
     return parts.join('.');
   } catch (error) {
@@ -814,94 +1084,128 @@ function incrementVersion(version: string): string {
 }
 
 /**
- * Helper function to determine support status
+ * Compare two version strings
+ * Returns > 0 if version1 is greater, < 0 if version2 is greater, 0 if equal
  */
-function getSupportStatus(
-  name: string,
-  version: string
-): 'supported' | 'maintenance' | 'deprecated' | 'eol' {
-  // Mock logic to determine support status
-  const versionNumber = parseFloat(version) || 0;
-  
-  // For demo purposes - consider old versions as EOL
-  if (versionNumber < 1) {
-    return 'eol';
+function compareVersions(version1: string, version2: string): number {
+  try {
+    return semver.compare(
+      semver.coerce(version1)?.version || version1,
+      semver.coerce(version2)?.version || version2
+    );
+  } catch (error) {
+    // Fallback manual comparison if semver fails
+    const v1parts = version1.split('.').map(p => parseInt(p, 10) || 0);
+    const v2parts = version2.split('.').map(p => parseInt(p, 10) || 0);
+    
+    // Ensure both arrays have the same length
+    while (v1parts.length < v2parts.length) v1parts.push(0);
+    while (v2parts.length < v1parts.length) v2parts.push(0);
+    
+    // Compare each part
+    for (let i = 0; i < v1parts.length; i++) {
+      if (v1parts[i] > v2parts[i]) return 1;
+      if (v1parts[i] < v2parts[i]) return -1;
+    }
+    
+    return 0;
   }
-  
-  if (versionNumber < 2) {
-    return 'deprecated';
-  }
-  
-  if (versionNumber < 4) {
-    return 'maintenance';
-  }
-  
-  return 'supported';
 }
 
 /**
- * Helper function to determine if a framework is deprecated
+ * Calculate the difference between two versions
  */
-function isDeprecated(name: string, version: string): boolean {
-  // Mock logic to determine if deprecated
-  const versionNumber = parseFloat(version) || 0;
+function calculateVersionDifference(
+  currentVersion: string,
+  latestVersion: string
+): { major: number, minor: number, patch: number } {
+  try {
+    const current = semver.coerce(currentVersion);
+    const latest = semver.coerce(latestVersion);
+    
+    if (current && latest) {
+      return {
+        major: Math.max(0, latest.major - current.major),
+        minor: Math.max(0, latest.minor - current.minor),
+        patch: Math.max(0, latest.patch - current.patch)
+      };
+    }
+  } catch (error) {
+    // Proceed to fallback
+  }
   
-  // For demo purposes - consider old versions as deprecated
-  return versionNumber < 2 || name.toLowerCase().includes('deprecated');
+  // Fallback manual calculation
+  const current = currentVersion.split('.').map(p => parseInt(p, 10) || 0);
+  const latest = latestVersion.split('.').map(p => parseInt(p, 10) || 0);
+  
+  // Ensure both arrays have at least 3 elements
+  while (current.length < 3) current.push(0);
+  while (latest.length < 3) latest.push(0);
+  
+  return {
+    major: Math.max(0, latest[0] - current[0]),
+    minor: Math.max(0, latest[1] - current[1]),
+    patch: Math.max(0, latest[2] - current[2])
+  };
 }
 
 /**
- * Helper function to determine if a framework has vulnerabilities
- */
-function isVulnerable(name: string, version: string): boolean {
-  // Mock logic to determine if vulnerable
-  const versionNumber = parseFloat(version) || 0;
-  
-  // For demo purposes - consider old versions as vulnerable
-  return versionNumber < 1.5 || name.toLowerCase().includes('vulnerable');
-}
-
-/**
- * Helper function for getting a random severity
+ * Get a random severity level
  */
 function getRandomSeverity(): 'low' | 'medium' | 'high' | 'critical' {
-  const severities: Array<'low' | 'medium' | 'high' | 'critical'> = ['low', 'medium', 'high', 'critical'];
-  return severities[Math.floor(Math.random() * severities.length)];
+  const severities: Array<'low' | 'medium' | 'high' | 'critical'> = [
+    'low', 'medium', 'high', 'critical'
+  ];
+  const weights = [0.3, 0.4, 0.2, 0.1]; // More medium and low than high and critical
+  
+  const random = Math.random();
+  let sum = 0;
+  
+  for (let i = 0; i < weights.length; i++) {
+    sum += weights[i];
+    if (random < sum) {
+      return severities[i];
+    }
+  }
+  
+  return 'medium'; // Default fallback
 }
 
 /**
- * Helper function for getting a random vulnerability type
+ * Get a random vulnerability type
  */
 function getRandomVulnerabilityType(): string {
   const types = [
-    'remote code execution',
-    'privilege escalation',
-    'denial of service',
-    'information disclosure',
-    'cross-site scripting',
     'SQL injection',
-    'memory corruption',
-    'code injection'
+    'cross-site scripting',
+    'remote code execution',
+    'denial of service',
+    'buffer overflow',
+    'path traversal',
+    'privilege escalation',
+    'open redirect',
+    'insecure deserialization',
+    'information disclosure',
+    'authentication bypass',
+    'memory corruption'
   ];
   return types[Math.floor(Math.random() * types.length)];
 }
 
 /**
- * Get migration guide URL for a framework
+ * Get a random license
  */
-function getMigrationGuideUrl(name: string, fromVersion: string, toVersion: string): string {
-  // In a real implementation, this would return actual migration guide URLs
-  // For now, we'll return mock URLs
-  const nameSlug = name.toLowerCase().replace(/\s+/g, '-');
-  return `https://docs.example.com/${nameSlug}/migration-guide-${fromVersion}-to-${toVersion}`;
-}
-
-/**
- * Get release notes URL for a framework
- */
-function getReleaseNotesUrl(name: string, version: string): string {
-  // In a real implementation, this would return actual release notes URLs
-  // For now, we'll return mock URLs
-  const nameSlug = name.toLowerCase().replace(/\s+/g, '-');
-  return `https://docs.example.com/${nameSlug}/release-notes-${version}`;
+function getRandomLicense(): string {
+  const licenses = [
+    'MIT',
+    'Apache-2.0',
+    'GPL-3.0',
+    'BSD-3-Clause',
+    'ISC',
+    'LGPL-2.1',
+    'MPL-2.0',
+    'AGPL-3.0',
+    'Proprietary'
+  ];
+  return licenses[Math.floor(Math.random() * licenses.length)];
 }
