@@ -1,66 +1,46 @@
 /**
- * Types for code pattern scanning and technology currency monitoring
- */
-
-/**
- * Represents a pattern that should be detected in code as deprecated or outdated
+ * Represents a pattern to check for deprecated code/technology
  */
 export interface DeprecationPattern {
-  // Unique identifier for the pattern
+  // Unique identifier for this pattern
   id: string;
   
-  // The technology this pattern is related to (e.g., 'javascript', 'react', 'python')
+  // Technology category (e.g., 'javascript', 'react', 'python')
   technology: string;
   
-  // Short message describing the issue
+  // Short description of the issue
   message: string;
   
-  // Detailed description of why this pattern is problematic
+  // Detailed description of why this is deprecated/problematic
   description: string;
   
-  // Recommended remediation steps
+  // How to fix the issue
   remediation: string;
   
-  // URL to documentation about the issue
-  documentationUrl?: string;
+  // URL to documentation about this issue
+  documentationUrl: string;
   
-  // Regular expression to detect the pattern (if using regex matching)
-  regex?: string;
+  // Regular expression to match this pattern
+  regex: string;
   
-  // Regular expression to exclude false positives (optional)
+  // Optional regex to exclude certain matches
   exclusionRegex?: string;
   
-  // Severity level of the issue
+  // Severity of the issue
   severity: 'low' | 'medium' | 'high' | 'critical';
   
-  // File types this pattern applies to (e.g., 'js', 'py', 'java')
-  fileTypes: string[];
-  
-  // For AST-based patterns (JavaScript/TypeScript)
-  astNodeType?: string;
-  
-  // Conditions for AST-based matching
-  astCondition?: {
-    // For function calls: functionName or object.method
-    functionName?: string;
-    memberExpression?: string;
-    
-    // For imports
-    importSource?: string;
-    
-    // For JSX
-    jsxTag?: string;
-  };
+  // File types this pattern applies to
+  fileTypes: string[]; // e.g., ['js', 'jsx', 'ts', 'tsx']
 }
 
 /**
- * Represents an instance of a deprecated pattern found in code
+ * Represents a deprecated technology or pattern found in code
  */
 export interface CodePatternIssue {
-  // Unique identifier for this issue
+  // Unique identifier for this instance
   id: string;
   
-  // ID of the pattern that was matched
+  // ID of the pattern that matched
   patternId: string;
   
   // File where the issue was found
@@ -69,221 +49,234 @@ export interface CodePatternIssue {
   // Line number where the issue was found
   line: number;
   
-  // Column number where the issue was found
+  // Column where the issue was found
   column: number;
   
-  // Code snippet with the issue
+  // The actual code snippet containing the issue
   snippet: string;
   
-  // The exact text that matched the pattern
+  // The specific text that matched the pattern
   match: string;
   
-  // Message describing the issue
+  // Short description of the issue
   message: string;
   
-  // Detailed description
+  // Detailed description of why this is deprecated/problematic
   description: string;
   
-  // Suggested fix
+  // How to fix the issue
   remediation: string;
   
-  // URL to documentation
-  documentationUrl?: string;
+  // URL to documentation about this issue
+  documentationUrl: string;
   
-  // Severity level
+  // Severity of the issue
   severity: 'low' | 'medium' | 'high' | 'critical';
   
-  // Technology affected
+  // Technology category
   technology: string;
   
-  // When the issue was detected
+  // When this issue was detected
   detectedAt: Date;
 }
 
 /**
- * Information about a browser extension
+ * Represents a dependency with associated vulnerabilities and outdated status
  */
-export interface BrowserExtensionInfo {
-  // Extension name
+export interface DependencyIssue {
+  // Dependency name
   name: string;
   
-  // Extension ID
-  id: string;
-  
-  // Version of the extension
-  version: string;
-  
-  // Browsers this extension is installed on
-  browsers: Array<'chrome' | 'firefox' | 'safari' | 'edge'>;
-  
-  // When the extension was last updated
-  lastUpdated?: Date;
+  // Current version
+  currentVersion: string;
   
   // Latest available version
-  latestVersion?: string;
+  latestVersion: string;
   
-  // Is the extension outdated?
-  outdated: boolean;
+  // Is the dependency outdated?
+  isOutdated: boolean;
   
-  // Number of versions behind latest
-  versionsBehind?: number;
+  // Is this a direct or transitive dependency?
+  isDirect: boolean;
   
-  // Security issues associated with this extension
-  securityIssues?: ExtensionSecurityIssue[];
+  // Package ecosystem (npm, pip, maven, etc.)
+  ecosystem: string;
   
-  // Known compatibility issues
-  compatibilityIssues?: ExtensionCompatibilityIssue[];
+  // Path to the dependency definition file (package.json, requirements.txt, etc.)
+  definitionFile: string;
   
-  // Is the extension deprecated by the developer?
-  deprecated: boolean;
+  // Known vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
   
-  // URL to the extension in the store
-  storeUrl?: string;
+  // When this dependency was last updated
+  lastUpdated?: Date;
   
-  // Permissions used by the extension
-  permissions?: string[];
+  // When this dependency will reach end-of-life/end-of-support
+  eolDate?: Date;
   
-  // Active installation count
-  activeInstallations?: number;
+  // Whether this is a deprecated package
+  isDeprecated: boolean;
+  
+  // Deprecation message if available
+  deprecationMessage?: string;
+  
+  // When this issue was detected
+  detectedAt: Date;
+  
+  // Suggested fix (e.g., upgrade command)
+  suggestedFix?: string;
 }
 
 /**
- * Security issue related to a browser extension
+ * Represents vulnerability information for a dependency
  */
-export interface ExtensionSecurityIssue {
-  // Issue title
-  title: string;
-  
-  // Issue description
-  description: string;
-  
-  // Severity level
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  
-  // Is a fix available?
-  fixAvailable: boolean;
-  
-  // Version where the issue is fixed
-  fixedInVersion?: string;
-  
-  // URL to more information
-  referenceUrl?: string;
-  
-  // CVE identifier if applicable
-  cveId?: string;
-}
-
-/**
- * Compatibility issue related to a browser extension
- */
-export interface ExtensionCompatibilityIssue {
-  // Issue title
-  title: string;
-  
-  // Issue description
-  description: string;
-  
-  // Affected browser versions
-  affectedBrowsers: Array<{
-    browser: 'chrome' | 'firefox' | 'safari' | 'edge';
-    versions: string;
-  }>;
-  
-  // Is a fix available?
-  fixAvailable: boolean;
-  
-  // Version where the issue is fixed
-  fixedInVersion?: string;
-  
-  // Workaround if available
-  workaround?: string;
-}
-
-/**
- * Configuration for monitoring version control systems
- */
-export interface VersionControlMonitorConfig {
-  // Repositories to monitor
-  repositories: Array<{
-    url: string;
-    branch: string;
-    credentials?: {
-      type: 'ssh' | 'https';
-      username?: string;
-      token?: string;
-      sshKeyPath?: string;
-    };
-  }>;
-  
-  // Technologies to detect in commits
-  technologiesToMonitor: string[];
-  
-  // Patterns to detect outdated dependencies in commits
-  dependencyPatterns: Record<string, string>;
-  
-  // Notification configuration
-  notifications: {
-    enabled: boolean;
-    channels: Array<'email' | 'slack' | 'teams' | 'webhook'>;
-    recipients: string[];
-  };
-}
-
-/**
- * Alert generated from monitoring systems
- */
-export interface TechnologyAlert {
-  // Unique identifier
+export interface VulnerabilityInfo {
+  // Unique identifier (e.g., CVE ID)
   id: string;
   
-  // Alert type
-  type: 'deprecated' | 'outdated' | 'security' | 'end-of-life';
-  
-  // Technology name
-  technology: string;
-  
-  // Version affected
-  version: string;
-  
-  // Source of the alert
-  source: 'code-scan' | 'dependency-scan' | 'browser-extension' | 'api';
-  
-  // Severity level
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  
-  // Alert message
-  message: string;
+  // Vulnerability title
+  title: string;
   
   // Detailed description
   description: string;
   
-  // Recommended actions
-  recommendations: string[];
+  // Severity level
+  severity: 'low' | 'medium' | 'high' | 'critical';
   
-  // Files affected (if applicable)
-  affectedFiles?: string[];
+  // URL to vulnerability details
+  url: string;
   
-  // Components affected
-  affectedComponents?: string[];
+  // Versions affected
+  affectedVersions: string;
   
-  // When the alert was generated
-  createdAt: Date;
+  // Versions that fix this vulnerability
+  patchedVersions: string;
   
-  // When the alert was last updated
-  updatedAt: Date;
+  // Published date of the vulnerability
+  publishedDate: Date;
   
-  // Status of the alert
-  status: 'open' | 'acknowledged' | 'in-progress' | 'resolved' | 'wontfix';
+  // Recommended action to fix
+  remediation: string;
+}
+
+/**
+ * Represents a browser extension that requires updating
+ */
+export interface BrowserExtensionIssue {
+  // Extension name
+  name: string;
   
-  // Assigned to (if anyone)
-  assignedTo?: string;
+  // Extension identifier
+  id: string;
   
-  // Due date for remediation (if applicable)
-  dueDate?: Date;
+  // Current version
+  currentVersion: string;
   
-  // Related tickets or issues
-  relatedTickets?: string[];
+  // Latest available version
+  latestVersion: string;
   
-  // Tags for categorization
-  tags?: string[];
+  // Browser this extension is for
+  browser: 'chrome' | 'firefox' | 'safari' | 'edge' | 'opera';
+  
+  // Is the extension outdated?
+  isOutdated: boolean;
+  
+  // Is the extension deprecated?
+  isDeprecated: boolean;
+  
+  // Does the extension have security issues?
+  hasSecurityIssues: boolean;
+  
+  // Has the extension been removed from the store?
+  isRemovedFromStore: boolean;
+  
+  // Known vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // URL to the extension in the browser store
+  storeUrl: string;
+  
+  // When this issue was detected
+  detectedAt: Date;
+}
+
+/**
+ * Represents a framework, library, or system component that is outdated
+ */
+export interface SystemComponentIssue {
+  // Component name
+  name: string;
+  
+  // Component type (framework, library, system)
+  type: 'framework' | 'library' | 'system';
+  
+  // Current version
+  currentVersion: string;
+  
+  // Latest available version
+  latestVersion: string;
+  
+  // Is the component outdated?
+  isOutdated: boolean;
+  
+  // Minimum version recommended for security
+  minimumRecommendedVersion: string;
+  
+  // End of life/support date
+  eolDate?: Date;
+  
+  // Is this component reaching EOL soon?
+  isApproachingEol: boolean;
+  
+  // Time until EOL
+  timeUntilEol?: string;
+  
+  // Known vulnerabilities
+  vulnerabilities: VulnerabilityInfo[];
+  
+  // Suggested upgrade path
+  upgradeInstructions?: string;
+  
+  // Potential impact of upgrading
+  upgradeDifficulty: 'low' | 'medium' | 'high';
+  
+  // Estimated time to upgrade (in person-days)
+  estimatedUpgradeEffort: number;
+  
+  // When this issue was detected
+  detectedAt: Date;
+}
+
+/**
+ * Report summarizing all types of currency issues
+ */
+export interface TechnologyCurrencyReport {
+  // Project summary
+  projectName: string;
+  scanDate: Date;
+  
+  // Overall scores
+  overallCurrencyScore: number; // 0-100
+  securityScore: number; // 0-100
+  technicalDebtScore: number; // 0-100
+  
+  // Issues by category
+  codePatternIssues: CodePatternIssue[];
+  dependencyIssues: DependencyIssue[];
+  browserExtensionIssues: BrowserExtensionIssue[];
+  systemComponentIssues: SystemComponentIssue[];
+  
+  // Summary statistics
+  totalIssues: number;
+  criticalIssues: number;
+  highIssues: number;
+  mediumIssues: number;
+  lowIssues: number;
+  
+  // Remediation summary
+  estimatedRemediationEffort: number; // In person-days
+  priorityRemediationItems: Array<CodePatternIssue | DependencyIssue | BrowserExtensionIssue | SystemComponentIssue>;
+  
+  // Historical data for trending
+  historicalScores?: { date: Date; score: number; }[];
 }
