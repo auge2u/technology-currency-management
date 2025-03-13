@@ -1,303 +1,316 @@
-import { CodePatternIssue, DependencyIssue, BrowserExtensionIssue, SystemComponentIssue } from '../types/scanning';
-
-/**
- * Severity levels in order from least to most severe
- */
-const SEVERITY_LEVELS = {
-  'low': 0,
-  'medium': 1,
-  'high': 2,
-  'critical': 3
-};
-
-/**
- * Determines if a given file content is likely a binary file
- * 
- * @param content File content as string
- * @returns True if the file appears to be binary
- */
-export function isBinaryFile(content: string): boolean {
-  // Check for null bytes which are common in binary files
-  if (content.includes('\0')) {
-    return true;
-  }
-  
-  // Check if the file has a high percentage of non-printable characters
-  const nonPrintableChars = content.replace(/[\x20-\x7E\n\r\t]/g, '');
-  const ratio = nonPrintableChars.length / content.length;
-  
-  // If more than 30% of the characters are non-printable, consider it binary
-  return ratio > 0.3;
-}
-
-/**
- * Filter issues by severity threshold
- * 
- * @param issues Array of issues to filter
- * @param threshold Minimum severity level to include
- * @returns Filtered array of issues meeting the severity threshold
- */
-export function filterBySeverity<T extends { severity: 'low' | 'medium' | 'high' | 'critical' }>(
-  issues: T[],
-  threshold: 'low' | 'medium' | 'high' | 'critical'
-): T[] {
-  const thresholdLevel = SEVERITY_LEVELS[threshold];
-  
-  return issues.filter(issue => {
-    const issueLevel = SEVERITY_LEVELS[issue.severity];
-    return issueLevel >= thresholdLevel;
-  });
-}
-
-/**
- * Categorize issues by severity
- * 
- * @param issues Array of issues to categorize
- * @returns Object with counts by severity
- */
-export function categorizeBySeverity<T extends { severity: 'low' | 'medium' | 'high' | 'critical' }>(
-  issues: T[]
-): { low: number; medium: number; high: number; critical: number; total: number } {
-  const result = {
-    low: 0,
-    medium: 0,
-    high: 0,
-    critical: 0,
-    total: issues.length
-  };
-  
-  issues.forEach(issue => {
-    result[issue.severity]++;
-  });
-  
-  return result;
-}
-
-/**
- * Group issues by file path
- * 
- * @param issues Array of code pattern issues
- * @returns Object with issues grouped by file path
- */
-export function groupIssuesByFile(issues: CodePatternIssue[]): Record<string, CodePatternIssue[]> {
-  return issues.reduce((groups, issue) => {
-    const file = issue.file;
-    if (!groups[file]) {
-      groups[file] = [];
-    }
-    groups[file].push(issue);
-    return groups;
-  }, {} as Record<string, CodePatternIssue[]>);
-}
-
-/**
- * Group issues by technology
- * 
- * @param issues Array of issues with technology field
- * @returns Object with issues grouped by technology
- */
-export function groupIssuesByTechnology<T extends { technology: string }>(
-  issues: T[]
-): Record<string, T[]> {
-  return issues.reduce((groups, issue) => {
-    const tech = issue.technology;
-    if (!groups[tech]) {
-      groups[tech] = [];
-    }
-    groups[tech].push(issue);
-    return groups;
-  }, {} as Record<string, T[]>);
-}
-
-/**
- * Calculate severity score based on issue counts
- * The score is 100 (perfect) - weighted deductions for issues
- * 
- * @param issuesSummary Object with counts by severity
- * @returns Score from 0-100
- */
-export function calculateSeverityScore(
-  issuesSummary: { low: number; medium: number; high: number; critical: number }
-): number {
-  // Weights for each severity level
-  const weights = {
-    low: 1,
-    medium: 3,
-    high: 10,
-    critical: 25
-  };
-  
-  // Calculate weighted deductions
-  const deduction = 
-    (issuesSummary.low * weights.low) +
-    (issuesSummary.medium * weights.medium) +
-    (issuesSummary.high * weights.high) +
-    (issuesSummary.critical * weights.critical);
-  
-  // Start with 100 and subtract deductions, minimum score is 0
-  return Math.max(0, Math.min(100, 100 - deduction));
-}
-
-/**
- * Get priority remediation items based on severity
- * 
- * @param issues All issues of different types
- * @param limit Maximum number of items to include
- * @returns Array of highest priority issues
- */
-export function getPriorityRemediationItems(
-  codeIssues: CodePatternIssue[],
-  dependencyIssues: DependencyIssue[],
-  extensionIssues: BrowserExtensionIssue[],
-  componentIssues: SystemComponentIssue[],
-  limit: number = 10
-): Array<CodePatternIssue | DependencyIssue | BrowserExtensionIssue | SystemComponentIssue> {
-  // Combine all issues and add type information for later identification
-  const allIssues = [
-    ...codeIssues.map(issue => ({ ...issue, issueType: 'code' as const })),
-    ...dependencyIssues.map(issue => ({ ...issue, issueType: 'dependency' as const })),
-    ...extensionIssues.map(issue => ({ ...issue, issueType: 'extension' as const })),
-    ...componentIssues.map(issue => ({ ...issue, issueType: 'component' as const }))
-  ];
-  
-  // Sort by severity (critical -> high -> medium -> low)
-  const sortedIssues = allIssues.sort((a, b) => {
-    return SEVERITY_LEVELS[b.severity] - SEVERITY_LEVELS[a.severity];
-  });
-  
-  // Take the top N issues
-  const topIssues = sortedIssues.slice(0, limit);
-  
-  // Remove the added issueType property before returning
-  return topIssues.map(({ issueType, ...issue }) => issue as any);
-}
-
-/**
- * Parse version string into comparable components
- * 
- * @param version Version string (e.g., "1.2.3-beta.1")
- * @returns Object with parsed components
- */
-export function parseVersion(version: string): { 
-  major: number; 
-  minor: number; 
-  patch: number; 
-  prerelease: string | null;
-  buildMetadata: string | null;
-} {
-  // Handle standard semver format: MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]
-  const semverRegex = /^(\d+)\.(\d+)\.(\d+)(?:-([^+]+))?(?:\+(.+))?$/;
-  const match = version.match(semverRegex);
-  
-  if (match) {
-    return {
-      major: parseInt(match[1], 10),
-      minor: parseInt(match[2], 10),
-      patch: parseInt(match[3], 10),
-      prerelease: match[4] || null,
-      buildMetadata: match[5] || null
-    };
-  }
-  
-  // Fallback for non-standard versions
-  const parts = version.split('.');
-  return {
-    major: parseInt(parts[0] || '0', 10),
-    minor: parseInt(parts[1] || '0', 10),
-    patch: parseInt(parts[2] || '0', 10),
-    prerelease: null,
-    buildMetadata: null
-  };
-}
+import * as semver from 'semver';
+import { log } from './logging';
 
 /**
  * Compare two version strings
- * 
- * @param versionA First version string
- * @param versionB Second version string
- * @returns -1 if A < B, 0 if A = B, 1 if A > B
+ * Returns:
+ * - negative if version1 < version2
+ * - 0 if version1 === version2
+ * - positive if version1 > version2
  */
-export function compareVersions(versionA: string, versionB: string): number {
-  const a = parseVersion(versionA);
-  const b = parseVersion(versionB);
+export function compareVersions(version1: string, version2: string): number {
+  try {
+    // Clean the versions to handle different formats
+    const cleanedVersion1 = cleanVersionString(version1);
+    const cleanedVersion2 = cleanVersionString(version2);
+    
+    // Try semver comparison first
+    if (semver.valid(cleanedVersion1) && semver.valid(cleanedVersion2)) {
+      return semver.compare(cleanedVersion1, cleanedVersion2);
+    }
+    
+    // Fall back to custom comparison for non-semver versions
+    return compareVersionParts(cleanedVersion1, cleanedVersion2);
+  } catch (error) {
+    log.warn('Error comparing versions', { error, version1, version2 });
+    return 0; // Assume equal if comparison fails
+  }
+}
+
+/**
+ * Clean a version string to make it more comparable
+ */
+export function cleanVersionString(version: string): string {
+  // Remove common prefixes like 'v', '=', '^', '~'
+  let cleaned = version.trim().replace(/^[v=^~]+/, '');
   
-  // Compare major, minor, patch
-  if (a.major !== b.major) return a.major - b.major;
-  if (a.minor !== b.minor) return a.minor - b.minor;
-  if (a.patch !== b.patch) return a.patch - b.patch;
-  
-  // Handle prereleases
-  // A version with a prerelease has lower precedence than the same version without it
-  if (a.prerelease === null && b.prerelease !== null) return 1;
-  if (a.prerelease !== null && b.prerelease === null) return -1;
-  if (a.prerelease !== null && b.prerelease !== null) {
-    // Simple string comparison for prerelease parts
-    if (a.prerelease < b.prerelease) return -1;
-    if (a.prerelease > b.prerelease) return 1;
+  // Handle ranges by taking the upper bound for '>=' and '>' and lower bound for '<=' and '<'
+  if (cleaned.startsWith('>=') || cleaned.startsWith('>')) {
+    cleaned = cleaned.substring(cleaned.indexOf(' ') + 1);
+  } else if (cleaned.startsWith('<=') || cleaned.startsWith('<')) {
+    cleaned = cleaned.substring(cleaned.indexOf(' ') + 1);
   }
   
-  return 0;
+  // Convert '-SNAPSHOT', '-beta', etc. to prerelease format that semver understands
+  if (cleaned.includes('-') && !cleaned.includes('-rc') && !cleaned.includes('-alpha') && 
+      !cleaned.includes('-beta') && !cleaned.includes('-pre')) {
+    const parts = cleaned.split('-');
+    if (parts.length === 2) {
+      if (parts[1].toLowerCase() === 'snapshot') {
+        cleaned = `${parts[0]}-snapshot.0`;
+      } else {
+        cleaned = `${parts[0]}-0.${parts[1]}`;
+      }
+    }
+  }
+  
+  return cleaned;
 }
 
 /**
- * Calculate version difference significance
- * 
- * @param currentVersion Current version string
- * @param latestVersion Latest version string
- * @returns Difference type: 'none', 'patch', 'minor', 'major'
+ * Compare version parts for non-semver versions
  */
-export function getVersionDifferenceType(
-  currentVersion: string, 
-  latestVersion: string
-): 'none' | 'patch' | 'minor' | 'major' {
-  const current = parseVersion(currentVersion);
-  const latest = parseVersion(latestVersion);
+function compareVersionParts(version1: string, version2: string): number {
+  // Split into parts by dots and dashes
+  const v1Parts = splitVersionIntoParts(version1);
+  const v2Parts = splitVersionIntoParts(version2);
   
-  if (latest.major > current.major) return 'major';
-  if (latest.minor > current.minor) return 'minor';
-  if (latest.patch > current.patch) return 'patch';
-  return 'none';
+  // Compare parts one by one
+  const maxLength = Math.max(v1Parts.length, v2Parts.length);
+  
+  for (let i = 0; i < maxLength; i++) {
+    // Missing parts are treated as 0
+    const v1Part = i < v1Parts.length ? v1Parts[i] : '0';
+    const v2Part = i < v2Parts.length ? v2Parts[i] : '0';
+    
+    // Try numeric comparison if both are numbers
+    const v1Num = parseInt(v1Part, 10);
+    const v2Num = parseInt(v2Part, 10);
+    
+    if (!isNaN(v1Num) && !isNaN(v2Num)) {
+      if (v1Num !== v2Num) {
+        return v1Num - v2Num;
+      }
+    } else {
+      // String comparison if not both numbers
+      const stringCompare = v1Part.localeCompare(v2Part);
+      if (stringCompare !== 0) {
+        return stringCompare;
+      }
+    }
+  }
+  
+  return 0; // All parts are equal
 }
 
 /**
- * Estimate upgrade effort based on version difference
- * 
- * @param currentVersion Current version string
- * @param targetVersion Target version string
- * @returns Estimated upgrade difficulty
+ * Split a version string into parts for comparison
  */
-export function estimateUpgradeDifficulty(
-  currentVersion: string,
-  targetVersion: string,
-  baseComplexity: 'low' | 'medium' | 'high' = 'medium'
-): 'low' | 'medium' | 'high' {
-  const diffType = getVersionDifferenceType(currentVersion, targetVersion);
+function splitVersionIntoParts(version: string): string[] {
+  // Split by dots and handle special characters
+  return version
+    .replace(/[\-+]/, '.') // Convert dashes and plus signs to dots
+    .split('.')
+    .map(part => part.trim())
+    .filter(part => part.length > 0);
+}
+
+/**
+ * Calculate days between two dates
+ */
+export function daysBetween(date1: Date, date2: Date): number {
+  const diff = Math.abs(date2.getTime() - date1.getTime());
+  return Math.floor(diff / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * Calculate severity score from 0-100 based on various factors
+ */
+export function calculateSeverityScore(
+  isOutdated: boolean,
+  isDeprecated: boolean,
+  daysOutdated: number | undefined,
+  daysToEndOfLife: number | undefined,
+  vulnerabilities: any[]
+): number {
+  let score = 0;
   
-  // Complexity matrix based on version difference and base complexity
-  const complexityMatrix: {
-    [key in 'low' | 'medium' | 'high']: {
-      [key in 'none' | 'patch' | 'minor' | 'major']: 'low' | 'medium' | 'high'
-    }
-  } = {
-    low: {
-      none: 'low',
-      patch: 'low',
-      minor: 'medium',
-      major: 'high'
-    },
-    medium: {
-      none: 'low',
-      patch: 'medium',
-      minor: 'medium',
-      major: 'high'
-    },
-    high: {
-      none: 'medium',
-      patch: 'medium',
-      minor: 'high',
-      major: 'high'
-    }
-  };
+  // Base scores
+  if (isOutdated) score += 10;
+  if (isDeprecated) score += 30;
   
-  return complexityMatrix[baseComplexity][diffType];
+  // Days outdated score (max 20)
+  if (daysOutdated) {
+    if (daysOutdated > 365) score += 20;
+    else if (daysOutdated > 180) score += 15;
+    else if (daysOutdated > 90) score += 10;
+    else if (daysOutdated > 30) score += 5;
+  }
+  
+  // Days to end of life (max 30)
+  if (daysToEndOfLife !== undefined) {
+    if (daysToEndOfLife < 0) score += 30;
+    else if (daysToEndOfLife < 30) score += 25;
+    else if (daysToEndOfLife < 90) score += 20;
+    else if (daysToEndOfLife < 180) score += 10;
+    else if (daysToEndOfLife < 365) score += 5;
+  }
+  
+  // Vulnerability score (max 40)
+  if (vulnerabilities && vulnerabilities.length > 0) {
+    let vulnScore = 0;
+    for (const vuln of vulnerabilities) {
+      switch (vuln.severity) {
+        case 'critical':
+          vulnScore += 10;
+          break;
+        case 'high':
+          vulnScore += 7;
+          break;
+        case 'medium':
+          vulnScore += 4;
+          break;
+        case 'low':
+          vulnScore += 1;
+          break;
+      }
+    }
+    score += Math.min(40, vulnScore);
+  }
+  
+  // Cap at 100
+  return Math.min(100, score);
+}
+
+/**
+ * Map a severity score (0-100) to a severity level
+ */
+export function mapScoreToSeverity(score: number): 'critical' | 'high' | 'medium' | 'low' {
+  if (score >= 70) return 'critical';
+  if (score >= 40) return 'high';
+  if (score >= 20) return 'medium';
+  return 'low';
+}
+
+/**
+ * Calculate the estimated effort (in days) to remediate an issue
+ */
+export function estimateRemediationEffort(
+  issueType: string,
+  severity: string,
+  isDeprecated: boolean,
+  hasVulnerabilities: boolean
+): number {
+  // Base effort by issue type
+  let baseEffort = 0;
+  
+  switch (issueType) {
+    case 'dependency':
+      baseEffort = 0.5; // Half a day for simple dependency updates
+      break;
+    case 'browserExtension':
+      baseEffort = 0.25; // Quarter day for browser extensions
+      break;
+    case 'framework':
+      baseEffort = 5; // 5 days for framework updates (much more complex)
+      break;
+    case 'database':
+      baseEffort = 3; // 3 days for database updates
+      break;
+    case 'infrastructure':
+      baseEffort = 2; // 2 days for infrastructure updates
+      break;
+    case 'security':
+      baseEffort = 1; // 1 day for security component updates
+      break;
+    case 'languageRuntime':
+      baseEffort = 4; // 4 days for language runtime updates
+      break;
+    default:
+      baseEffort = 1; // Default to 1 day
+  }
+  
+  // Multipliers based on severity
+  let severityMultiplier = 1.0;
+  switch (severity) {
+    case 'critical':
+      severityMultiplier = 1.5;
+      break;
+    case 'high':
+      severityMultiplier = 1.3;
+      break;
+    case 'medium':
+      severityMultiplier = 1.1;
+      break;
+    case 'low':
+      severityMultiplier = 1.0;
+      break;
+  }
+  
+  // Additional factors
+  if (isDeprecated) severityMultiplier *= 1.5;
+  if (hasVulnerabilities) severityMultiplier *= 1.2;
+  
+  return baseEffort * severityMultiplier;
+}
+
+/**
+ * Calculate the estimated business impact of an issue (1-10)
+ */
+export function estimateBusinessImpact(
+  issueType: string,
+  severity: string,
+  isDeprecated: boolean,
+  hasVulnerabilities: boolean,
+  daysToEndOfLife?: number
+): number {
+  // Base impact by issue type
+  let baseImpact = 0;
+  
+  switch (issueType) {
+    case 'dependency':
+      baseImpact = 3;
+      break;
+    case 'browserExtension':
+      baseImpact = 2;
+      break;
+    case 'framework':
+      baseImpact = 8;
+      break;
+    case 'database':
+      baseImpact = 9;
+      break;
+    case 'infrastructure':
+      baseImpact = 7;
+      break;
+    case 'security':
+      baseImpact = 8;
+      break;
+    case 'languageRuntime':
+      baseImpact = 6;
+      break;
+    default:
+      baseImpact = 5;
+  }
+  
+  // Adjust based on severity
+  switch (severity) {
+    case 'critical':
+      baseImpact += 2;
+      break;
+    case 'high':
+      baseImpact += 1.5;
+      break;
+    case 'medium':
+      baseImpact += 1;
+      break;
+    case 'low':
+      baseImpact += 0;
+      break;
+  }
+  
+  // Adjust for other factors
+  if (isDeprecated) baseImpact += 1;
+  if (hasVulnerabilities) baseImpact += 1.5;
+  
+  // End of life adjustment
+  if (daysToEndOfLife !== undefined) {
+    if (daysToEndOfLife < 0) baseImpact += 2;
+    else if (daysToEndOfLife < 30) baseImpact += 1.5;
+    else if (daysToEndOfLife < 90) baseImpact += 1;
+    else if (daysToEndOfLife < 180) baseImpact += 0.5;
+  }
+  
+  // Cap at 10
+  return Math.min(10, baseImpact);
 }
