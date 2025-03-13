@@ -1,0 +1,149 @@
+name: Technology Currency Check
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  schedule:
+    # Run weekly on Monday at 9:00 AM
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    # Allow manual triggering
+
+jobs:
+  technology-currency-check:
+    name: Technology Currency Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run technology currency scan
+        id: tech-scan
+        run: npm run scan:all
+        env:
+          TECH_CURRENCY_SCAN_OUTPUT: github-action
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
+      - name: Read scan results
+        id: scan-results
+        if: always()
+        run: |
+          if [ -f "./scan-results.json" ]; then
+            echo "SCAN_RESULTS<<EOF" >> $GITHUB_ENV
+            cat ./scan-results.json >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+            
+            # Extract counts for summary
+            CRITICAL_COUNT=$(jq '.critical | length' ./scan-results.json)
+            HIGH_COUNT=$(jq '.high | length' ./scan-results.json)
+            MEDIUM_COUNT=$(jq '.medium | length' ./scan-results.json)
+            LOW_COUNT=$(jq '.low | length' ./scan-results.json)
+            
+            echo "CRITICAL_COUNT=$CRITICAL_COUNT" >> $GITHUB_ENV
+            echo "HIGH_COUNT=$HIGH_COUNT" >> $GITHUB_ENV
+            echo "MEDIUM_COUNT=$MEDIUM_COUNT" >> $GITHUB_ENV
+            echo "LOW_COUNT=$LOW_COUNT" >> $GITHUB_ENV
+            
+            TOTAL_COUNT=$(($CRITICAL_COUNT + $HIGH_COUNT + $MEDIUM_COUNT + $LOW_COUNT))
+            echo "TOTAL_COUNT=$TOTAL_COUNT" >> $GITHUB_ENV
+          else
+            echo "No scan results found"
+            exit 1
+          fi
+      
+      - name: Create PR comment
+        if: github.event_name == 'pull_request' && (env.CRITICAL_COUNT > 0 || env.HIGH_COUNT > 0)
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const results = JSON.parse(process.env.SCAN_RESULTS);
+            const totalCount = parseInt(process.env.TOTAL_COUNT);
+            const criticalCount = parseInt(process.env.CRITICAL_COUNT);
+            const highCount = parseInt(process.env.HIGH_COUNT);
+            const mediumCount = parseInt(process.env.MEDIUM_COUNT);
+            const lowCount = parseInt(process.env.LOW_COUNT);
+            
+            let comment = `## 🔍 Technology Currency Scan Results\n\n`;
+            comment += `Found **${totalCount}** issues in this PR:\n\n`;
+            comment += `- 🚨 **${criticalCount}** Critical\n`;
+            comment += `- ⚠️ **${highCount}** High\n`;
+            comment += `- ⚠ **${mediumCount}** Medium\n`;
+            comment += `- ℹ️ **${lowCount}** Low\n\n`;
+            
+            if (criticalCount > 0 || highCount > 0) {
+              comment += `### Issues requiring attention\n\n`;
+              
+              // Add critical issues
+              if (criticalCount > 0) {
+                comment += `#### Critical Issues\n\n`;
+                results.critical.forEach(issue => {
+                  comment += `- **${issue.technology}**: ${issue.message}\n`;
+                  comment += `  - File: \`${issue.filePath}\`${issue.lineNumber ? ` (line ${issue.lineNumber})` : ''}\n`;
+                  comment += `  - Recommended: ${issue.recommendedVersion}\n`;
+                  comment += `  - Remediation: ${issue.remediationSteps}\n\n`;
+                });
+              }
+              
+              // Add high severity issues
+              if (highCount > 0) {
+                comment += `#### High Severity Issues\n\n`;
+                results.high.forEach(issue => {
+                  comment += `- **${issue.technology}**: ${issue.message}\n`;
+                  comment += `  - File: \`${issue.filePath}\`${issue.lineNumber ? ` (line ${issue.lineNumber})` : ''}\n`;
+                  comment += `  - Recommended: ${issue.recommendedVersion}\n`;
+                  comment += `  - Remediation: ${issue.remediationSteps}\n\n`;
+                });
+              }
+            }
+            
+            comment += `For more details, see the complete [Technology Currency Report](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}).`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Fail check on critical issues
+        if: env.CRITICAL_COUNT > 0
+        run: |
+          echo "::error::Found ${CRITICAL_COUNT} critical technology currency issues. See the job summary for details."
+          exit 1
+          
+      - name: Add PR check summary
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "# Technology Currency Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Found **${TOTAL_COUNT}** issues in this PR:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🚨 **${CRITICAL_COUNT}** Critical" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **${HIGH_COUNT}** High" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠ **${MEDIUM_COUNT}** Medium" >> $GITHUB_STEP_SUMMARY
+          echo "- ℹ️ **${LOW_COUNT}** Low" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "./scan-results.html" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>Detailed Scan Results</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat ./scan-results.html >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
