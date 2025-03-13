@@ -13,35 +13,68 @@ const execAsync = promisify(exec);
  * Configuration specific to dependency scanning
  */
 export interface DependencyScannerConfig extends ScannerConfig {
-  // Package managers to include in scan
-  packageManagers?: Array<'npm' | 'pip' | 'maven' | 'gradle' | 'nuget'>;
+  // Types of dependencies to scan
+  dependencyTypes?: Array<
+    | 'direct'
+    | 'dev'
+    | 'peer'
+    | 'optional'
+    | 'transitive'
+  >;
   
-  // Whether to only check direct dependencies (vs. transitive)
-  directDependenciesOnly?: boolean;
+  // Types of package managers to scan
+  packageManagers?: Array<
+    | 'npm'
+    | 'yarn'
+    | 'pnpm'
+    | 'pip'
+    | 'pipenv'
+    | 'poetry'
+    | 'maven'
+    | 'gradle'
+    | 'composer'
+    | 'nuget'
+    | 'cargo'
+    | 'go'
+    | 'gem'
+    | 'cocoapods'
+    | 'swift'
+  >;
   
-  // Maximum depth for transitive dependencies
-  maxTransitiveDepth?: number;
-  
-  // Whether to check for vulnerabilities
+  // Whether to check for known vulnerabilities
   checkVulnerabilities?: boolean;
   
-  // Whether to assess impact of updates
-  assessUpdateImpact?: boolean;
+  // Whether to check dependency licenses
+  checkLicenses?: boolean;
+  
+  // Whether to check for duplicate dependencies
+  checkDuplicates?: boolean;
+  
+  // Whether to check for unused dependencies
+  checkUnused?: boolean;
+  
+  // Whether to check if the dependency is being maintained
+  checkMaintained?: boolean;
+  
+  // Maximum age of a dependency update in days before flagging
+  maxUpdateAge?: number;
   
   // Custom vulnerability database paths
   vulnerabilityDbPaths?: {
-    npm?: string;
-    pip?: string;
-    maven?: string;
-    gradle?: string;
-    nuget?: string;
+    dependencies?: string;
   };
   
-  // Package ranges to exclude
-  excludePackages?: string[];
+  // Custom license allowlist/blocklist
+  licenses?: {
+    allowlist?: string[];
+    blocklist?: string[];
+  };
   
-  // Whether to auto-generate package lock files if missing
-  generateLockFiles?: boolean;
+  // Dependencies to exclude from scanning
+  excludeDependencies?: string[];
+  
+  // Scan depth - how deep to check transitive dependencies
+  scanDepth?: number;
 }
 
 /**
@@ -50,31 +83,47 @@ export interface DependencyScannerConfig extends ScannerConfig {
 interface DependencyInfo {
   name: string;
   version: string;
+  type: 'direct' | 'dev' | 'peer' | 'optional' | 'transitive';
+  packageManager: string;
+  manifestPath: string;
   latestVersion?: string;
-  packageManager: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget';
-  isDirect: boolean;
-  depth?: number;
-  dependentFiles: string[];
-  path?: string; // Path to the package definition file
-  dependencies?: Record<string, string>; // Direct dependencies of this package
-  devDependency?: boolean;
-  peerDependency?: boolean;
-  optionalDependency?: boolean;
-  repository?: string;
+  latestReleaseDate?: Date;
+  isOutdated?: boolean;
+  isVulnerable?: boolean;
+  isDeprecated?: boolean;
+  isUnused?: boolean;
+  isLicenseIssue?: boolean;
+  dependencyChain?: string[];
+  homepageUrl?: string;
+  repositoryUrl?: string;
+  license?: string;
+  lastPublishDate?: Date;
+  isNotMaintained?: boolean;
   vulnerabilities?: {
     severity: 'low' | 'medium' | 'high' | 'critical';
     description: string;
     cveIds?: string[];
+    affectedVersions?: string;
     fixedInVersion?: string;
     url?: string;
   }[];
-  isDeprecated?: boolean;
-  deprecationMessage?: string;
-  isOutdated?: boolean;
+  licenseIssue?: {
+    license: string;
+    reason: string;
+  };
+  duplicates?: {
+    paths: string[];
+    versions: string[];
+  };
+  upgradeBreaking?: boolean;
+  dependents?: string[];
+  author?: string;
+  maintainers?: string[];
+  dependsOn?: string[];
 }
 
 /**
- * Main function to scan dependencies
+ * Main function to scan for dependencies
  */
 export async function scanDependencies(
   config: DependencyScannerConfig
@@ -83,79 +132,197 @@ export async function scanDependencies(
     log.info('Starting dependency scanner');
     const issues: DependencyIssue[] = [];
     
-    // Determine which package managers to scan
-    const packageManagers = config.packageManagers || ['npm', 'pip', 'maven', 'gradle', 'nuget'];
-    log.info(`Scanning for dependencies using: ${packageManagers.join(', ')}`);
+    // Determine which dependency types to scan
+    const dependencyTypes = config.dependencyTypes || [
+      'direct', 'dev', 'peer', 'optional'
+    ];
+    log.info(`Scanning dependency types: ${dependencyTypes.join(', ')}`);
     
-    // Collect dependencies from all package managers
+    // Determine which package managers to scan
+    const packageManagers = config.packageManagers || [
+      'npm', 'yarn', 'pnpm', 'pip', 'pipenv', 'poetry', 'maven', 'gradle',
+      'composer', 'nuget', 'cargo', 'go', 'gem', 'cocoapods', 'swift'
+    ];
+    log.info(`Scanning package managers: ${packageManagers.join(', ')}`);
+    
+    // Scan for all dependencies
     const dependencies: DependencyInfo[] = [];
     
-    for (const manager of packageManagers) {
+    // JavaScript/TypeScript (npm, yarn, pnpm)
+    if (packageManagers.some(pm => ['npm', 'yarn', 'pnpm'].includes(pm))) {
       try {
-        log.info(`Collecting ${manager} dependencies`);
-        const managerDeps = await collectDependencies(manager, config);
-        dependencies.push(...managerDeps);
-        log.info(`Found ${managerDeps.length} ${manager} dependencies`);
-      } catch (managerError) {
-        log.error(`Error collecting ${manager} dependencies`, { error: managerError });
+        log.info('Scanning for JavaScript/TypeScript dependencies');
+        const jsDependencies = await scanJavaScriptDependencies(config);
+        dependencies.push(...jsDependencies);
+        log.info(`Found ${jsDependencies.length} JavaScript/TypeScript dependencies`);
+      } catch (jsError) {
+        log.error('Error scanning JavaScript/TypeScript dependencies', { error: jsError });
+      }
+    }
+    
+    // Python (pip, pipenv, poetry)
+    if (packageManagers.some(pm => ['pip', 'pipenv', 'poetry'].includes(pm))) {
+      try {
+        log.info('Scanning for Python dependencies');
+        const pythonDependencies = await scanPythonDependencies(config);
+        dependencies.push(...pythonDependencies);
+        log.info(`Found ${pythonDependencies.length} Python dependencies`);
+      } catch (pythonError) {
+        log.error('Error scanning Python dependencies', { error: pythonError });
+      }
+    }
+    
+    // Java (maven, gradle)
+    if (packageManagers.some(pm => ['maven', 'gradle'].includes(pm))) {
+      try {
+        log.info('Scanning for Java dependencies');
+        const javaDependencies = await scanJavaDependencies(config);
+        dependencies.push(...javaDependencies);
+        log.info(`Found ${javaDependencies.length} Java dependencies`);
+      } catch (javaError) {
+        log.error('Error scanning Java dependencies', { error: javaError });
+      }
+    }
+    
+    // PHP (composer)
+    if (packageManagers.includes('composer')) {
+      try {
+        log.info('Scanning for PHP dependencies');
+        const phpDependencies = await scanPhpDependencies(config);
+        dependencies.push(...phpDependencies);
+        log.info(`Found ${phpDependencies.length} PHP dependencies`);
+      } catch (phpError) {
+        log.error('Error scanning PHP dependencies', { error: phpError });
+      }
+    }
+    
+    // .NET (nuget)
+    if (packageManagers.includes('nuget')) {
+      try {
+        log.info('Scanning for .NET dependencies');
+        const dotnetDependencies = await scanDotNetDependencies(config);
+        dependencies.push(...dotnetDependencies);
+        log.info(`Found ${dotnetDependencies.length} .NET dependencies`);
+      } catch (dotnetError) {
+        log.error('Error scanning .NET dependencies', { error: dotnetError });
+      }
+    }
+    
+    // Rust (cargo)
+    if (packageManagers.includes('cargo')) {
+      try {
+        log.info('Scanning for Rust dependencies');
+        const rustDependencies = await scanRustDependencies(config);
+        dependencies.push(...rustDependencies);
+        log.info(`Found ${rustDependencies.length} Rust dependencies`);
+      } catch (rustError) {
+        log.error('Error scanning Rust dependencies', { error: rustError });
+      }
+    }
+    
+    // Go (go modules)
+    if (packageManagers.includes('go')) {
+      try {
+        log.info('Scanning for Go dependencies');
+        const goDependencies = await scanGoDependencies(config);
+        dependencies.push(...goDependencies);
+        log.info(`Found ${goDependencies.length} Go dependencies`);
+      } catch (goError) {
+        log.error('Error scanning Go dependencies', { error: goError });
+      }
+    }
+    
+    // Ruby (gem)
+    if (packageManagers.includes('gem')) {
+      try {
+        log.info('Scanning for Ruby dependencies');
+        const rubyDependencies = await scanRubyDependencies(config);
+        dependencies.push(...rubyDependencies);
+        log.info(`Found ${rubyDependencies.length} Ruby dependencies`);
+      } catch (rubyError) {
+        log.error('Error scanning Ruby dependencies', { error: rubyError });
+      }
+    }
+    
+    // iOS/macOS (cocoapods, swift)
+    if (packageManagers.some(pm => ['cocoapods', 'swift'].includes(pm))) {
+      try {
+        log.info('Scanning for iOS/macOS dependencies');
+        const iosDependencies = await scanAppleDependencies(config);
+        dependencies.push(...iosDependencies);
+        log.info(`Found ${iosDependencies.length} iOS/macOS dependencies`);
+      } catch (iosError) {
+        log.error('Error scanning iOS/macOS dependencies', { error: iosError });
       }
     }
     
     log.info(`Found total of ${dependencies.length} dependencies to analyze`);
     
-    // Filter dependencies based on configuration
-    let filteredDeps = dependencies;
+    // Filter dependencies based on type if specified
+    let filteredDependencies = dependencies.filter(dep => 
+      dependencyTypes.includes(dep.type)
+    );
+    log.info(`Filtered to ${filteredDependencies.length} dependencies of specified types`);
     
-    // Filter direct vs. transitive dependencies
-    if (config.directDependenciesOnly) {
-      filteredDeps = filteredDeps.filter(dep => dep.isDirect);
-      log.info(`Filtered to ${filteredDeps.length} direct dependencies`);
-    } else if (config.maxTransitiveDepth) {
-      filteredDeps = filteredDeps.filter(dep => 
-        dep.isDirect || (dep.depth !== undefined && dep.depth <= config.maxTransitiveDepth!)
-      );
-      log.info(`Filtered to ${filteredDeps.length} dependencies within depth ${config.maxTransitiveDepth}`);
+    // Filter out excluded dependencies
+    if (config.excludeDependencies && config.excludeDependencies.length > 0) {
+      filteredDependencies = filteredDependencies.filter(dep => {
+        return !config.excludeDependencies!.some(excluded => {
+          if (excluded === dep.name) {
+            return true;
+          }
+          if (excluded.includes('*')) {
+            const pattern = excluded.replace(/\*/g, '.*');
+            return new RegExp(`^${pattern}$`).test(dep.name);
+          }
+          return false;
+        });
+      });
+      log.info(`Filtered out excluded dependencies, ${filteredDependencies.length} remaining`);
     }
     
     // Process each dependency
-    for (const dep of filteredDeps) {
+    for (const dep of filteredDependencies) {
       try {
-        // Skip excluded packages
-        if (config.excludePackages?.some(pattern => {
-          // Handle glob patterns like "eslint-*"
-          if (pattern.includes('*')) {
-            const regexPattern = pattern
-              .replace(/\./g, '\\.')
-              .replace(/\*/g, '.*');
-            return new RegExp(`^${regexPattern}$`).test(dep.name);
-          }
-          return pattern === dep.name;
-        })) {
-          continue;
-        }
-        
         log.info(`Checking dependency: ${dep.name}@${dep.version} (${dep.packageManager})`);
         
-        // Update dependency with latest version info
+        // Check for issues
         await checkDependencyForIssues(dep, config);
         
         // Create issue for problematic dependencies
         if (dep.isOutdated || 
-            (dep.vulnerabilities && dep.vulnerabilities.length > 0) || 
-            dep.isDeprecated) {
+            dep.isVulnerable || 
+            dep.isDeprecated || 
+            dep.isUnused || 
+            dep.isLicenseIssue ||
+            dep.isNotMaintained) {
           
           const issue: DependencyIssue = {
             detectedAt: new Date(),
-            packageName: dep.name,
-            currentVersion: dep.version,
-            latestVersion: dep.latestVersion,
+            name: dep.name,
+            version: dep.version,
+            type: dep.type,
             packageManager: dep.packageManager,
-            isDirect: dep.isDirect,
+            manifestPath: dep.manifestPath,
+            latestVersion: dep.latestVersion,
             isOutdated: dep.isOutdated || false,
-            isVulnerable: (dep.vulnerabilities && dep.vulnerabilities.length > 0) || false,
+            isVulnerable: dep.isVulnerable || false,
             vulnerabilities: dep.vulnerabilities || [],
-            dependentFiles: dep.dependentFiles,
-            updateImpact: await assessUpdateImpact(dep, config),
+            isDeprecated: dep.isDeprecated || false,
+            isUnused: dep.isUnused || false,
+            isLicenseIssue: dep.isLicenseIssue || false,
+            licenseIssue: dep.licenseIssue,
+            license: dep.license,
+            isNotMaintained: dep.isNotMaintained || false,
+            lastPublishDate: dep.lastPublishDate,
+            duplicates: dep.duplicates,
+            upgradeBreaking: dep.upgradeBreaking,
+            dependents: dep.dependents,
+            dependsOn: dep.dependsOn,
+            repositoryUrl: dep.repositoryUrl,
+            homepageUrl: dep.homepageUrl,
+            author: dep.author,
+            maintainers: dep.maintainers,
             riskLevel: calculateRiskLevel(dep),
             recommendation: generateRecommendation(dep),
             tags: generateTags(dep)
@@ -177,38 +344,15 @@ export async function scanDependencies(
 }
 
 /**
- * Collect dependencies for a specific package manager
+ * Scan for JavaScript/TypeScript dependencies
  */
-async function collectDependencies(
-  packageManager: 'npm' | 'pip' | 'maven' | 'gradle' | 'nuget',
-  config: DependencyScannerConfig
-): Promise<DependencyInfo[]> {
-  switch (packageManager) {
-    case 'npm':
-      return collectNpmDependencies(config);
-    case 'pip':
-      return collectPipDependencies(config);
-    case 'maven':
-      return collectMavenDependencies(config);
-    case 'gradle':
-      return collectGradleDependencies(config);
-    case 'nuget':
-      return collectNugetDependencies(config);
-    default:
-      return [];
-  }
-}
-
-/**
- * Collect NPM dependencies
- */
-async function collectNpmDependencies(
+async function scanJavaScriptDependencies(
   config: DependencyScannerConfig
 ): Promise<DependencyInfo[]> {
   const dependencies: DependencyInfo[] = [];
   
   try {
-    // Find all package.json files
+    // Find package.json files
     const packageJsonPaths = await glob('**/package.json', {
       cwd: config.rootDir,
       absolute: true,
@@ -221,231 +365,185 @@ async function collectNpmDependencies(
       ]
     });
     
-    log.info(`Found ${packageJsonPaths.length} package.json files`);
-    
-    // Process each package.json file
     for (const packageJsonPath of packageJsonPaths) {
       try {
-        const packageDirPath = path.dirname(packageJsonPath);
-        const packageJson = JSON.parse(await readFileAsync(packageJsonPath, 'utf8'));
+        const content = await readFileAsync(packageJsonPath, 'utf8');
+        const packageJson = JSON.parse(content);
         
-        // Direct dependencies from different types
-        const directDeps = {
-          ...Object.entries(packageJson.dependencies || {}).reduce(
-            (acc, [name, version]) => ({ ...acc, [name]: { version, type: 'dependency' } }),
-            {}
-          ),
-          ...Object.entries(packageJson.devDependencies || {}).reduce(
-            (acc, [name, version]) => ({ ...acc, [name]: { version, type: 'devDependency' } }),
-            {}
-          ),
-          ...Object.entries(packageJson.peerDependencies || {}).reduce(
-            (acc, [name, version]) => ({ ...acc, [name]: { version, type: 'peerDependency' } }),
-            {}
-          ),
-          ...Object.entries(packageJson.optionalDependencies || {}).reduce(
-            (acc, [name, version]) => ({ ...acc, [name]: { version, type: 'optionalDependency' } }),
-            {}
-          )
-        };
-        
-        // Add direct dependencies
-        for (const [name, info] of Object.entries(directDeps)) {
-          const depInfo: DependencyInfo = {
-            name,
-            version: String(info.version).replace(/[^0-9.]/g, ''),
-            packageManager: 'npm',
-            isDirect: true,
-            depth: 0,
-            dependentFiles: [packageJsonPath],
-            path: packageJsonPath,
-            devDependency: info.type === 'devDependency',
-            peerDependency: info.type === 'peerDependency',
-            optionalDependency: info.type === 'optionalDependency'
-          };
-          
-          dependencies.push(depInfo);
+        // Determine the package manager
+        let packageManager = 'npm'; // Default
+        try {
+          // Check for lockfiles to determine package manager
+          const dirPath = path.dirname(packageJsonPath);
+          if (fs.existsSync(path.join(dirPath, 'yarn.lock'))) {
+            packageManager = 'yarn';
+          } else if (fs.existsSync(path.join(dirPath, 'pnpm-lock.yaml'))) {
+            packageManager = 'pnpm';
+          }
+        } catch (lockError) {
+          log.debug(`Error detecting package manager for ${packageJsonPath}`, { error: lockError });
         }
         
-        // If not limiting to direct dependencies, check for locked dependencies
-        if (!config.directDependenciesOnly) {
-          // Try package-lock.json first
-          const packageLockPath = path.join(packageDirPath, 'package-lock.json');
-          if (fs.existsSync(packageLockPath)) {
-            const lockFile = JSON.parse(await readFileAsync(packageLockPath, 'utf8'));
-            
-            if (lockFile.dependencies) {
-              addTransitiveDepsFromNpmLock(lockFile.dependencies, dependencies, packageJsonPath, 1);
-            }
-          }
-          // Try npm-shrinkwrap.json next
-          else {
-            const shrinkwrapPath = path.join(packageDirPath, 'npm-shrinkwrap.json');
-            if (fs.existsSync(shrinkwrapPath)) {
-              const shrinkwrap = JSON.parse(await readFileAsync(shrinkwrapPath, 'utf8'));
-              
-              if (shrinkwrap.dependencies) {
-                addTransitiveDepsFromNpmLock(shrinkwrap.dependencies, dependencies, packageJsonPath, 1);
-              }
-            }
-            // Try yarn.lock next
-            else {
-              const yarnLockPath = path.join(packageDirPath, 'yarn.lock');
-              if (fs.existsSync(yarnLockPath)) {
-                // Yarn lock files are not JSON, but we can still extract some info
-                // A proper parser would be more accurate
-                const yarnLockContent = await readFileAsync(yarnLockPath, 'utf8');
-                addTransitiveDepsFromYarnLock(yarnLockContent, dependencies, packageJsonPath);
-              }
-              // Try to generate a package lock if configured
-              else if (config.generateLockFiles) {
-                try {
-                  await execAsync('npm install --package-lock-only', { cwd: packageDirPath });
-                  
-                  if (fs.existsSync(packageLockPath)) {
-                    const lockFile = JSON.parse(await readFileAsync(packageLockPath, 'utf8'));
-                    
-                    if (lockFile.dependencies) {
-                      addTransitiveDepsFromNpmLock(lockFile.dependencies, dependencies, packageJsonPath, 1);
-                    }
-                  }
-                } catch (npmError) {
-                  log.warn(`Could not generate package-lock.json for ${packageDirPath}`, { error: npmError });
-                }
-              }
-            }
-          }
+        // Process direct dependencies
+        if (packageJson.dependencies) {
+          await processDependencyObject(packageJson.dependencies, 'direct', packageManager, packageJsonPath, dependencies);
+        }
+        
+        // Process dev dependencies
+        if (packageJson.devDependencies) {
+          await processDependencyObject(packageJson.devDependencies, 'dev', packageManager, packageJsonPath, dependencies);
+        }
+        
+        // Process peer dependencies
+        if (packageJson.peerDependencies) {
+          await processDependencyObject(packageJson.peerDependencies, 'peer', packageManager, packageJsonPath, dependencies);
+        }
+        
+        // Process optional dependencies
+        if (packageJson.optionalDependencies) {
+          await processDependencyObject(packageJson.optionalDependencies, 'optional', packageManager, packageJsonPath, dependencies);
         }
       } catch (packageJsonError) {
         log.warn(`Error processing package.json at ${packageJsonPath}`, { error: packageJsonError });
       }
     }
+    
+    // Check for transitive dependencies if scan depth > 1
+    if ((config.scanDepth || 1) > 1) {
+      // In a complete implementation, this would involve parsing lockfiles (package-lock.json, yarn.lock, etc.)
+      // and extracting transitive dependency information
+    }
+    
+    // Check for unused dependencies if configured
+    if (config.checkUnused) {
+      await checkUnusedJSDependencies(dependencies, config);
+    }
   } catch (error) {
-    log.error('Error collecting npm dependencies', { error });
+    log.error('Error scanning JavaScript/TypeScript dependencies', { error });
   }
   
   return dependencies;
 }
 
 /**
- * Add transitive dependencies from NPM lock file
+ * Process a dependency object from package.json
  */
-function addTransitiveDepsFromNpmLock(
-  dependencies: Record<string, any>,
-  depInfoList: DependencyInfo[],
-  packageJsonPath: string,
-  depth: number
-) {
-  for (const [name, info] of Object.entries(dependencies)) {
-    // Skip if already added as direct dependency
-    if (depInfoList.some(d => d.name === name && d.isDirect && d.path === packageJsonPath)) {
-      continue;
-    }
-    
-    // New transitive dependency
-    const depInfo: DependencyInfo = {
-      name,
-      version: info.version,
-      packageManager: 'npm',
-      isDirect: false,
-      depth,
-      dependentFiles: [packageJsonPath],
-      path: packageJsonPath
-    };
-    
-    // Avoid duplicates by checking if this exact dependency is already in the list
-    if (!depInfoList.some(d => d.name === name && d.version === info.version && 
-                           d.packageManager === 'npm' && d.path === packageJsonPath)) {
-      depInfoList.push(depInfo);
-    } else {
-      // Update existing entry's dependent files if needed
-      const existing = depInfoList.find(d => d.name === name && d.version === info.version && 
-                                        d.packageManager === 'npm' && d.path === packageJsonPath);
-      if (existing && !existing.dependentFiles.includes(packageJsonPath)) {
-        existing.dependentFiles.push(packageJsonPath);
-      }
-    }
-    
-    // Recursively process nested dependencies
-    if (info.dependencies && depth < (depInfoList.length > 1000 ? 2 : 5)) { // Limit depth for large projects
-      addTransitiveDepsFromNpmLock(info.dependencies, depInfoList, packageJsonPath, depth + 1);
-    }
-  }
-}
-
-/**
- * Add transitive dependencies from Yarn lock file
- * This is a simplified implementation and doesn't handle all yarn.lock formats
- */
-function addTransitiveDepsFromYarnLock(
-  yarnLockContent: string,
-  depInfoList: DependencyInfo[],
-  packageJsonPath: string
-) {
-  // Very basic yarn.lock parsing - a proper parser would be better
-  const lines = yarnLockContent.split('\n');
-  let currentDep: {name?: string, version?: string} = {};
-  
-  for (const line of lines) {
-    // Each dependency block starts with the name and requested version(s)
-    if (line.match(/^"?([^@"]+)@/) && !line.includes('integrity') && !line.includes('resolved')) {
-      const match = line.match(/^"?([^@"]+)@/);
-      if (match) {
-        currentDep = { name: match[1] };
-      }
-    }
-    // Get actual version
-    else if (line.match(/^  version/) && currentDep.name) {
-      const versionMatch = line.match(/version "?([^"]+)"?/);
-      if (versionMatch) {
-        currentDep.version = versionMatch[1];
-        
-        // Skip if already added as direct dependency
-        if (!depInfoList.some(d => d.name === currentDep.name && d.isDirect && d.path === packageJsonPath)) {
-          // New transitive dependency
-          const depInfo: DependencyInfo = {
-            name: currentDep.name,
-            version: currentDep.version,
-            packageManager: 'npm',
-            isDirect: false,
-            depth: 1, // Simplified, all considered depth 1
-            dependentFiles: [packageJsonPath],
-            path: packageJsonPath
-          };
-          
-          // Add if not already in the list
-          if (!depInfoList.some(d => d.name === currentDep.name && d.version === currentDep.version && 
-                                d.packageManager === 'npm' && d.path === packageJsonPath)) {
-            depInfoList.push(depInfo);
-          } else {
-            // Update existing entry if needed
-            const existing = depInfoList.find(d => d.name === currentDep.name && 
-                                           d.version === currentDep.version && 
-                                           d.packageManager === 'npm' && 
-                                           d.path === packageJsonPath);
-            if (existing && !existing.dependentFiles.includes(packageJsonPath)) {
-              existing.dependentFiles.push(packageJsonPath);
-            }
-          }
+async function processDependencyObject(
+  dependencyObject: Record<string, string>,
+  type: 'direct' | 'dev' | 'peer' | 'optional' | 'transitive',
+  packageManager: string,
+  manifestPath: string,
+  dependencies: DependencyInfo[]
+): Promise<void> {
+  for (const [name, versionSpec] of Object.entries(dependencyObject)) {
+    try {
+      // Extract the version from the version spec
+      let version = versionSpec.replace(/[^0-9.]/g, '');
+      
+      // Handle complex version specs like "~1.2.3", "^1.2.3", etc.
+      if (!version) {
+        if (versionSpec.includes('#')) {
+          // Handle GitHub URLs with hashes
+          version = versionSpec.split('#')[1] || 'unknown';
+        } else if (versionSpec.includes('/')) {
+          // Handle local paths or GitHub URLs
+          version = 'local';
+        } else {
+          version = 'unknown';
         }
-        
-        currentDep = {}; // Reset for next dependency
       }
+      
+      dependencies.push({
+        name,
+        version,
+        type,
+        packageManager,
+        manifestPath
+      });
+    } catch (depError) {
+      log.debug(`Error processing dependency ${name}`, { error: depError });
     }
   }
 }
 
 /**
- * Collect Python (pip) dependencies
+ * Check for unused JS dependencies
  */
-async function collectPipDependencies(
+async function checkUnusedJSDependencies(
+  dependencies: DependencyInfo[],
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Group dependencies by their manifest path
+    const depsByManifest: Record<string, DependencyInfo[]> = {};
+    
+    for (const dep of dependencies) {
+      if (!depsByManifest[dep.manifestPath]) {
+        depsByManifest[dep.manifestPath] = [];
+      }
+      depsByManifest[dep.manifestPath].push(dep);
+    }
+    
+    // Check each package.json separately
+    for (const [manifestPath, deps] of Object.entries(depsByManifest)) {
+      const projectDir = path.dirname(manifestPath);
+      
+      // Find all JS/TS files in the project
+      const sourceFiles = await glob('**/*.{js,jsx,ts,tsx}', {
+        cwd: projectDir,
+        absolute: true,
+        ignore: [
+          'node_modules/**',
+          'dist/**',
+          'build/**'
+        ]
+      });
+      
+      // Read all source files and create a combined content string
+      let combinedContent = '';
+      for (const filePath of sourceFiles) {
+        try {
+          const content = await readFileAsync(filePath, 'utf8');
+          combinedContent += content + '\n';
+        } catch (fileError) {
+          log.debug(`Error reading file ${filePath}`, { error: fileError });
+        }
+      }
+      
+      // Check each dependency for usage
+      for (const dep of deps) {
+        // Skip dev dependencies as they might be used in config files or scripts
+        if (dep.type === 'dev') continue;
+        
+        // Check if the dependency name appears in the source code
+        // This is a simplified check - a complete solution would parse imports properly
+        if (!combinedContent.includes(`'${dep.name}'`) && 
+            !combinedContent.includes(`"${dep.name}"`) && 
+            !combinedContent.includes(`require('${dep.name}`) && 
+            !combinedContent.includes(`require("${dep.name}`) && 
+            !combinedContent.includes(`from '${dep.name}`) && 
+            !combinedContent.includes(`from "${dep.name}`)) {
+          
+          dep.isUnused = true;
+        }
+      }
+    }
+  } catch (error) {
+    log.error('Error checking for unused JS dependencies', { error });
+  }
+}
+
+/**
+ * Scan for Python dependencies
+ */
+async function scanPythonDependencies(
   config: DependencyScannerConfig
 ): Promise<DependencyInfo[]> {
   const dependencies: DependencyInfo[] = [];
   
   try {
-    // Find all requirements.txt files
-    const reqFilePaths = await glob('**/requirements{,.*}.txt', {
+    // Find requirements.txt files
+    const requirementsPaths = await glob('**/requirements{,.*}.txt', {
       cwd: config.rootDir,
       absolute: true,
       ignore: [
@@ -453,31 +551,13 @@ async function collectPipDependencies(
         '**/venv/**',
         '**/.venv/**',
         '**/env/**',
-        '**/.env/**',
-        '**/dist/**',
-        '**/build/**'
+        '**/.env/**'
       ]
     });
     
-    // Also find setup.py files
-    const setupPyPaths = await glob('**/setup.py', {
-      cwd: config.rootDir,
-      absolute: true,
-      ignore: [
-        ...(config.excludePaths || []),
-        '**/venv/**',
-        '**/.venv/**',
-        '**/env/**',
-        '**/.env/**',
-        '**/dist/**',
-        '**/build/**'
-      ]
-    });
-    
-    // Process requirements.txt files
-    for (const reqFilePath of reqFilePaths) {
+    for (const requirementsPath of requirementsPaths) {
       try {
-        const content = await readFileAsync(reqFilePath, 'utf8');
+        const content = await readFileAsync(requirementsPath, 'utf8');
         const lines = content.split('\n');
         
         for (const line of lines) {
@@ -488,215 +568,336 @@ async function collectPipDependencies(
           
           // Parse the requirement line
           const reqLine = line.split('#')[0].trim(); // Remove inline comments
+          const parts = reqLine.split(/[=<>!~]+/); // Split by version operators
+          const name = parts[0].trim();
+          const version = parts.length > 1 ? parts[1].trim() : 'unknown';
           
-          // Extract package name and version
-          const parts = reqLine.split('==');
-          if (parts.length >= 2) {
-            const name = parts[0].trim();
-            const version = parts[1].trim().split(/[<>]=?/)[0].trim();
-            
-            // Add to dependencies list
-            dependencies.push({
-              name,
-              version,
-              packageManager: 'pip',
-              isDirect: true,
-              depth: 0,
-              dependentFiles: [reqFilePath],
-              path: reqFilePath
-            });
-          } else {
-            // Handle requirements without version
-            const match = reqLine.match(/^([^<>=~]+)/);
-            if (match) {
-              const name = match[1].trim();
-              
-              dependencies.push({
-                name,
-                version: 'unknown',
-                packageManager: 'pip',
-                isDirect: true,
-                depth: 0,
-                dependentFiles: [reqFilePath],
-                path: reqFilePath
-              });
-            }
-          }
+          dependencies.push({
+            name,
+            version,
+            type: 'direct', // requirements.txt doesn't distinguish between direct/dev
+            packageManager: 'pip',
+            manifestPath: requirementsPath
+          });
         }
-      } catch (reqFileError) {
-        log.warn(`Error processing requirements file ${reqFilePath}`, { error: reqFileError });
+      } catch (requirementsError) {
+        log.warn(`Error processing requirements.txt at ${requirementsPath}`, { error: requirementsError });
       }
     }
     
-    // Process setup.py files for install_requires
+    // Find setup.py files
+    const setupPyPaths = await glob('**/setup.py', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || []),
+        '**/venv/**',
+        '**/.venv/**',
+        '**/env/**',
+        '**/.env/**'
+      ]
+    });
+    
     for (const setupPyPath of setupPyPaths) {
       try {
         const content = await readFileAsync(setupPyPath, 'utf8');
         
-        // Find install_requires section
-        const installReqMatch = content.match(/install_requires\s*=\s*\[([^\]]+)\]/s);
-        if (installReqMatch) {
-          const requiresList = installReqMatch[1];
+        // This is a very simple parser - a real implementation would use a Python parser
+        // Look for install_requires=['package1', 'package2>=1.0']
+        const installRequiresMatch = content.match(/install_requires\s*=\s*\[([^\]]+)\]/s);
+        
+        if (installRequiresMatch && installRequiresMatch[1]) {
+          const requiresStr = installRequiresMatch[1];
+          const requireItems = requiresStr.match(/(['"])(.+?)\1/g) || [];
           
-          // Extract package names
-          const packageMatches = requiresList.match(/['"]([^'"]+)['"]\s*,?/g);
-          if (packageMatches) {
-            for (const packageMatch of packageMatches) {
-              const strippedPackage = packageMatch.replace(/['",\s]/g, '');
+          for (const item of requireItems) {
+            // Remove quotes
+            const reqStr = item.substring(1, item.length - 1);
+            
+            // Parse the requirement
+            const parts = reqStr.split(/[=<>!~]+/); // Split by version operators
+            const name = parts[0].trim();
+            const version = parts.length > 1 ? parts[1].trim() : 'unknown';
+            
+            dependencies.push({
+              name,
+              version,
+              type: 'direct',
+              packageManager: 'pip',
+              manifestPath: setupPyPath
+            });
+          }
+        }
+        
+        // Look for extras_require={'dev': ['package1', 'package2>=1.0']}
+        const extrasRequireMatch = content.match(/extras_require\s*=\s*\{([^\}]+)\}/s);
+        
+        if (extrasRequireMatch && extrasRequireMatch[1]) {
+          const extrasStr = extrasRequireMatch[1];
+          const extrasSections = extrasStr.split(':');
+          
+          for (let i = 0; i < extrasSections.length - 1; i++) {
+            const sectionName = extrasSections[i].match(/(['"])(.+?)\1/)?.[2] || 'unknown';
+            const requireItems = extrasSections[i + 1].match(/(['"])(.+?)\1/g) || [];
+            
+            for (const item of requireItems) {
+              // Remove quotes
+              const reqStr = item.substring(1, item.length - 1);
               
-              // Parse for name and version
-              const parts = strippedPackage.split('==');
-              if (parts.length >= 2) {
-                const name = parts[0].trim();
-                const version = parts[1].trim().split(/[<>]=?/)[0].trim();
-                
-                // Add to dependencies list
-                dependencies.push({
-                  name,
-                  version,
-                  packageManager: 'pip',
-                  isDirect: true,
-                  depth: 0,
-                  dependentFiles: [setupPyPath],
-                  path: setupPyPath
-                });
-              } else {
-                // Handle requirements without version
-                const match = strippedPackage.match(/^([^<>=~]+)/);
-                if (match) {
-                  const name = match[1].trim();
-                  
-                  dependencies.push({
-                    name,
-                    version: 'unknown',
-                    packageManager: 'pip',
-                    isDirect: true,
-                    depth: 0,
-                    dependentFiles: [setupPyPath],
-                    path: setupPyPath
-                  });
-                }
-              }
+              // Parse the requirement
+              const parts = reqStr.split(/[=<>!~]+/); // Split by version operators
+              const name = parts[0].trim();
+              const version = parts.length > 1 ? parts[1].trim() : 'unknown';
+              
+              dependencies.push({
+                name,
+                version,
+                type: sectionName === 'dev' || sectionName === 'test' ? 'dev' : 'optional',
+                packageManager: 'pip',
+                manifestPath: setupPyPath
+              });
             }
           }
         }
       } catch (setupPyError) {
-        log.warn(`Error processing setup.py ${setupPyPath}`, { error: setupPyError });
+        log.warn(`Error processing setup.py at ${setupPyPath}`, { error: setupPyError });
       }
     }
     
-    // If configured and Python is available, try to get transitive dependencies
-    if (!config.directDependenciesOnly && reqFilePaths.length > 0) {
+    // Find Pipfile files
+    const pipfilePaths = await glob('**/Pipfile', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || []),
+        '**/venv/**',
+        '**/.venv/**',
+        '**/env/**',
+        '**/.env/**'
+      ]
+    });
+    
+    for (const pipfilePath of pipfilePaths) {
       try {
-        for (const reqFilePath of reqFilePaths) {
-          const reqDir = path.dirname(reqFilePath);
-          
-          // Run pip-compile to get the dependency tree
-          try {
-            await execAsync(`pip-compile --dry-run ${path.basename(reqFilePath)}`, { cwd: reqDir });
-          } catch (pipCompileError) {
-            log.debug(`pip-compile not available for ${reqFilePath}`);
-            continue; // Skip if pip-compile fails
+        const content = await readFileAsync(pipfilePath, 'utf8');
+        const lines = content.split('\n');
+        
+        let currentSection = '';
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
+            continue;
           }
           
-          // Run pipdeptree if available
-          try {
-            const { stdout } = await execAsync('pipdeptree --json', { cwd: reqDir });
-            const depsTree = JSON.parse(stdout);
-            
-            // Process dependency tree
-            for (const pkg of depsTree) {
-              const directDep = dependencies.find(d => 
-                d.name === pkg.package.key && 
-                d.packageManager === 'pip' && 
-                d.path === reqFilePath
-              );
+          // Check for section headers
+          if (line.trim().startsWith('[') && line.trim().endsWith(']')) {
+            currentSection = line.trim().slice(1, -1).toLowerCase();
+            continue;
+          }
+          
+          if (currentSection === 'packages' || currentSection === 'dev-packages') {
+            const match = line.match(/^([\w-_\.]+)\s*=\s*["']?([^"']+)["']?$/i);
+            if (match) {
+              const name = match[1].trim();
+              const versionSpec = match[2].trim();
               
-              if (directDep && pkg.dependencies) {
-                // Process the transitive dependencies
-                addPipTransitiveDependencies(pkg.dependencies, dependencies, reqFilePath, 1);
+              // Extract version from spec
+              let version = 'unknown';
+              if (versionSpec.startsWith('==')) {
+                version = versionSpec.substring(2).trim();
+              } else if (versionSpec.startsWith('>=')) {
+                version = versionSpec.substring(2).trim();
+              } else if (versionSpec.startsWith('>')) {
+                version = versionSpec.substring(1).trim();
+              } else if (versionSpec.startsWith('~=')) {
+                version = versionSpec.substring(2).trim();
+              } else if (versionSpec.startsWith('~')) {
+                version = versionSpec.substring(1).trim();
               }
+              
+              dependencies.push({
+                name,
+                version,
+                type: currentSection === 'dev-packages' ? 'dev' : 'direct',
+                packageManager: 'pipenv',
+                manifestPath: pipfilePath
+              });
             }
-          } catch (pipdeptreeError) {
-            log.debug(`pipdeptree not available for ${reqFilePath}`);
           }
         }
-      } catch (transitiveError) {
-        log.warn('Error collecting transitive pip dependencies', { error: transitiveError });
+      } catch (pipfileError) {
+        log.warn(`Error processing Pipfile at ${pipfilePath}`, { error: pipfileError });
       }
     }
+    
+    // Find pyproject.toml files (Poetry)
+    const pyprojectPaths = await glob('**/pyproject.toml', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || []),
+        '**/venv/**',
+        '**/.venv/**',
+        '**/env/**',
+        '**/.env/**'
+      ]
+    });
+    
+    for (const pyprojectPath of pyprojectPaths) {
+      try {
+        const content = await readFileAsync(pyprojectPath, 'utf8');
+        const lines = content.split('\n');
+        
+        let inDependencies = false;
+        let inDevDependencies = false;
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
+            continue;
+          }
+          
+          // Check for section headers
+          if (line.trim() === '[tool.poetry.dependencies]') {
+            inDependencies = true;
+            inDevDependencies = false;
+            continue;
+          } else if (line.trim() === '[tool.poetry.dev-dependencies]') {
+            inDependencies = false;
+            inDevDependencies = true;
+            continue;
+          } else if (line.trim().startsWith('[') && line.trim().endsWith(']')) {
+            inDependencies = false;
+            inDevDependencies = false;
+            continue;
+          }
+          
+          if (inDependencies || inDevDependencies) {
+            // Skip python dependency
+            if (line.trim().startsWith('python =')) {
+              continue;
+            }
+            
+            const match = line.match(/^([\w-_\.]+)\s*=\s*["']?([^"']+)["']?$/i);
+            if (match) {
+              const name = match[1].trim();
+              const versionSpec = match[2].trim();
+              
+              // Extract version from spec
+              let version = 'unknown';
+              const versionMatch = versionSpec.match(/["']([^"']+)["']/);
+              if (versionMatch) {
+                version = versionMatch[1];
+              }
+              
+              dependencies.push({
+                name,
+                version,
+                type: inDevDependencies ? 'dev' : 'direct',
+                packageManager: 'poetry',
+                manifestPath: pyprojectPath
+              });
+            }
+          }
+        }
+      } catch (poetryError) {
+        log.warn(`Error processing pyproject.toml at ${pyprojectPath}`, { error: poetryError });
+      }
+    }
+    
+    // Check for unused dependencies if configured
+    if (config.checkUnused) {
+      await checkUnusedPythonDependencies(dependencies, config);
+    }
   } catch (error) {
-    log.error('Error collecting pip dependencies', { error });
+    log.error('Error scanning Python dependencies', { error });
   }
   
   return dependencies;
 }
 
 /**
- * Add transitive dependencies from pip dependency tree
+ * Check for unused Python dependencies
  */
-function addPipTransitiveDependencies(
-  dependencies: Array<{key: string, package_name: string, installed_version: string, dependencies: any[]}>,
-  depInfoList: DependencyInfo[],
-  requiredPath: string,
-  depth: number
-) {
-  for (const dep of dependencies) {
-    // Skip if already added as direct dependency
-    if (depInfoList.some(d => d.name === dep.key && d.isDirect && d.path === requiredPath)) {
-      continue;
+async function checkUnusedPythonDependencies(
+  dependencies: DependencyInfo[],
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Group dependencies by their manifest path
+    const depsByManifest: Record<string, DependencyInfo[]> = {};
+    
+    for (const dep of dependencies) {
+      if (!depsByManifest[dep.manifestPath]) {
+        depsByManifest[dep.manifestPath] = [];
+      }
+      depsByManifest[dep.manifestPath].push(dep);
     }
     
-    // New transitive dependency
-    const depInfo: DependencyInfo = {
-      name: dep.key,
-      version: dep.installed_version,
-      packageManager: 'pip',
-      isDirect: false,
-      depth,
-      dependentFiles: [requiredPath],
-      path: requiredPath
-    };
-    
-    // Add if not already in the list
-    if (!depInfoList.some(d => d.name === dep.key && d.version === dep.installed_version && 
-                         d.packageManager === 'pip' && d.path === requiredPath)) {
-      depInfoList.push(depInfo);
-    } else {
-      // Update existing entry if needed
-      const existing = depInfoList.find(d => d.name === dep.key && 
-                                     d.version === dep.installed_version && 
-                                     d.packageManager === 'pip' && 
-                                     d.path === requiredPath);
-      if (existing && !existing.dependentFiles.includes(requiredPath)) {
-        existing.dependentFiles.push(requiredPath);
+    // Check each project separately
+    for (const [manifestPath, deps] of Object.entries(depsByManifest)) {
+      const projectDir = path.dirname(manifestPath);
+      
+      // Find all Python files in the project
+      const sourceFiles = await glob('**/*.py', {
+        cwd: projectDir,
+        absolute: true,
+        ignore: [
+          'venv/**',
+          '.venv/**',
+          'env/**',
+          '.env/**'
+        ]
+      });
+      
+      // Read all source files and create a combined content string
+      let combinedContent = '';
+      for (const filePath of sourceFiles) {
+        try {
+          const content = await readFileAsync(filePath, 'utf8');
+          combinedContent += content + '\n';
+        } catch (fileError) {
+          log.debug(`Error reading file ${filePath}`, { error: fileError });
+        }
+      }
+      
+      // Check each dependency for usage
+      for (const dep of deps) {
+        // Skip dev dependencies as they might be used in tests or development tools
+        if (dep.type === 'dev') continue;
+        
+        // Check if the dependency name appears in the source code
+        // This is a simplified check - a complete solution would parse imports properly
+        if (!combinedContent.includes(`import ${dep.name}`) && 
+            !combinedContent.includes(`from ${dep.name} import`) && 
+            !combinedContent.includes(`import ${dep.name.replace('-', '_')}`) && 
+            !combinedContent.includes(`from ${dep.name.replace('-', '_')} import`)) {
+          
+          dep.isUnused = true;
+        }
       }
     }
-    
-    // Recursively process nested dependencies
-    if (dep.dependencies && depth < (depInfoList.length > 1000 ? 2 : 5)) { // Limit depth for large projects
-      addPipTransitiveDependencies(dep.dependencies, depInfoList, requiredPath, depth + 1);
-    }
+  } catch (error) {
+    log.error('Error checking for unused Python dependencies', { error });
   }
 }
 
 /**
- * Collect Maven dependencies
+ * Scan for Java dependencies
  */
-async function collectMavenDependencies(
+async function scanJavaDependencies(
   config: DependencyScannerConfig
 ): Promise<DependencyInfo[]> {
   const dependencies: DependencyInfo[] = [];
   
   try {
-    // Find all pom.xml files
+    // Find pom.xml files (Maven)
     const pomPaths = await glob('**/pom.xml', {
       cwd: config.rootDir,
       absolute: true,
       ignore: [
         ...(config.excludePaths || []),
-        '**/target/**',
-        '**/build/**'
+        '**/target/**'
       ]
     });
     
@@ -704,142 +905,53 @@ async function collectMavenDependencies(
       try {
         const content = await readFileAsync(pomPath, 'utf8');
         
-        // Very basic XML parsing - a proper XML parser would be better
-        // Extract dependency elements
-        const dependencyMatches = content.match(/<dependency>([\s\S]*?)<\/dependency>/g);
+        // Extract dependencies - this is a simplified approach
+        // A complete solution would use an XML parser
+        const dependencyMatches = content.match(/<dependency>[\s\S]*?<\/dependency>/g) || [];
         
-        if (dependencyMatches) {
-          for (const depMatch of dependencyMatches) {
-            const groupIdMatch = depMatch.match(/<groupId>([^<]+)<\/groupId>/);
-            const artifactIdMatch = depMatch.match(/<artifactId>([^<]+)<\/artifactId>/);
-            const versionMatch = depMatch.match(/<version>([^<]+)<\/version>/);
-            const scopeMatch = depMatch.match(/<scope>([^<]+)<\/scope>/);
+        for (const depMatch of dependencyMatches) {
+          const groupIdMatch = depMatch.match(/<groupId>([^<]+)<\/groupId>/);
+          const artifactIdMatch = depMatch.match(/<artifactId>([^<]+)<\/artifactId>/);
+          const versionMatch = depMatch.match(/<version>([^<]+)<\/version>/);
+          const scopeMatch = depMatch.match(/<scope>([^<]+)<\/scope>/);
+          
+          if (groupIdMatch && artifactIdMatch) {
+            const groupId = groupIdMatch[1].trim();
+            const artifactId = artifactIdMatch[1].trim();
+            const version = versionMatch ? versionMatch[1].trim() : 'unknown';
+            const scope = scopeMatch ? scopeMatch[1].trim() : 'compile';
             
-            if (groupIdMatch && artifactIdMatch) {
-              const groupId = groupIdMatch[1].trim();
-              const artifactId = artifactIdMatch[1].trim();
-              const version = versionMatch ? versionMatch[1].trim() : 'unknown';
-              const scope = scopeMatch ? scopeMatch[1].trim() : 'compile';
-              
-              // Maven dependency name format: groupId:artifactId
-              const name = `${groupId}:${artifactId}`;
-              
-              // Add to dependencies list
-              dependencies.push({
-                name,
-                version,
-                packageManager: 'maven',
-                isDirect: true,
-                depth: 0,
-                dependentFiles: [pomPath],
-                path: pomPath,
-                devDependency: scope === 'test',
-                optionalDependency: scope === 'provided'
-              });
+            // Determine dependency type based on scope
+            let type: 'direct' | 'dev' | 'peer' | 'optional' | 'transitive' = 'direct';
+            if (scope === 'test') {
+              type = 'dev';
+            } else if (scope === 'provided') {
+              type = 'peer';
+            } else if (scope === 'runtime') {
+              type = 'direct';
             }
+            
+            dependencies.push({
+              name: `${groupId}:${artifactId}`,
+              version,
+              type,
+              packageManager: 'maven',
+              manifestPath: pomPath
+            });
           }
         }
       } catch (pomError) {
-        log.warn(`Error processing pom.xml ${pomPath}`, { error: pomError });
+        log.warn(`Error processing pom.xml at ${pomPath}`, { error: pomError });
       }
     }
     
-    // If configured and Maven is available, try to get transitive dependencies
-    if (!config.directDependenciesOnly && pomPaths.length > 0) {
-      for (const pomPath of pomPaths) {
-        try {
-          const pomDir = path.dirname(pomPath);
-          
-          // Run Maven dependency:tree to get transitive dependencies
-          try {
-            const { stdout } = await execAsync('mvn dependency:tree -DoutputType=text', { cwd: pomDir });
-            
-            // Parse the dependency tree output
-            const lines = stdout.split('\n');
-            let currentDepth = 0;
-            let depStack: {name: string, version: string, depth: number}[] = [];
-            
-            for (const line of lines) {
-              // Skip until we find the dependency tree section
-              if (!line.includes('--- ')) {
-                continue;
-              }
-              
-              // Parse the dependency line
-              // Format is usually: [INFO] [level]groupId:artifactId:type:version:scope
-              const depMatch = line.match(/\[INFO\]\s*(\|\s+)*([+\\-]+-\s+)(.+):(\w+):([^:]+)(?::(\w+))?/);
-              
-              if (depMatch) {
-                const indentLevel = (depMatch[1] || '').split('|').length - 1;
-                const groupArtifact = `${depMatch[3]}:${depMatch[4]}`;
-                const version = depMatch[5];
-                const scope = depMatch[6] || 'compile';
-                
-                // Direct dependencies were already added from the POM file
-                if (indentLevel > 0) {
-                  // This is a transitive dependency
-                  
-                  // Update the stack to maintain proper parent-child relationships
-                  while (depStack.length > 0 && depStack[depStack.length - 1].depth >= indentLevel) {
-                    depStack.pop();
-                  }
-                  
-                  // Add to dependencies list if not already there
-                  if (!dependencies.some(d => d.name === groupArtifact && 
-                                        d.version === version && 
-                                        d.packageManager === 'maven' && 
-                                        d.path === pomPath)) {
-                    
-                    dependencies.push({
-                      name: groupArtifact,
-                      version,
-                      packageManager: 'maven',
-                      isDirect: false,
-                      depth: indentLevel,
-                      dependentFiles: [pomPath],
-                      path: pomPath,
-                      devDependency: scope === 'test',
-                      optionalDependency: scope === 'provided'
-                    });
-                  }
-                  
-                  // Update the stack
-                  depStack.push({ name: groupArtifact, version, depth: indentLevel });
-                }
-              }
-            }
-          } catch (mvnError) {
-            log.debug(`Maven dependency:tree failed for ${pomPath}`, { error: mvnError });
-          }
-        } catch (transitiveError) {
-          log.warn(`Error collecting transitive Maven dependencies for ${pomPath}`, { error: transitiveError });
-        }
-      }
-    }
-  } catch (error) {
-    log.error('Error collecting Maven dependencies', { error });
-  }
-  
-  return dependencies;
-}
-
-/**
- * Collect Gradle dependencies
- */
-async function collectGradleDependencies(
-  config: DependencyScannerConfig
-): Promise<DependencyInfo[]> {
-  const dependencies: DependencyInfo[] = [];
-  
-  try {
-    // Find all build.gradle files (both Groovy and Kotlin DSL)
-    const gradlePaths = await glob('**/{build.gradle,build.gradle.kts}', {
+    // Find build.gradle files (Gradle)
+    const gradlePaths = await glob('**/build.gradle{,.kts}', {
       cwd: config.rootDir,
       absolute: true,
       ignore: [
         ...(config.excludePaths || []),
-        '**/build/**',
-        '**/.gradle/**'
+        '**/build/**'
       ]
     });
     
@@ -847,334 +959,712 @@ async function collectGradleDependencies(
       try {
         const content = await readFileAsync(gradlePath, 'utf8');
         
-        // Extract dependencies from build.gradle
-        // This is a simplified approach - a proper Gradle parser would be better
-        const dependencyRegexes = [
-          // Groovy syntax: implementation 'group:name:version'
-          /(?:implementation|api|compile|runtime|testImplementation|testCompile|testRuntime)\s+(?:'|")([^:]+):([^:]+):([^'"]+)(?:'|")/g,
-          // Kotlin DSL syntax: implementation("group:name:version")
-          /(?:implementation|api|compile|runtime|testImplementation|testCompile|testRuntime)\s*\(\s*(?:'|")([^:]+):([^:]+):([^'"]+)(?:'|")\s*\)/g
-        ];
+        // Match different Gradle dependency formats
+        // This is a simplified approach - a complete solution would use a proper Gradle parser
         
-        for (const regex of dependencyRegexes) {
-          let match;
-          while ((match = regex.exec(content)) !== null) {
-            const groupId = match[1].trim();
-            const artifactId = match[2].trim();
-            const version = match[3].trim();
+        // Format: implementation 'group:artifact:version'
+        let dependencyMatches = content.match(/(?:implementation|api|compile|testImplementation|testCompile|runtimeOnly|compileOnly)\s+['"](.*?)['"]\)?/g) || [];
+        
+        for (const depMatch of dependencyMatches) {
+          const typeMatch = depMatch.match(/^(\w+)/);
+          const coordsMatch = depMatch.match(/['"]([^'"]+)['"]/);
+          
+          if (typeMatch && coordsMatch) {
+            const depType = typeMatch[1].trim();
+            const coords = coordsMatch[1].trim();
             
-            // Gradle dependency name format: groupId:artifactId
-            const name = `${groupId}:${artifactId}`;
+            // Split coordinates
+            const parts = coords.split(':');
+            if (parts.length >= 2) {
+              const groupId = parts[0].trim();
+              const artifactId = parts[1].trim();
+              const version = parts.length > 2 ? parts[2].trim() : 'unknown';
+              
+              // Determine dependency type based on Gradle configuration
+              let type: 'direct' | 'dev' | 'peer' | 'optional' | 'transitive' = 'direct';
+              if (depType.startsWith('test')) {
+                type = 'dev';
+              } else if (depType === 'compileOnly') {
+                type = 'peer';
+              } else if (depType === 'runtimeOnly') {
+                type = 'direct';
+              }
+              
+              dependencies.push({
+                name: `${groupId}:${artifactId}`,
+                version,
+                type,
+                packageManager: 'gradle',
+                manifestPath: gradlePath
+              });
+            }
+          }
+        }
+        
+        // Format: implementation(group: 'org.example', name: 'library', version: '1.0')
+        dependencyMatches = content.match(/(?:implementation|api|compile|testImplementation|testCompile|runtimeOnly|compileOnly)\s*\([^)]*group\s*:\s*['"]([^'"]+)['"]\s*,\s*name\s*:\s*['"]([^'"]+)['"]\s*,\s*version\s*:\s*['"]([^'"]+)['"][^)]*\)/g) || [];
+        
+        for (const depMatch of dependencyMatches) {
+          const typeMatch = depMatch.match(/^(\w+)/);
+          const groupMatch = depMatch.match(/group\s*:\s*['"]([^'"]+)['"]/);
+          const nameMatch = depMatch.match(/name\s*:\s*['"]([^'"]+)['"]/);
+          const versionMatch = depMatch.match(/version\s*:\s*['"]([^'"]+)['"]/);
+          
+          if (typeMatch && groupMatch && nameMatch) {
+            const depType = typeMatch[1].trim();
+            const groupId = groupMatch[1].trim();
+            const artifactId = nameMatch[1].trim();
+            const version = versionMatch ? versionMatch[1].trim() : 'unknown';
             
-            // Check if the configuration suggests test or optional
-            const configType = match[0].includes('test') ? 'test' : 
-                               match[0].includes('runtime') ? 'runtime' : 'compile';
+            // Determine dependency type based on Gradle configuration
+            let type: 'direct' | 'dev' | 'peer' | 'optional' | 'transitive' = 'direct';
+            if (depType.startsWith('test')) {
+              type = 'dev';
+            } else if (depType === 'compileOnly') {
+              type = 'peer';
+            } else if (depType === 'runtimeOnly') {
+              type = 'direct';
+            }
             
-            // Add to dependencies list
             dependencies.push({
-              name,
+              name: `${groupId}:${artifactId}`,
               version,
+              type,
               packageManager: 'gradle',
-              isDirect: true,
-              depth: 0,
-              dependentFiles: [gradlePath],
-              path: gradlePath,
-              devDependency: configType === 'test',
-              optionalDependency: configType === 'runtime'
+              manifestPath: gradlePath
             });
           }
         }
       } catch (gradleError) {
-        log.warn(`Error processing build.gradle ${gradlePath}`, { error: gradleError });
-      }
-    }
-    
-    // If configured and Gradle is available, try to get transitive dependencies
-    if (!config.directDependenciesOnly && gradlePaths.length > 0) {
-      for (const gradlePath of gradlePaths) {
-        try {
-          const gradleDir = path.dirname(gradlePath);
-          
-          // Create a temporary task to output dependencies if needed
-          const tempTaskPath = path.join(gradleDir, 'dependencies-output.gradle');
-          
-          try {
-            // Add the task if it doesn't exist
-            const taskContent = `
-task printAllDependencies {
-  doLast {
-    configurations.findAll { it.canBeResolved }.each { config ->
-      println "\n--- " + config.name + " dependencies ---"
-      config.resolvedConfiguration.lenientConfiguration.allModuleDependencies.each { dep ->
-        println "${dep.module.id.group}:${dep.module.id.name}:${dep.module.id.version} (${config.name})"
-        dep.children.each { child ->
-          println "  ${child.module.id.group}:${child.module.id.name}:${child.module.id.version}"
-          printChildren(child, 4)
-        }
-      }
-    }
-  }
-}
-
-def printChildren(dep, indent) {
-  dep.children.each { child ->
-    println "${' ' * indent}${child.module.id.group}:${child.module.id.name}:${child.module.id.version}"
-    printChildren(child, indent + 2)
-  }
-}
-`;
-            
-            await fs.promises.writeFile(tempTaskPath, taskContent);
-            
-            // Run the task
-            const { stdout } = await execAsync('./gradlew -q printAllDependencies -I dependencies-output.gradle', { cwd: gradleDir });
-            
-            // Parse the output
-            const lines = stdout.split('\n');
-            let currentConfig = '';
-            
-            for (const line of lines) {
-              // Check for configuration section
-              const configMatch = line.match(/--- ([\w-]+) dependencies ---/);
-              if (configMatch) {
-                currentConfig = configMatch[1];
-                continue;
-              }
-              
-              // Skip empty lines
-              if (!line.trim()) {
-                continue;
-              }
-              
-              // Parse dependency line
-              const indentLevel = line.search(/\S/) / 2;
-              const depMatch = line.trim().match(/([^:]+):([^:]+):([^ ]+)(?: \((.+)\))?/);
-              
-              if (depMatch) {
-                const groupId = depMatch[1].trim();
-                const artifactId = depMatch[2].trim();
-                const version = depMatch[3].trim();
-                const config = depMatch[4] || currentConfig;
-                
-                // Gradle dependency name format: groupId:artifactId
-                const name = `${groupId}:${artifactId}`;
-                
-                // Skip if already added as direct dependency
-                if (indentLevel > 0 && !dependencies.some(d => d.name === name && 
-                                                  d.version === version && 
-                                                  d.packageManager === 'gradle' && 
-                                                  d.path === gradlePath)) {
-                  
-                  // Add to dependencies list
-                  dependencies.push({
-                    name,
-                    version,
-                    packageManager: 'gradle',
-                    isDirect: false,
-                    depth: indentLevel,
-                    dependentFiles: [gradlePath],
-                    path: gradlePath,
-                    devDependency: config.includes('test'),
-                    optionalDependency: config.includes('runtime')
-                  });
-                }
-              }
-            }
-            
-            // Clean up
-            await fs.promises.unlink(tempTaskPath).catch(() => {});
-          } catch (gradleTaskError) {
-            log.debug(`Gradle dependency resolution failed for ${gradlePath}`, { error: gradleTaskError });
-          }
-        } catch (transitiveError) {
-          log.warn(`Error collecting transitive Gradle dependencies for ${gradlePath}`, { error: transitiveError });
-        }
+        log.warn(`Error processing build.gradle at ${gradlePath}`, { error: gradleError });
       }
     }
   } catch (error) {
-    log.error('Error collecting Gradle dependencies', { error });
+    log.error('Error scanning Java dependencies', { error });
   }
   
   return dependencies;
 }
 
 /**
- * Collect NuGet dependencies
+ * Scan for PHP dependencies
  */
-async function collectNugetDependencies(
+async function scanPhpDependencies(
   config: DependencyScannerConfig
 ): Promise<DependencyInfo[]> {
   const dependencies: DependencyInfo[] = [];
   
   try {
-    // Find all .csproj, .fsproj, and packages.config files
-    const projFilePaths = await glob('**/*.{csproj,fsproj}', {
+    // Find composer.json files
+    const composerPaths = await glob('**/composer.json', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || []),
+        '**/vendor/**'
+      ]
+    });
+    
+    for (const composerPath of composerPaths) {
+      try {
+        const content = await readFileAsync(composerPath, 'utf8');
+        const composerJson = JSON.parse(content);
+        
+        // Process require dependencies
+        if (composerJson.require) {
+          for (const [name, versionSpec] of Object.entries(composerJson.require)) {
+            // Skip PHP itself
+            if (name === 'php') continue;
+            
+            const version = String(versionSpec).replace(/[^0-9.]/g, '') || 'unknown';
+            
+            dependencies.push({
+              name,
+              version,
+              type: 'direct',
+              packageManager: 'composer',
+              manifestPath: composerPath
+            });
+          }
+        }
+        
+        // Process require-dev dependencies
+        if (composerJson['require-dev']) {
+          for (const [name, versionSpec] of Object.entries(composerJson['require-dev'])) {
+            const version = String(versionSpec).replace(/[^0-9.]/g, '') || 'unknown';
+            
+            dependencies.push({
+              name,
+              version,
+              type: 'dev',
+              packageManager: 'composer',
+              manifestPath: composerPath
+            });
+          }
+        }
+      } catch (composerError) {
+        log.warn(`Error processing composer.json at ${composerPath}`, { error: composerError });
+      }
+    }
+  } catch (error) {
+    log.error('Error scanning PHP dependencies', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Scan for .NET dependencies
+ */
+async function scanDotNetDependencies(
+  config: DependencyScannerConfig
+): Promise<DependencyInfo[]> {
+  const dependencies: DependencyInfo[] = [];
+  
+  try {
+    // Find .csproj files
+    const csprojPaths = await glob('**/*.{csproj,fsproj,vbproj}', {
       cwd: config.rootDir,
       absolute: true,
       ignore: [
         ...(config.excludePaths || []),
         '**/bin/**',
-        '**/obj/**',
-        '**/build/**'
+        '**/obj/**'
       ]
     });
     
+    for (const csprojPath of csprojPaths) {
+      try {
+        const content = await readFileAsync(csprojPath, 'utf8');
+        
+        // Extract package references
+        // This is a simplified approach - a complete solution would use an XML parser
+        const packageRefMatches = content.match(/<PackageReference[^>]*>/g) || [];
+        
+        for (const refMatch of packageRefMatches) {
+          const includeMatch = refMatch.match(/Include="([^"]+)"/i);
+          const versionMatch = refMatch.match(/Version="([^"]+)"/i);
+          
+          if (includeMatch) {
+            const name = includeMatch[1].trim();
+            const version = versionMatch ? versionMatch[1].trim() : 'unknown';
+            
+            // Check if it's a development dependency
+            const privateAssetsMatch = refMatch.match(/PrivateAssets="([^"]+)"/i);
+            const isDevDependency = privateAssetsMatch && privateAssetsMatch[1].includes('all');
+            
+            dependencies.push({
+              name,
+              version,
+              type: isDevDependency ? 'dev' : 'direct',
+              packageManager: 'nuget',
+              manifestPath: csprojPath
+            });
+          }
+        }
+        
+        // Extract project references
+        const projectRefMatches = content.match(/<ProjectReference[^>]*>/g) || [];
+        
+        for (const refMatch of projectRefMatches) {
+          const includeMatch = refMatch.match(/Include="([^"]+)"/i);
+          
+          if (includeMatch) {
+            const projectPath = includeMatch[1].trim();
+            const projectName = path.basename(projectPath, path.extname(projectPath));
+            
+            dependencies.push({
+              name: projectName,
+              version: 'local',
+              type: 'direct',
+              packageManager: 'nuget',
+              manifestPath: csprojPath
+            });
+          }
+        }
+      } catch (csprojError) {
+        log.warn(`Error processing .csproj at ${csprojPath}`, { error: csprojError });
+      }
+    }
+    
+    // Find packages.config files (older NuGet format)
     const packagesConfigPaths = await glob('**/packages.config', {
       cwd: config.rootDir,
       absolute: true,
       ignore: [
         ...(config.excludePaths || []),
         '**/bin/**',
-        '**/obj/**',
-        '**/build/**'
+        '**/obj/**'
       ]
     });
     
-    // Process .csproj and .fsproj files (new PackageReference format)
-    for (const projPath of projFilePaths) {
+    for (const packagesConfigPath of packagesConfigPaths) {
       try {
-        const content = await readFileAsync(projPath, 'utf8');
+        const content = await readFileAsync(packagesConfigPath, 'utf8');
         
-        // Extract PackageReference elements
-        const packageRefMatches = content.match(/<PackageReference [^>]*>/g);
+        // Extract package references
+        const packageMatches = content.match(/<package[^>]*>/g) || [];
         
-        if (packageRefMatches) {
-          for (const pkgRef of packageRefMatches) {
-            const includeMatch = pkgRef.match(/Include="([^"]+)"/i);
-            const versionMatch = pkgRef.match(/Version="([^"]+)"/i);
-            
-            if (includeMatch) {
-              const name = includeMatch[1].trim();
-              const version = versionMatch ? versionMatch[1].trim() : 'unknown';
-              
-              // Add to dependencies list
-              dependencies.push({
-                name,
-                version,
-                packageManager: 'nuget',
-                isDirect: true,
-                depth: 0,
-                dependentFiles: [projPath],
-                path: projPath
-              });
-            }
-          }
-        }
-      } catch (projError) {
-        log.warn(`Error processing project file ${projPath}`, { error: projError });
-      }
-    }
-    
-    // Process packages.config files (old format)
-    for (const pkgConfigPath of packagesConfigPaths) {
-      try {
-        const content = await readFileAsync(pkgConfigPath, 'utf8');
-        
-        // Extract package elements
-        const packageMatches = content.match(/<package [^>]*>/g);
-        
-        if (packageMatches) {
-          for (const pkg of packageMatches) {
-            const idMatch = pkg.match(/id="([^"]+)"/i);
-            const versionMatch = pkg.match(/version="([^"]+)"/i);
-            
-            if (idMatch) {
-              const name = idMatch[1].trim();
-              const version = versionMatch ? versionMatch[1].trim() : 'unknown';
-              
-              // Add to dependencies list
-              dependencies.push({
-                name,
-                version,
-                packageManager: 'nuget',
-                isDirect: true,
-                depth: 0,
-                dependentFiles: [pkgConfigPath],
-                path: pkgConfigPath
-              });
-            }
-          }
-        }
-      } catch (pkgConfigError) {
-        log.warn(`Error processing packages.config ${pkgConfigPath}`, { error: pkgConfigError });
-      }
-    }
-    
-    // If configured and dotnet is available, try to get transitive dependencies
-    if (!config.directDependenciesOnly && projFilePaths.length > 0) {
-      for (const projPath of projFilePaths) {
-        try {
-          const projDir = path.dirname(projPath);
+        for (const packageMatch of packageMatches) {
+          const idMatch = packageMatch.match(/id="([^"]+)"/i);
+          const versionMatch = packageMatch.match(/version="([^"]+)"/i);
+          const developmentDependencyMatch = packageMatch.match(/developmentDependency="([^"]+)"/i);
           
-          // Run dotnet list package to get transitive dependencies
-          try {
-            const { stdout } = await execAsync(`dotnet list ${path.basename(projPath)} package --include-transitive`, { cwd: projDir });
+          if (idMatch && versionMatch) {
+            const name = idMatch[1].trim();
+            const version = versionMatch[1].trim();
+            const isDevDependency = developmentDependencyMatch && developmentDependencyMatch[1].toLowerCase() === 'true';
             
-            // Parse the output
-            const lines = stdout.split('\n');
-            let inTransitiveSection = false;
-            let currentTopLevel = '';
-            
-            for (const line of lines) {
-              // Look for the transitive dependencies section
-              if (line.includes('Transitive Package')) {
-                inTransitiveSection = true;
-                continue;
-              }
-              
-              // Skip until we get to the transitive section
-              if (!inTransitiveSection) {
-                continue;
-              }
-              
-              // Parse top-level dependency that has transitives
-              const topLevelMatch = line.match(/> ([^ ]+)/);
-              if (topLevelMatch) {
-                currentTopLevel = topLevelMatch[1].trim();
-                continue;
-              }
-              
-              // Parse transitive dependency line
-              const depMatch = line.match(/\s+([^ ]+)\s+([^ ]+)/);
-              if (depMatch) {
-                const name = depMatch[1].trim();
-                const version = depMatch[2].trim();
-                
-                // Add if not already in the list
-                if (!dependencies.some(d => d.name === name && 
-                                     d.version === version && 
-                                     d.packageManager === 'nuget' && 
-                                     d.path === projPath)) {
-                  
-                  dependencies.push({
-                    name,
-                    version,
-                    packageManager: 'nuget',
-                    isDirect: false,
-                    depth: 1, // Simplified, all considered depth 1
-                    dependentFiles: [projPath],
-                    path: projPath
-                  });
-                }
-              }
-            }
-          } catch (dotnetError) {
-            log.debug(`dotnet list package failed for ${projPath}`, { error: dotnetError });
+            dependencies.push({
+              name,
+              version,
+              type: isDevDependency ? 'dev' : 'direct',
+              packageManager: 'nuget',
+              manifestPath: packagesConfigPath
+            });
           }
-        } catch (transitiveError) {
-          log.warn(`Error collecting transitive NuGet dependencies for ${projPath}`, { error: transitiveError });
         }
+      } catch (packagesConfigError) {
+        log.warn(`Error processing packages.config at ${packagesConfigPath}`, { error: packagesConfigError });
       }
     }
   } catch (error) {
-    log.error('Error collecting NuGet dependencies', { error });
+    log.error('Error scanning .NET dependencies', { error });
   }
   
   return dependencies;
 }
 
 /**
- * Check dependencies for issues
+ * Scan for Rust dependencies
+ */
+async function scanRustDependencies(
+  config: DependencyScannerConfig
+): Promise<DependencyInfo[]> {
+  const dependencies: DependencyInfo[] = [];
+  
+  try {
+    // Find Cargo.toml files
+    const cargoTomlPaths = await glob('**/Cargo.toml', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || []),
+        '**/target/**'
+      ]
+    });
+    
+    for (const cargoTomlPath of cargoTomlPaths) {
+      try {
+        const content = await readFileAsync(cargoTomlPath, 'utf8');
+        const lines = content.split('\n');
+        
+        let inDependencies = false;
+        let inDevDependencies = false;
+        let inBuildDependencies = false;
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
+            continue;
+          }
+          
+          // Check for section headers
+          if (line.trim() === '[dependencies]') {
+            inDependencies = true;
+            inDevDependencies = false;
+            inBuildDependencies = false;
+            continue;
+          } else if (line.trim() === '[dev-dependencies]') {
+            inDependencies = false;
+            inDevDependencies = true;
+            inBuildDependencies = false;
+            continue;
+          } else if (line.trim() === '[build-dependencies]') {
+            inDependencies = false;
+            inDevDependencies = false;
+            inBuildDependencies = true;
+            continue;
+          } else if (line.trim().startsWith('[') && line.trim().endsWith(']')) {
+            inDependencies = false;
+            inDevDependencies = false;
+            inBuildDependencies = false;
+            continue;
+          }
+          
+          if (inDependencies || inDevDependencies || inBuildDependencies) {
+            // Simple key = "value" format
+            let match = line.match(/^([\w_-]+)\s*=\s*["']([^"']+)["']/);
+            
+            if (match) {
+              const name = match[1].trim();
+              const version = match[2].trim();
+              
+              dependencies.push({
+                name,
+                version,
+                type: inDevDependencies ? 'dev' : inBuildDependencies ? 'dev' : 'direct',
+                packageManager: 'cargo',
+                manifestPath: cargoTomlPath
+              });
+              continue;
+            }
+            
+            // Complex format with table
+            match = line.match(/^([\w_-]+)\s*=\s*\{/);
+            
+            if (match) {
+              const name = match[1].trim();
+              
+              // Try to find the version in this line or the next few lines
+              let versionMatch = line.match(/version\s*=\s*["']([^"']+)["']/);
+              if (!versionMatch) {
+                // Look in the next 5 lines at most
+                for (let i = 1; i <= 5; i++) {
+                  const lineIndex = lines.indexOf(line) + i;
+                  if (lineIndex < lines.length) {
+                    versionMatch = lines[lineIndex].match(/version\s*=\s*["']([^"']+)["']/);
+                    if (versionMatch) break;
+                  }
+                }
+              }
+              
+              const version = versionMatch ? versionMatch[1].trim() : 'unknown';
+              
+              dependencies.push({
+                name,
+                version,
+                type: inDevDependencies ? 'dev' : inBuildDependencies ? 'dev' : 'direct',
+                packageManager: 'cargo',
+                manifestPath: cargoTomlPath
+              });
+            }
+          }
+        }
+      } catch (cargoTomlError) {
+        log.warn(`Error processing Cargo.toml at ${cargoTomlPath}`, { error: cargoTomlError });
+      }
+    }
+  } catch (error) {
+    log.error('Error scanning Rust dependencies', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Scan for Go dependencies
+ */
+async function scanGoDependencies(
+  config: DependencyScannerConfig
+): Promise<DependencyInfo[]> {
+  const dependencies: DependencyInfo[] = [];
+  
+  try {
+    // Find go.mod files
+    const goModPaths = await glob('**/go.mod', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || [])
+      ]
+    });
+    
+    for (const goModPath of goModPaths) {
+      try {
+        const content = await readFileAsync(goModPath, 'utf8');
+        const lines = content.split('\n');
+        
+        // Get module name (first line: module github.com/example/myproject)
+        const moduleLine = lines.find(line => line.trim().startsWith('module '));
+        const moduleName = moduleLine ? moduleLine.replace('module', '').trim() : 'unknown';
+        
+        // Find require sections
+        let inRequireBlock = false;
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          
+          if (trimmedLine === 'require (') {
+            inRequireBlock = true;
+            continue;
+          }
+          
+          if (inRequireBlock && trimmedLine === ')') {
+            inRequireBlock = false;
+            continue;
+          }
+          
+          // Single-line require: require github.com/example/package v1.2.3
+          if (trimmedLine.startsWith('require ') && !inRequireBlock) {
+            const parts = trimmedLine.replace('require ', '').trim().split(' ');
+            if (parts.length >= 2) {
+              const name = parts[0].trim();
+              const version = parts[1].trim();
+              
+              dependencies.push({
+                name,
+                version,
+                type: 'direct',
+                packageManager: 'go',
+                manifestPath: goModPath
+              });
+            }
+          }
+          
+          // Multi-line require block
+          if (inRequireBlock && trimmedLine && !trimmedLine.startsWith('//')) {
+            const parts = trimmedLine.split(' ');
+            if (parts.length >= 2) {
+              const name = parts[0].trim();
+              const version = parts[1].trim();
+              
+              dependencies.push({
+                name,
+                version,
+                type: 'direct',
+                packageManager: 'go',
+                manifestPath: goModPath
+              });
+            }
+          }
+        }
+      } catch (goModError) {
+        log.warn(`Error processing go.mod at ${goModPath}`, { error: goModError });
+      }
+    }
+  } catch (error) {
+    log.error('Error scanning Go dependencies', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Scan for Ruby dependencies
+ */
+async function scanRubyDependencies(
+  config: DependencyScannerConfig
+): Promise<DependencyInfo[]> {
+  const dependencies: DependencyInfo[] = [];
+  
+  try {
+    // Find Gemfile files
+    const gemfilePaths = await glob('**/Gemfile', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || [])
+      ]
+    });
+    
+    for (const gemfilePath of gemfilePaths) {
+      try {
+        const content = await readFileAsync(gemfilePath, 'utf8');
+        const lines = content.split('\n');
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
+            continue;
+          }
+          
+          // Match gem declarations with version
+          const gemMatch = line.match(/^\s*gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]?([^'"\s]+)['"]?)?/);
+          
+          if (gemMatch) {
+            const name = gemMatch[1].trim();
+            const version = gemMatch[2] ? gemMatch[2].trim() : 'unknown';
+            
+            let type: 'direct' | 'dev' | 'peer' | 'optional' | 'transitive' = 'direct';
+            
+            // Check if it's in a group block (simplified - a complete solution would track blocks)
+            if (line.includes(':development') || line.includes(':test')) {
+              type = 'dev';
+            }
+            
+            dependencies.push({
+              name,
+              version,
+              type,
+              packageManager: 'gem',
+              manifestPath: gemfilePath
+            });
+          }
+        }
+      } catch (gemfileError) {
+        log.warn(`Error processing Gemfile at ${gemfilePath}`, { error: gemfileError });
+      }
+    }
+    
+    // Find .gemspec files
+    const gemspecPaths = await glob('**/*.gemspec', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || [])
+      ]
+    });
+    
+    for (const gemspecPath of gemspecPaths) {
+      try {
+        const content = await readFileAsync(gemspecPath, 'utf8');
+        const lines = content.split('\n');
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
+            continue;
+          }
+          
+          // Match add_dependency and add_development_dependency declarations
+          const depMatch = line.match(/\.(add_(?:development_)?dependency)\s*\(['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?/);
+          
+          if (depMatch) {
+            const method = depMatch[1].trim();
+            const name = depMatch[2].trim();
+            const version = depMatch[3] ? depMatch[3].trim() : 'unknown';
+            
+            const type: 'direct' | 'dev' = method.includes('development') ? 'dev' : 'direct';
+            
+            dependencies.push({
+              name,
+              version,
+              type,
+              packageManager: 'gem',
+              manifestPath: gemspecPath
+            });
+          }
+        }
+      } catch (gemspecError) {
+        log.warn(`Error processing .gemspec at ${gemspecPath}`, { error: gemspecError });
+      }
+    }
+  } catch (error) {
+    log.error('Error scanning Ruby dependencies', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Scan for iOS/macOS dependencies
+ */
+async function scanAppleDependencies(
+  config: DependencyScannerConfig
+): Promise<DependencyInfo[]> {
+  const dependencies: DependencyInfo[] = [];
+  
+  try {
+    // Find Podfile files (CocoaPods)
+    const podfilePaths = await glob('**/Podfile', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || [])
+      ]
+    });
+    
+    for (const podfilePath of podfilePaths) {
+      try {
+        const content = await readFileAsync(podfilePath, 'utf8');
+        const lines = content.split('\n');
+        
+        let currentTarget = '';
+        
+        for (const line of lines) {
+          // Skip comments and empty lines
+          if (line.trim().startsWith('#') || !line.trim()) {
+            continue;
+          }
+          
+          // Check for target definitions
+          const targetMatch = line.match(/target\s+['"]([^'"]+)['"]\s+do/);
+          if (targetMatch) {
+            currentTarget = targetMatch[1].trim();
+            continue;
+          }
+          
+          // Check for pod declarations
+          const podMatch = line.match(/pod\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?/);
+          
+          if (podMatch) {
+            const name = podMatch[1].trim();
+            const version = podMatch[2] ? podMatch[2].trim() : 'unknown';
+            
+            dependencies.push({
+              name,
+              version,
+              type: 'direct',
+              packageManager: 'cocoapods',
+              manifestPath: podfilePath
+            });
+          }
+        }
+      } catch (podfileError) {
+        log.warn(`Error processing Podfile at ${podfilePath}`, { error: podfileError });
+      }
+    }
+    
+    // Find Package.swift files (Swift Package Manager)
+    const packageSwiftPaths = await glob('**/Package.swift', {
+      cwd: config.rootDir,
+      absolute: true,
+      ignore: [
+        ...(config.excludePaths || [])
+      ]
+    });
+    
+    for (const packageSwiftPath of packageSwiftPaths) {
+      try {
+        const content = await readFileAsync(packageSwiftPath, 'utf8');
+        
+        // This is a very simplified parser for Swift Package dependencies
+        // A complete solution would use a Swift parser
+        
+        // Match dependency declarations
+        const dependencies_section = content.match(/dependencies\s*:\s*\[([^\]]+)\]/s);
+        
+        if (dependencies_section && dependencies_section[1]) {
+          const dependenciesBlock = dependencies_section[1];
+          
+          // Match package dependencies
+          const packageMatches = dependenciesBlock.match(/\.package\s*\(\s*url\s*:\s*["']([^"']+)["']\s*,\s*(?:from\s*:|exact\s*:|branch\s*:|revision\s*:)\s*["']([^"']+)["']/g) || [];
+          
+          for (const packageMatch of packageMatches) {
+            const urlMatch = packageMatch.match(/url\s*:\s*["']([^"']+)["']/);
+            const versionMatch = packageMatch.match(/(?:from|exact|branch|revision)\s*:\s*["']([^"']+)["']/);
+            
+            if (urlMatch) {
+              const url = urlMatch[1].trim();
+              const version = versionMatch ? versionMatch[1].trim() : 'unknown';
+              
+              // Extract name from URL
+              const urlParts = url.split('/');
+              const name = urlParts.length > 0 ? urlParts[urlParts.length - 1] : url;
+              
+              dependencies.push({
+                name,
+                version,
+                type: 'direct',
+                packageManager: 'swift',
+                manifestPath: packageSwiftPath
+              });
+            }
+          }
+        }
+      } catch (packageSwiftError) {
+        log.warn(`Error processing Package.swift at ${packageSwiftPath}`, { error: packageSwiftError });
+      }
+    }
+  } catch (error) {
+    log.error('Error scanning iOS/macOS dependencies', { error });
+  }
+  
+  return dependencies;
+}
+
+/**
+ * Check dependency for issues
  */
 async function checkDependencyForIssues(
   dep: DependencyInfo,
@@ -1182,48 +1672,75 @@ async function checkDependencyForIssues(
 ): Promise<void> {
   try {
     // Check for updates
-    await checkForUpdates(dep, config);
+    await checkForDependencyUpdates(dep, config);
     
     // Check for vulnerabilities if configured
     if (config.checkVulnerabilities) {
-      await checkForVulnerabilities(dep, config);
+      await checkForDependencyVulnerabilities(dep, config);
     }
     
-    // Check if deprecated
-    await checkIfDeprecated(dep, config);
+    // Check for license issues if configured
+    if (config.checkLicenses) {
+      await checkDependencyLicense(dep, config);
+    }
+    
+    // Check if dependency is maintained if configured
+    if (config.checkMaintained) {
+      await checkIfDependencyMaintained(dep, config);
+    }
   } catch (error) {
     log.warn(`Error checking dependency ${dep.name} for issues`, { error });
   }
 }
 
 /**
- * Check if a dependency has updates available
+ * Check if dependency has available updates
  */
-async function checkForUpdates(
+async function checkForDependencyUpdates(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check based on package manager
+    // Use different approaches based on package manager
     switch (dep.packageManager) {
       case 'npm':
+      case 'yarn':
+      case 'pnpm':
         await checkNpmUpdates(dep, config);
         break;
       case 'pip':
-        await checkPipUpdates(dep, config);
+      case 'pipenv':
+      case 'poetry':
+        await checkPyPIUpdates(dep, config);
         break;
       case 'maven':
+      case 'gradle':
         await checkMavenUpdates(dep, config);
         break;
-      case 'gradle':
-        await checkGradleUpdates(dep, config);
+      case 'composer':
+        await checkPackagistUpdates(dep, config);
         break;
       case 'nuget':
-        await checkNugetUpdates(dep, config);
+        await checkNuGetUpdates(dep, config);
+        break;
+      case 'cargo':
+        await checkCargoUpdates(dep, config);
+        break;
+      case 'go':
+        await checkGoUpdates(dep, config);
+        break;
+      case 'gem':
+        await checkRubyGemsUpdates(dep, config);
+        break;
+      case 'cocoapods':
+        await checkCocoaPodsUpdates(dep, config);
+        break;
+      case 'swift':
+        await checkSwiftUpdates(dep, config);
         break;
     }
   } catch (error) {
-    log.warn(`Error checking for updates for ${dep.name}`, { error });
+    log.warn(`Error checking updates for dependency ${dep.name}`, { error });
   }
 }
 
@@ -1236,22 +1753,46 @@ async function checkNpmUpdates(
 ): Promise<void> {
   try {
     // Use npm registry API to check for latest version
-    const { stdout } = await execAsync(`npm view ${dep.name} version --json`);
+    const { stdout } = await execAsync(`npm view ${dep.name} dist-tags.latest time --json`);
     
     try {
-      const latestVersion = JSON.parse(stdout.trim());
-      dep.latestVersion = latestVersion;
+      const info = JSON.parse(stdout.trim());
+      dep.latestVersion = info['dist-tags'] ? info['dist-tags'].latest : Object.keys(info.time).pop();
+      
+      // Get last publish date
+      if (info.time && dep.latestVersion) {
+        dep.lastPublishDate = new Date(info.time[dep.latestVersion]);
+      }
       
       // Compare versions to determine if outdated
-      if (dep.version !== 'unknown' && dep.version !== latestVersion) {
+      if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
         // Use semver to compare versions if available
         try {
           const semver = require('semver');
-          dep.isOutdated = semver.lt(dep.version, latestVersion);
+          dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+          
+          // Check if update is breaking (major version change)
+          if (dep.isOutdated) {
+            const currentMajor = semver.major(dep.version);
+            const latestMajor = semver.major(dep.latestVersion);
+            dep.upgradeBreaking = currentMajor < latestMajor;
+          }
         } catch (semverError) {
           // Basic version comparison if semver is not available
-          dep.isOutdated = dep.version !== latestVersion;
+          dep.isOutdated = dep.version !== dep.latestVersion;
+          dep.upgradeBreaking = false;
         }
+      }
+      
+      // Try to get repository and homepage URLs
+      try {
+        const { stdout: pkgInfo } = await execAsync(`npm view ${dep.name} repository.url homepage --json`);
+        const pkgInfoJson = JSON.parse(pkgInfo.trim());
+        
+        dep.repositoryUrl = pkgInfoJson.repository ? pkgInfoJson.repository.url : undefined;
+        dep.homepageUrl = pkgInfoJson.homepage;
+      } catch (pkgInfoError) {
+        log.debug(`Error getting package info for ${dep.name}`, { error: pkgInfoError });
       }
     } catch (jsonError) {
       log.warn(`Error parsing npm view output for ${dep.name}`, { error: jsonError });
@@ -1262,9 +1803,9 @@ async function checkNpmUpdates(
 }
 
 /**
- * Check for Python package updates
+ * Check for PyPI package updates
  */
-async function checkPipUpdates(
+async function checkPyPIUpdates(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
@@ -1276,16 +1817,45 @@ async function checkPipUpdates(
       const packageInfo = JSON.parse(stdout);
       dep.latestVersion = packageInfo.info.version;
       
-      // Compare versions to determine if outdated
-      if (dep.version !== 'unknown' && dep.version !== dep.latestVersion) {
-        // Basic version comparison
-        dep.isOutdated = dep.version !== dep.latestVersion;
+      // Get last release date
+      if (packageInfo.releases && dep.latestVersion && packageInfo.releases[dep.latestVersion]) {
+        const releaseInfo = packageInfo.releases[dep.latestVersion][0];
+        if (releaseInfo && releaseInfo.upload_time) {
+          dep.lastPublishDate = new Date(releaseInfo.upload_time);
+        }
       }
+      
+      // Compare versions to determine if outdated
+      if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+        // Basic version comparison for Python packages
+        dep.isOutdated = dep.version !== dep.latestVersion;
+        
+        // Try to determine if update is breaking (major version change)
+        try {
+          const currentParts = dep.version.split('.');
+          const latestParts = dep.latestVersion.split('.');
+          
+          if (currentParts.length > 0 && latestParts.length > 0) {
+            const currentMajor = parseInt(currentParts[0], 10);
+            const latestMajor = parseInt(latestParts[0], 10);
+            dep.upgradeBreaking = currentMajor < latestMajor;
+          }
+        } catch (parseError) {
+          dep.upgradeBreaking = false;
+        }
+      }
+      
+      // Get repository and homepage URLs
+      dep.homepageUrl = packageInfo.info.home_page;
+      dep.repositoryUrl = packageInfo.info.project_urls?.Source || packageInfo.info.project_urls?.Homepage;
+      
+      // Get author info
+      dep.author = packageInfo.info.author;
     } catch (jsonError) {
       log.warn(`Error parsing PyPI API output for ${dep.name}`, { error: jsonError });
     }
   } catch (error) {
-    log.warn(`Error checking Python updates for ${dep.name}`, { error });
+    log.warn(`Error checking PyPI updates for ${dep.name}`, { error });
   }
 }
 
@@ -1300,6 +1870,11 @@ async function checkMavenUpdates(
     // Extract groupId and artifactId
     const [groupId, artifactId] = dep.name.split(':');
     
+    if (!groupId || !artifactId) {
+      log.warn(`Invalid Maven dependency name: ${dep.name}`);
+      return;
+    }
+    
     // Use Maven Central API to check for latest version
     const { stdout } = await execAsync(`curl -s "https://search.maven.org/solrsearch/select?q=g:%22${groupId}%22+AND+a:%22${artifactId}%22&rows=1&wt=json"`);
     
@@ -1308,11 +1883,26 @@ async function checkMavenUpdates(
       
       if (searchResult.response && searchResult.response.docs && searchResult.response.docs.length > 0) {
         dep.latestVersion = searchResult.response.docs[0].latestVersion;
+        dep.lastPublishDate = new Date(searchResult.response.docs[0].timestamp);
         
         // Compare versions to determine if outdated
-        if (dep.version !== 'unknown' && dep.version !== dep.latestVersion) {
-          // Basic version comparison
+        if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+          // Basic version comparison for Maven packages
           dep.isOutdated = dep.version !== dep.latestVersion;
+          
+          // Try to determine if update is breaking (major version change)
+          try {
+            const currentParts = dep.version.split('.');
+            const latestParts = dep.latestVersion.split('.');
+            
+            if (currentParts.length > 0 && latestParts.length > 0) {
+              const currentMajor = parseInt(currentParts[0], 10);
+              const latestMajor = parseInt(latestParts[0], 10);
+              dep.upgradeBreaking = currentMajor < latestMajor;
+            }
+          } catch (parseError) {
+            dep.upgradeBreaking = false;
+          }
         }
       }
     } catch (jsonError) {
@@ -1324,65 +1914,125 @@ async function checkMavenUpdates(
 }
 
 /**
- * Check for Gradle package updates
- * (Similar to Maven since many Gradle dependencies are from Maven repositories)
+ * Check for Packagist updates (PHP/Composer)
  */
-async function checkGradleUpdates(
+async function checkPackagistUpdates(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Extract groupId and artifactId
-    const [groupId, artifactId] = dep.name.split(':');
-    
-    // Use Maven Central API to check for latest version
-    const { stdout } = await execAsync(`curl -s "https://search.maven.org/solrsearch/select?q=g:%22${groupId}%22+AND+a:%22${artifactId}%22&rows=1&wt=json"`);
+    // Use Packagist API to check for latest version
+    const { stdout } = await execAsync(`curl -s https://repo.packagist.org/p2/${dep.name}.json`);
     
     try {
-      const searchResult = JSON.parse(stdout);
+      const packageInfo = JSON.parse(stdout);
       
-      if (searchResult.response && searchResult.response.docs && searchResult.response.docs.length > 0) {
-        dep.latestVersion = searchResult.response.docs[0].latestVersion;
+      if (packageInfo.packages && packageInfo.packages[dep.name]) {
+        const versions = Object.keys(packageInfo.packages[dep.name])
+          .filter(v => !v.includes('-') && !v.includes('dev') && !v.includes('alpha') && !v.includes('beta') && !v.includes('RC'));
         
-        // Compare versions to determine if outdated
-        if (dep.version !== 'unknown' && dep.version !== dep.latestVersion) {
-          // Basic version comparison
-          dep.isOutdated = dep.version !== dep.latestVersion;
+        if (versions.length > 0) {
+          // Sort versions and get the latest
+          versions.sort((a, b) => {
+            try {
+              const semver = require('semver');
+              return semver.gt(a, b) ? -1 : 1;
+            } catch (semverError) {
+              return a > b ? -1 : 1; // Basic comparison
+            }
+          });
+          
+          dep.latestVersion = versions[0];
+          
+          // Get last release date and other metadata
+          const latestVersionInfo = packageInfo.packages[dep.name][dep.latestVersion];
+          if (latestVersionInfo) {
+            if (latestVersionInfo.time) {
+              dep.lastPublishDate = new Date(latestVersionInfo.time);
+            }
+            
+            dep.homepageUrl = latestVersionInfo.homepage;
+            dep.repositoryUrl = latestVersionInfo.source?.url;
+            dep.author = latestVersionInfo.authors?.[0]?.name;
+          }
+          
+          // Compare versions to determine if outdated
+          if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+            // Use semver to compare versions if available
+            try {
+              const semver = require('semver');
+              dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+              
+              // Check if update is breaking (major version change)
+              if (dep.isOutdated) {
+                const currentMajor = semver.major(dep.version);
+                const latestMajor = semver.major(dep.latestVersion);
+                dep.upgradeBreaking = currentMajor < latestMajor;
+              }
+            } catch (semverError) {
+              // Basic version comparison if semver is not available
+              dep.isOutdated = dep.version !== dep.latestVersion;
+              dep.upgradeBreaking = false;
+            }
+          }
         }
       }
     } catch (jsonError) {
-      log.warn(`Error parsing Maven Central API output for ${dep.name}`, { error: jsonError });
+      log.warn(`Error parsing Packagist API output for ${dep.name}`, { error: jsonError });
     }
   } catch (error) {
-    log.warn(`Error checking Gradle updates for ${dep.name}`, { error });
+    log.warn(`Error checking Packagist updates for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check for NuGet package updates
+ * Check for NuGet updates (.NET)
  */
-async function checkNugetUpdates(
+async function checkNuGetUpdates(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
     // Use NuGet API to check for latest version
-    const { stdout } = await execAsync(`curl -s "https://api.nuget.org/v3-flatcontainer/${dep.name.toLowerCase()}/index.json"`);
+    const { stdout } = await execAsync(`curl -s "https://api-v2v3search-0.nuget.org/query?q=PackageId:${dep.name}&prerelease=false"`);
     
     try {
-      const packageInfo = JSON.parse(stdout);
+      const searchResult = JSON.parse(stdout);
       
-      if (packageInfo.versions && packageInfo.versions.length > 0) {
-        // Get the latest non-preview version
-        const stableVersions = packageInfo.versions.filter((v: string) => !v.includes('-'));
-        dep.latestVersion = stableVersions.length > 0 ? 
-          stableVersions[stableVersions.length - 1] : 
-          packageInfo.versions[packageInfo.versions.length - 1];
+      if (searchResult.data && searchResult.data.length > 0) {
+        // Find exact match for the package
+        const pkg = searchResult.data.find((p: any) => p.id.toLowerCase() === dep.name.toLowerCase());
         
-        // Compare versions to determine if outdated
-        if (dep.version !== 'unknown' && dep.version !== dep.latestVersion) {
-          // Basic version comparison
-          dep.isOutdated = dep.version !== dep.latestVersion;
+        if (pkg) {
+          dep.latestVersion = pkg.version;
+          dep.homepageUrl = pkg.projectUrl;
+          dep.repositoryUrl = pkg.repositoryUrl;
+          dep.author = pkg.authors;
+          
+          // Get last publish date if available
+          if (pkg.lastUpdated) {
+            dep.lastPublishDate = new Date(pkg.lastUpdated);
+          }
+          
+          // Compare versions to determine if outdated
+          if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+            // Use semver to compare versions if available
+            try {
+              const semver = require('semver');
+              dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+              
+              // Check if update is breaking (major version change)
+              if (dep.isOutdated) {
+                const currentMajor = semver.major(dep.version);
+                const latestMajor = semver.major(dep.latestVersion);
+                dep.upgradeBreaking = currentMajor < latestMajor;
+              }
+            } catch (semverError) {
+              // Basic version comparison if semver is not available
+              dep.isOutdated = dep.version !== dep.latestVersion;
+              dep.upgradeBreaking = false;
+            }
+          }
         }
       }
     } catch (jsonError) {
@@ -1394,489 +2044,936 @@ async function checkNugetUpdates(
 }
 
 /**
- * Check for vulnerabilities in a dependency
+ * Check for Cargo updates (Rust)
  */
-async function checkForVulnerabilities(
+async function checkCargoUpdates(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check for vulnerabilities based on package manager
+    // Use crates.io API to check for latest version
+    const { stdout } = await execAsync(`curl -s https://crates.io/api/v1/crates/${dep.name}`);
+    
+    try {
+      const crateInfo = JSON.parse(stdout);
+      
+      if (crateInfo.crate) {
+        dep.latestVersion = crateInfo.crate.max_stable_version;
+        dep.homepageUrl = crateInfo.crate.homepage;
+        dep.repositoryUrl = crateInfo.crate.repository;
+        
+        // Get last publish date
+        if (crateInfo.versions && crateInfo.versions.length > 0) {
+          dep.lastPublishDate = new Date(crateInfo.versions[0].updated_at);
+        }
+        
+        // Compare versions to determine if outdated
+        if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+            // Use semver to compare versions if available
+            try {
+              const semver = require('semver');
+              dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+              
+              // Check if update is breaking (major version change)
+              if (dep.isOutdated) {
+                const currentMajor = semver.major(dep.version);
+                const latestMajor = semver.major(dep.latestVersion);
+                dep.upgradeBreaking = currentMajor < latestMajor;
+              }
+            } catch (semverError) {
+              // Basic version comparison if semver is not available
+              dep.isOutdated = dep.version !== dep.latestVersion;
+              dep.upgradeBreaking = false;
+            }
+          }
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing crates.io API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.warn(`Error checking Cargo updates for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check for Go module updates
+ */
+async function checkGoUpdates(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use proxy.golang.org API to check for latest version
+    const { stdout } = await execAsync(`curl -s "https://proxy.golang.org/${dep.name}/@v/list"`);
+    
+    if (stdout.trim()) {
+      const versions = stdout.trim().split('\n');
+      
+      // Filter out pre-releases and get the latest version
+      const stableVersions = versions.filter(v => 
+        !v.includes('-beta') && 
+        !v.includes('-alpha') && 
+        !v.includes('-rc')
+      );
+      
+      if (stableVersions.length > 0) {
+        // Sort versions and get the latest
+        stableVersions.sort((a, b) => {
+          try {
+            const semver = require('semver');
+            return semver.gt(a, b) ? -1 : 1;
+          } catch (semverError) {
+            return a > b ? -1 : 1; // Basic comparison
+          }
+        });
+        
+        dep.latestVersion = stableVersions[0];
+        
+        // Compare versions to determine if outdated
+        if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+          // Use semver to compare versions if available
+          try {
+            const semver = require('semver');
+            dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+            
+            // Check if update is breaking (major version change)
+            if (dep.isOutdated) {
+              const currentMajor = semver.major(dep.version);
+              const latestMajor = semver.major(dep.latestVersion);
+              dep.upgradeBreaking = currentMajor < latestMajor;
+            }
+          } catch (semverError) {
+            // Basic version comparison if semver is not available
+            dep.isOutdated = dep.version !== dep.latestVersion;
+            dep.upgradeBreaking = false;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    log.warn(`Error checking Go updates for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check for RubyGems updates
+ */
+async function checkRubyGemsUpdates(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use RubyGems API to check for latest version
+    const { stdout } = await execAsync(`curl -s https://rubygems.org/api/v1/gems/${dep.name}.json`);
+    
+    try {
+      const gemInfo = JSON.parse(stdout);
+      
+      dep.latestVersion = gemInfo.version;
+      dep.homepageUrl = gemInfo.homepage_uri || gemInfo.project_uri;
+      dep.repositoryUrl = gemInfo.source_code_uri;
+      dep.author = gemInfo.authors;
+      
+      // Get last publish date
+      if (gemInfo.version_created_at) {
+        dep.lastPublishDate = new Date(gemInfo.version_created_at);
+      }
+      
+      // Compare versions to determine if outdated
+      if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+        // Use semver to compare versions if available
+        try {
+          const semver = require('semver');
+          dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+          
+          // Check if update is breaking (major version change)
+          if (dep.isOutdated) {
+            const currentMajor = semver.major(dep.version);
+            const latestMajor = semver.major(dep.latestVersion);
+            dep.upgradeBreaking = currentMajor < latestMajor;
+          }
+        } catch (semverError) {
+          // Basic version comparison if semver is not available
+          dep.isOutdated = dep.version !== dep.latestVersion;
+          dep.upgradeBreaking = false;
+        }
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing RubyGems API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.warn(`Error checking RubyGems updates for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check for CocoaPods updates
+ */
+async function checkCocoaPodsUpdates(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use CocoaPods API to check for latest version
+    const { stdout } = await execAsync(`curl -s https://trunk.cocoapods.org/api/v1/pods/${dep.name}`);
+    
+    try {
+      const podInfo = JSON.parse(stdout);
+      
+      if (podInfo.version) {
+        dep.latestVersion = podInfo.version;
+        
+        // Compare versions to determine if outdated
+        if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+          // Use semver to compare versions if available
+          try {
+            const semver = require('semver');
+            dep.isOutdated = semver.lt(dep.version, dep.latestVersion);
+            
+            // Check if update is breaking (major version change)
+            if (dep.isOutdated) {
+              const currentMajor = semver.major(dep.version);
+              const latestMajor = semver.major(dep.latestVersion);
+              dep.upgradeBreaking = currentMajor < latestMajor;
+            }
+          } catch (semverError) {
+            // Basic version comparison if semver is not available
+            dep.isOutdated = dep.version !== dep.latestVersion;
+            dep.upgradeBreaking = false;
+          }
+        }
+      }
+      
+      // Extract other metadata if available
+      if (podInfo.pod) {
+        dep.homepageUrl = podInfo.pod.homepage;
+        dep.repositoryUrl = podInfo.pod.source?.git;
+        dep.author = podInfo.pod.authors;
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing CocoaPods API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.warn(`Error checking CocoaPods updates for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check for Swift Package updates
+ */
+async function checkSwiftUpdates(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For Swift packages, we have less standardized means to check
+    // This would generally involve checking the git repository directly
+    
+    // If the name looks like a GitHub repository, we can try to use the GitHub API
+    if (dep.name.includes('/') && !dep.name.startsWith('http')) {
+      // Extract owner and repo
+      const parts = dep.name.split('/');
+      if (parts.length >= 2) {
+        const owner = parts[parts.length - 2];
+        const repo = parts[parts.length - 1];
+        
+        // Use GitHub API to get latest release
+        try {
+          const { stdout } = await execAsync(`curl -s https://api.github.com/repos/${owner}/${repo}/releases/latest`);
+          
+          try {
+            const releaseInfo = JSON.parse(stdout);
+            
+            if (releaseInfo.tag_name) {
+              // Extract version from tag name
+              let version = releaseInfo.tag_name;
+              if (version.startsWith('v')) {
+                version = version.substring(1);
+              }
+              
+              dep.latestVersion = version;
+              
+              // Get last release date
+              if (releaseInfo.published_at) {
+                dep.lastPublishDate = new Date(releaseInfo.published_at);
+              }
+              
+              // Compare versions to determine if outdated
+              if (dep.version !== 'unknown' && dep.version !== 'local' && dep.latestVersion !== dep.version) {
+                // Remove 'v' prefix if present
+                let currentVersion = dep.version;
+                if (currentVersion.startsWith('v')) {
+                  currentVersion = currentVersion.substring(1);
+                }
+                
+                // Use semver to compare versions if available
+                try {
+                  const semver = require('semver');
+                  dep.isOutdated = semver.lt(currentVersion, dep.latestVersion);
+                  
+                  // Check if update is breaking (major version change)
+                  if (dep.isOutdated) {
+                    const currentMajor = semver.major(currentVersion);
+                    const latestMajor = semver.major(dep.latestVersion);
+                    dep.upgradeBreaking = currentMajor < latestMajor;
+                  }
+                } catch (semverError) {
+                  // Basic version comparison if semver is not available
+                  dep.isOutdated = currentVersion !== dep.latestVersion;
+                  dep.upgradeBreaking = false;
+                }
+              }
+              
+              // Get repository URL
+              dep.repositoryUrl = releaseInfo.html_url?.replace(/\/releases\/tag\/.*$/, '');
+            }
+          } catch (jsonError) {
+            log.warn(`Error parsing GitHub API output for ${dep.name}`, { error: jsonError });
+          }
+        } catch (githubError) {
+          log.debug(`Error getting GitHub release info for ${dep.name}`, { error: githubError });
+        }
+      }
+    }
+  } catch (error) {
+    log.warn(`Error checking Swift updates for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check for dependency vulnerabilities
+ */
+async function checkForDependencyVulnerabilities(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Check custom database first if configured
+    if (config.vulnerabilityDbPaths?.dependencies && fs.existsSync(config.vulnerabilityDbPaths.dependencies)) {
+      try {
+        const vulnDb = JSON.parse(await readFileAsync(config.vulnerabilityDbPaths.dependencies, 'utf8'));
+        
+        // Normalize dependency name for lookup (case-insensitive)
+        const normalizedName = dep.name.toLowerCase();
+        
+        // Check for vulnerabilities by package name
+        let vulnEntries = vulnDb[normalizedName];
+        
+        // For Java, try by groupId only if not found by full name
+        if (!vulnEntries && dep.packageManager === 'maven' || dep.packageManager === 'gradle') {
+          const groupId = dep.name.split(':')[0];
+          if (groupId) {
+            vulnEntries = vulnDb[groupId.toLowerCase()];
+          }
+        }
+        
+        if (vulnEntries) {
+          processVulnerabilityData(dep, vulnEntries);
+        }
+      } catch (dbError) {
+        log.warn(`Error reading dependency vulnerability database`, { error: dbError });
+      }
+    }
+    
+    // If no custom database or no vulnerabilities found, try to check npm audit, safety, etc.
+    // based on package manager
+    await checkVulnerabilitiesByPackageManager(dep, config);
+  } catch (error) {
+    log.warn(`Error checking vulnerabilities for dependency ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Process vulnerability data from a database
+ */
+function processVulnerabilityData(
+  dep: DependencyInfo,
+  vulnerabilities: Array<{
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    description: string;
+    affected_versions: string;
+    fixed_in_version?: string;
+    cve_ids?: string[];
+    url?: string;
+  }>
+): void {
+  const affectedVulns = vulnerabilities.filter(vuln => 
+    isVersionAffected(dep.version, vuln.affected_versions)
+  );
+  
+  if (affectedVulns.length > 0) {
+    dep.vulnerabilities = affectedVulns.map(vuln => ({
+      severity: vuln.severity,
+      description: vuln.description,
+      affectedVersions: vuln.affected_versions,
+      fixedInVersion: vuln.fixed_in_version,
+      url: vuln.url,
+      cveIds: vuln.cve_ids
+    }));
+    
+    dep.isVulnerable = true;
+  }
+}
+
+/**
+ * Check vulnerabilities by package manager
+ */
+async function checkVulnerabilitiesByPackageManager(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use different approaches based on package manager
     switch (dep.packageManager) {
       case 'npm':
+      case 'yarn':
+      case 'pnpm':
         await checkNpmVulnerabilities(dep, config);
         break;
       case 'pip':
-        await checkPipVulnerabilities(dep, config);
+      case 'pipenv':
+      case 'poetry':
+        await checkPythonVulnerabilities(dep, config);
         break;
       case 'maven':
       case 'gradle':
         await checkMavenVulnerabilities(dep, config);
         break;
-      case 'nuget':
-        await checkNugetVulnerabilities(dep, config);
+      case 'composer':
+        await checkComposerVulnerabilities(dep, config);
         break;
+      case 'nuget':
+        await checkNuGetVulnerabilities(dep, config);
+        break;
+      case 'cargo':
+        await checkCargoVulnerabilities(dep, config);
+        break;
+      // Other package managers would have similar implementations
     }
   } catch (error) {
-    log.warn(`Error checking vulnerabilities for ${dep.name}`, { error });
+    log.warn(`Error checking vulnerabilities by package manager for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check for vulnerabilities in NPM packages
+ * Check for npm vulnerabilities
  */
 async function checkNpmVulnerabilities(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check custom database first if configured
-    if (config.vulnerabilityDbPaths?.npm && fs.existsSync(config.vulnerabilityDbPaths.npm)) {
-      try {
-        const vulnDb = JSON.parse(await readFileAsync(config.vulnerabilityDbPaths.npm, 'utf8'));
-        
-        if (vulnDb[dep.name]) {
-          const vulnerabilities = [];
-          
-          for (const vuln of vulnDb[dep.name]) {
-            // Check if this version is affected
-            if (isVersionAffected(dep.version, vuln.affected_versions || '*')) {
-              vulnerabilities.push({
-                severity: vuln.severity || 'medium',
-                description: vuln.description || 'Vulnerability in package',
-                fixedInVersion: vuln.fixed_in_version,
-                url: vuln.more_info_url,
-                cveIds: vuln.cve_ids
-              });
-            }
-          }
-          
-          if (vulnerabilities.length > 0) {
-            dep.vulnerabilities = vulnerabilities;
-          }
-        }
-      } catch (dbError) {
-        log.warn(`Error reading npm vulnerability database`, { error: dbError });
-      }
-    }
+    // Use npm audit API to check for vulnerabilities
+    const { stdout } = await execAsync(`npm view ${dep.name} --json`);
     
-    // If no vulnerabilities found yet, try npm audit
-    if (!dep.vulnerabilities || dep.vulnerabilities.length === 0) {
-      try {
-        // Create a temporary package.json to audit just this package
-        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dep-audit-'));
-        const tempPackageJson = {
-          name: 'temp-audit-package',
-          version: '1.0.0',
-          dependencies: {
-            [dep.name]: dep.version
-          }
-        };
-        
-        fs.writeFileSync(path.join(tempDir, 'package.json'), JSON.stringify(tempPackageJson, null, 2));
-        
-        // Run npm audit
-        try {
-          const { stdout } = await execAsync('npm audit --json', { cwd: tempDir });
-          
-          try {
-            const auditResult = JSON.parse(stdout);
-            const vulnerabilities = [];
-            
-            if (auditResult.vulnerabilities && auditResult.vulnerabilities[dep.name]) {
-              const vulnInfo = auditResult.vulnerabilities[dep.name];
-              
-              for (const vuln of vulnInfo.via) {
-                if (typeof vuln === 'object') {
-                  vulnerabilities.push({
-                    severity: vuln.severity,
-                    description: vuln.title,
-                    cveIds: [vuln.url.includes('advisories/') ? `GHSA-${vuln.url.split('advisories/')[1]}` : ''],
-                    fixedInVersion: vulnInfo.fixAvailable?.version,
-                    url: vuln.url
-                  });
-                }
-              }
-              
-              if (vulnerabilities.length > 0) {
-                dep.vulnerabilities = vulnerabilities;
-              }
-            }
-          } catch (jsonError) {
-            log.warn(`Error parsing npm audit output for ${dep.name}`, { error: jsonError });
-          }
-        } catch (auditError) {
-          // npm audit can exit with non-zero when vulnerabilities are found
-          try {
-            const output = auditError.stdout || '';
-            if (output) {
-              const auditResult = JSON.parse(output);
-              const vulnerabilities = [];
-              
-              if (auditResult.vulnerabilities && auditResult.vulnerabilities[dep.name]) {
-                const vulnInfo = auditResult.vulnerabilities[dep.name];
-                
-                for (const vuln of vulnInfo.via) {
-                  if (typeof vuln === 'object') {
-                    vulnerabilities.push({
-                      severity: vuln.severity,
-                      description: vuln.title,
-                      cveIds: [vuln.url.includes('advisories/') ? `GHSA-${vuln.url.split('advisories/')[1]}` : ''],
-                      fixedInVersion: vulnInfo.fixAvailable?.version,
-                      url: vuln.url
-                    });
-                  }
-                }
-                
-                if (vulnerabilities.length > 0) {
-                  dep.vulnerabilities = vulnerabilities;
-                }
-              }
-            }
-          } catch (parseError) {
-            log.warn(`Error handling npm audit error output for ${dep.name}`, { error: parseError });
-          }
-        }
-        
-        // Clean up temp directory
-        try {
-          fs.rmSync(tempDir, { recursive: true, force: true });
-        } catch (cleanupError) {
-          log.warn(`Error cleaning up temp directory ${tempDir}`, { error: cleanupError });
-        }
-      } catch (auditError) {
-        log.warn(`Error running npm audit for ${dep.name}`, { error: auditError });
+    // Complete implementation would use npm audit directly on the package
+    // This is a simplified approach checking security advisories
+    const packageInfo = JSON.parse(stdout);
+    
+    // Check if the package has security advisories
+    if (packageInfo.security?.vulnerabilities) {
+      const vulns = [];
+      
+      for (const [severity, info] of Object.entries(packageInfo.security.vulnerabilities)) {
+        vulns.push({
+          severity: mapNpmSeverity(severity),
+          description: `Security vulnerability in ${dep.name}`,
+          affectedVersions: dep.version, // Simplified - would need to check version ranges
+          fixedInVersion: undefined // Simplified - would need to check fixed versions
+        });
+      }
+      
+      if (vulns.length > 0) {
+        dep.vulnerabilities = vulns;
+        dep.isVulnerable = true;
       }
     }
   } catch (error) {
-    log.warn(`Error checking npm vulnerabilities for ${dep.name}`, { error });
+    log.debug(`Error checking npm vulnerabilities for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check for vulnerabilities in Python packages
+ * Map npm severity to standard severity
  */
-async function checkPipVulnerabilities(
+function mapNpmSeverity(severity: string): 'low' | 'medium' | 'high' | 'critical' {
+  switch (severity.toLowerCase()) {
+    case 'critical':
+      return 'critical';
+    case 'high':
+      return 'high';
+    case 'moderate':
+      return 'medium';
+    case 'low':
+      return 'low';
+    default:
+      return 'medium';
+  }
+}
+
+/**
+ * Check for Python vulnerabilities
+ */
+async function checkPythonVulnerabilities(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check custom database first if configured
-    if (config.vulnerabilityDbPaths?.pip && fs.existsSync(config.vulnerabilityDbPaths.pip)) {
-      try {
-        const vulnDb = JSON.parse(await readFileAsync(config.vulnerabilityDbPaths.pip, 'utf8'));
-        
-        if (vulnDb[dep.name]) {
-          const vulnerabilities = [];
-          
-          for (const vuln of vulnDb[dep.name]) {
-            // Check if this version is affected
-            if (isVersionAffected(dep.version, vuln.affected_versions || '*')) {
-              vulnerabilities.push({
-                severity: vuln.severity || 'medium',
-                description: vuln.description || 'Vulnerability in package',
-                fixedInVersion: vuln.fixed_in_version,
-                url: vuln.more_info_url,
-                cveIds: vuln.cve_ids
-              });
-            }
-          }
-          
-          if (vulnerabilities.length > 0) {
-            dep.vulnerabilities = vulnerabilities;
-          }
-        }
-      } catch (dbError) {
-        log.warn(`Error reading pip vulnerability database`, { error: dbError });
-      }
-    }
+    // Use PyPI JSON API to check for known vulnerabilities
+    const { stdout } = await execAsync(`curl -s https://pypi.org/pypi/${dep.name}/json`);
     
-    // If no vulnerabilities found yet, try safety check
-    if (!dep.vulnerabilities || dep.vulnerabilities.length === 0) {
-      try {
-        // Create a temporary requirements.txt for this package
-        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dep-safety-'));
-        fs.writeFileSync(path.join(tempDir, 'requirements.txt'), `${dep.name}==${dep.version}\n`);
+    try {
+      const packageInfo = JSON.parse(stdout);
+      
+      // Check for security issues in the package info
+      // This is a simplified approach - a complete solution would use safety-db
+      if (packageInfo.info && packageInfo.info.classifiers) {
+        const classifiers = packageInfo.info.classifiers;
         
-        // Run safety check
-        try {
-          const { stdout } = await execAsync('safety check --json -r requirements.txt', { cwd: tempDir });
-          
-          try {
-            const safetyResult = JSON.parse(stdout);
-            const vulnerabilities = [];
-            
-            for (const vuln of safetyResult) {
-              if (vuln[0] === dep.name) {
-                vulnerabilities.push({
-                  severity: mapSafetySeverity(vuln[4]),
-                  description: vuln[3],
-                  cveIds: [vuln[1]],
-                  fixedInVersion: vuln[5],
-                  url: vuln[6]
-                });
-              }
+        // Look for deprecation or security warnings in classifiers
+        for (const classifier of classifiers) {
+          if (classifier.includes('Development Status :: 7 - Inactive') || 
+              classifier.includes('Development Status :: 6 - Mature')) {
+            // These packages might be at higher risk for security issues
+            if (dep.version !== dep.latestVersion && dep.isOutdated) {
+              // If using an outdated version of a package marked as inactive or mature,
+              // flag as potential vulnerability
+              dep.vulnerabilities = [{
+                severity: 'medium',
+                description: `Using outdated version of possibly inactive package ${dep.name}`,
+                affectedVersions: `<=${dep.version}`,
+                fixedInVersion: dep.latestVersion
+              }];
+              dep.isVulnerable = true;
+              break;
             }
-            
-            if (vulnerabilities.length > 0) {
-              dep.vulnerabilities = vulnerabilities;
-            }
-          } catch (jsonError) {
-            log.warn(`Error parsing safety check output for ${dep.name}`, { error: jsonError });
           }
-        } catch (safetyError) {
-          log.warn(`Safety check failed for ${dep.name}`, { error: safetyError });
         }
-        
-        // Clean up temp directory
-        try {
-          fs.rmSync(tempDir, { recursive: true, force: true });
-        } catch (cleanupError) {
-          log.warn(`Error cleaning up temp directory ${tempDir}`, { error: cleanupError });
-        }
-      } catch (safetyError) {
-        log.warn(`Error running safety check for ${dep.name}`, { error: safetyError });
       }
+    } catch (jsonError) {
+      log.warn(`Error parsing PyPI API output for ${dep.name}`, { error: jsonError });
     }
   } catch (error) {
-    log.warn(`Error checking pip vulnerabilities for ${dep.name}`, { error });
+    log.debug(`Error checking Python vulnerabilities for ${dep.name}`, { error });
   }
 }
 
 /**
- * Map Safety severity to standard severity
- */
-function mapSafetySeverity(safetySeverity: string): 'low' | 'medium' | 'high' | 'critical' {
-  const severity = safetySeverity.toLowerCase();
-  
-  if (severity.includes('critical')) {
-    return 'critical';
-  } else if (severity.includes('high')) {
-    return 'high';
-  } else if (severity.includes('moderate') || severity.includes('medium')) {
-    return 'medium';
-  } else {
-    return 'low';
-  }
-}
-
-/**
- * Check for vulnerabilities in Maven/Gradle packages
+ * Check for Maven vulnerabilities
  */
 async function checkMavenVulnerabilities(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check custom database first if configured
-    const dbPath = config.vulnerabilityDbPaths?.maven || config.vulnerabilityDbPaths?.gradle;
+    // This is a simplified approach - a complete solution would use tools like OWASP Dependency Check
+    // Extract groupId and artifactId
+    const [groupId, artifactId] = dep.name.split(':');
     
-    if (dbPath && fs.existsSync(dbPath)) {
-      try {
-        const vulnDb = JSON.parse(await readFileAsync(dbPath, 'utf8'));
-        
-        if (vulnDb[dep.name]) {
-          const vulnerabilities = [];
-          
-          for (const vuln of vulnDb[dep.name]) {
-            // Check if this version is affected
-            if (isVersionAffected(dep.version, vuln.affected_versions || '*')) {
-              vulnerabilities.push({
-                severity: vuln.severity || 'medium',
-                description: vuln.description || 'Vulnerability in package',
-                fixedInVersion: vuln.fixed_in_version,
-                url: vuln.more_info_url,
-                cveIds: vuln.cve_ids
-              });
-            }
-          }
-          
-          if (vulnerabilities.length > 0) {
-            dep.vulnerabilities = vulnerabilities;
-          }
+    if (!groupId || !artifactId) {
+      return;
+    }
+    
+    // Check for common vulnerabilities in well-known packages
+    // This is just a demonstration - a real implementation would use a comprehensive database
+    const knownVulnerablePackages: Record<string, Array<{
+      artifactId: string;
+      severity: 'low' | 'medium' | 'high' | 'critical';
+      description: string;
+      affected_versions: string;
+      fixed_in_version?: string;
+      cve_ids?: string[];
+    }>> = {
+      'org.apache.logging.log4j': [
+        {
+          artifactId: 'log4j-core',
+          severity: 'critical',
+          description: 'Remote Code Execution (RCE) vulnerability (Log4Shell)',
+          affected_versions: '>=2.0.0,<=2.14.1',
+          fixed_in_version: '2.15.0',
+          cve_ids: ['CVE-2021-44228']
         }
-      } catch (dbError) {
-        log.warn(`Error reading Maven/Gradle vulnerability database`, { error: dbError });
+      ],
+      'org.springframework': [
+        {
+          artifactId: 'spring-core',
+          severity: 'critical',
+          description: 'Spring Framework RCE vulnerability (Spring4Shell)',
+          affected_versions: '<=5.3.17,<=5.2.19',
+          fixed_in_version: '5.3.18,5.2.20',
+          cve_ids: ['CVE-2022-22965']
+        }
+      ]
+    };
+    
+    if (knownVulnerablePackages[groupId]) {
+      // Find matching artifactId
+      const vulnForArtifact = knownVulnerablePackages[groupId].find(v => 
+        v.artifactId === artifactId || artifactId.includes(v.artifactId)
+      );
+      
+      if (vulnForArtifact && isVersionAffected(dep.version, vulnForArtifact.affected_versions)) {
+        dep.vulnerabilities = [{
+          severity: vulnForArtifact.severity,
+          description: vulnForArtifact.description,
+          affectedVersions: vulnForArtifact.affected_versions,
+          fixedInVersion: vulnForArtifact.fixed_in_version,
+          cveIds: vulnForArtifact.cve_ids
+        }];
+        dep.isVulnerable = true;
       }
     }
-    
-    // If no vulnerabilities found yet, try dependency-check or OWASP Dependency Check
-    if (!dep.vulnerabilities || dep.vulnerabilities.length === 0) {
-      // For a complete implementation, you would integrate with dependency-check or OWASP Dependency Check
-    }
   } catch (error) {
-    log.warn(`Error checking Maven/Gradle vulnerabilities for ${dep.name}`, { error });
+    log.debug(`Error checking Maven vulnerabilities for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check for vulnerabilities in NuGet packages
+ * Check for Composer vulnerabilities
  */
-async function checkNugetVulnerabilities(
+async function checkComposerVulnerabilities(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check custom database first if configured
-    if (config.vulnerabilityDbPaths?.nuget && fs.existsSync(config.vulnerabilityDbPaths.nuget)) {
-      try {
-        const vulnDb = JSON.parse(await readFileAsync(config.vulnerabilityDbPaths.nuget, 'utf8'));
-        
-        if (vulnDb[dep.name]) {
-          const vulnerabilities = [];
-          
-          for (const vuln of vulnDb[dep.name]) {
-            // Check if this version is affected
-            if (isVersionAffected(dep.version, vuln.affected_versions || '*')) {
-              vulnerabilities.push({
-                severity: vuln.severity || 'medium',
-                description: vuln.description || 'Vulnerability in package',
-                fixedInVersion: vuln.fixed_in_version,
-                url: vuln.more_info_url,
-                cveIds: vuln.cve_ids
-              });
-            }
-          }
-          
-          if (vulnerabilities.length > 0) {
-            dep.vulnerabilities = vulnerabilities;
-          }
-        }
-      } catch (dbError) {
-        log.warn(`Error reading NuGet vulnerability database`, { error: dbError });
-      }
-    }
+    // This is a simplified approach - a real implementation would use the Security Advisories API
+    // or a more comprehensive database
     
-    // If no vulnerabilities found yet, try to query known vulnerabilities
-    if (!dep.vulnerabilities || dep.vulnerabilities.length === 0) {
-      // For a complete implementation, you could query NVD or other vulnerability databases
+    // Check for common vulnerabilities in well-known packages
+    const knownVulnerablePackages: Record<string, Array<{
+      severity: 'low' | 'medium' | 'high' | 'critical';
+      description: string;
+      affected_versions: string;
+      fixed_in_version?: string;
+      cve_ids?: string[];
+    }>> = {
+      'laravel/framework': [
+        {
+          severity: 'high',
+          description: 'Remote code execution vulnerability in Laravel Framework',
+          affected_versions: '<8.4.3',
+          fixed_in_version: '8.4.3',
+          cve_ids: ['CVE-2021-3129']
+        }
+      ],
+      'symfony/symfony': [
+        {
+          severity: 'high',
+          description: 'Symfony Security Component vulnerability',
+          affected_versions: '>=4.4.0,<4.4.18',
+          fixed_in_version: '4.4.18',
+          cve_ids: ['CVE-2020-15094']
+        }
+      ]
+    };
+    
+    if (knownVulnerablePackages[dep.name] && isVersionAffected(dep.version, knownVulnerablePackages[dep.name][0].affected_versions)) {
+      dep.vulnerabilities = knownVulnerablePackages[dep.name].map(vuln => ({
+        severity: vuln.severity,
+        description: vuln.description,
+        affectedVersions: vuln.affected_versions,
+        fixedInVersion: vuln.fixed_in_version,
+        cveIds: vuln.cve_ids
+      }));
+      dep.isVulnerable = true;
     }
   } catch (error) {
-    log.warn(`Error checking NuGet vulnerabilities for ${dep.name}`, { error });
+    log.debug(`Error checking Composer vulnerabilities for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check if a dependency is deprecated
+ * Check for NuGet vulnerabilities
  */
-async function checkIfDeprecated(
+async function checkNuGetVulnerabilities(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Check for deprecation based on package manager
+    // This is a simplified approach - a real implementation would use the NuGet Security API
+    // or a more comprehensive database
+    
+    // Check for common vulnerabilities in well-known packages
+    const knownVulnerablePackages: Record<string, Array<{
+      severity: 'low' | 'medium' | 'high' | 'critical';
+      description: string;
+      affected_versions: string;
+      fixed_in_version?: string;
+      cve_ids?: string[];
+    }>> = {
+      'Newtonsoft.Json': [
+        {
+          severity: 'medium',
+          description: 'Denial of Service vulnerability in Newtonsoft.Json',
+          affected_versions: '<12.0.3',
+          fixed_in_version: '12.0.3',
+          cve_ids: ['CVE-2020-10204']
+        }
+      ],
+      'Microsoft.AspNetCore.SignalR': [
+        {
+          severity: 'high',
+          description: 'Denial of Service vulnerability in SignalR',
+          affected_versions: '<1.1.5',
+          fixed_in_version: '1.1.5',
+          cve_ids: ['CVE-2020-1597']
+        }
+      ]
+    };
+    
+    if (knownVulnerablePackages[dep.name] && isVersionAffected(dep.version, knownVulnerablePackages[dep.name][0].affected_versions)) {
+      dep.vulnerabilities = knownVulnerablePackages[dep.name].map(vuln => ({
+        severity: vuln.severity,
+        description: vuln.description,
+        affectedVersions: vuln.affected_versions,
+        fixedInVersion: vuln.fixed_in_version,
+        cveIds: vuln.cve_ids
+      }));
+      dep.isVulnerable = true;
+    }
+  } catch (error) {
+    log.debug(`Error checking NuGet vulnerabilities for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check for Cargo vulnerabilities
+ */
+async function checkCargoVulnerabilities(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // This is a simplified approach - a real implementation would use the RustSec Advisory Database
+    // or a more comprehensive database
+    
+    // Use the RustSec advisory database API if available
+    const { stdout } = await execAsync(`curl -s https://rustsec.org/api/v1/advisories/crates/${dep.name}.json`);
+    
+    try {
+      const advisories = JSON.parse(stdout);
+      
+      if (advisories && advisories.advisories && advisories.advisories.length > 0) {
+        const vulns = [];
+        
+        for (const advisory of advisories.advisories) {
+          if (isVersionAffected(dep.version, advisory.affected_versions)) {
+            vulns.push({
+              severity: mapRustSecSeverity(advisory.severity),
+              description: advisory.title,
+              affectedVersions: advisory.affected_versions,
+              fixedInVersion: advisory.patched_versions?.[0],
+              cveIds: advisory.aliases?.filter((a: string) => a.startsWith('CVE-')) || [],
+              url: advisory.url
+            });
+          }
+        }
+        
+        if (vulns.length > 0) {
+          dep.vulnerabilities = vulns;
+          dep.isVulnerable = true;
+        }
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing RustSec API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.debug(`Error checking Cargo vulnerabilities for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Map RustSec severity to standard severity
+ */
+function mapRustSecSeverity(severity: string): 'low' | 'medium' | 'high' | 'critical' {
+  switch (severity?.toLowerCase()) {
+    case 'critical':
+      return 'critical';
+    case 'high':
+      return 'high';
+    case 'medium':
+    case 'moderate':
+      return 'medium';
+    case 'low':
+      return 'low';
+    default:
+      return 'medium';
+  }
+}
+
+/**
+ * Check dependency license
+ */
+async function checkDependencyLicense(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Get the license information based on package manager
+    await getLicenseInfo(dep, config);
+    
+    if (!dep.license) {
+      // If license information could not be determined, flag as a license issue
+      dep.isLicenseIssue = true;
+      dep.licenseIssue = {
+        license: 'unknown',
+        reason: 'No license information found for this dependency.'
+      };
+      return;
+    }
+    
+    // Check against allowlist/blocklist if configured
+    if (config.licenses) {
+      // Check if the license is in the blocklist
+      if (config.licenses.blocklist && config.licenses.blocklist.length > 0) {
+        for (const blockedLicense of config.licenses.blocklist) {
+          if (licenseMatches(dep.license, blockedLicense)) {
+            dep.isLicenseIssue = true;
+            dep.licenseIssue = {
+              license: dep.license,
+              reason: `License '${dep.license}' is in the blocked licenses list.`
+            };
+            return;
+          }
+        }
+      }
+      
+      // Check if allowlist is configured and license is not in it
+      if (config.licenses.allowlist && config.licenses.allowlist.length > 0) {
+        let inAllowlist = false;
+        
+        for (const allowedLicense of config.licenses.allowlist) {
+          if (licenseMatches(dep.license, allowedLicense)) {
+            inAllowlist = true;
+            break;
+          }
+        }
+        
+        if (!inAllowlist) {
+          dep.isLicenseIssue = true;
+          dep.licenseIssue = {
+            license: dep.license,
+            reason: `License '${dep.license}' is not in the allowed licenses list.`
+          };
+        }
+      }
+    }
+  } catch (error) {
+    log.warn(`Error checking license for dependency ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Get license information for a dependency
+ */
+async function getLicenseInfo(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use different approaches based on package manager
     switch (dep.packageManager) {
       case 'npm':
-        await checkNpmDeprecation(dep, config);
+      case 'yarn':
+      case 'pnpm':
+        await getNpmLicense(dep, config);
         break;
       case 'pip':
-        await checkPipDeprecation(dep, config);
+      case 'pipenv':
+      case 'poetry':
+        await getPythonLicense(dep, config);
         break;
       case 'maven':
       case 'gradle':
-        await checkMavenDeprecation(dep, config);
+        await getMavenLicense(dep, config);
+        break;
+      case 'composer':
+        await getComposerLicense(dep, config);
         break;
       case 'nuget':
-        await checkNugetDeprecation(dep, config);
+        await getNuGetLicense(dep, config);
+        break;
+      case 'cargo':
+        await getCargoLicense(dep, config);
+        break;
+      case 'go':
+        await getGoLicense(dep, config);
+        break;
+      case 'gem':
+        await getRubyGemsLicense(dep, config);
+        break;
+      case 'cocoapods':
+        await getCocoaPodsLicense(dep, config);
+        break;
+      case 'swift':
+        await getSwiftLicense(dep, config);
         break;
     }
   } catch (error) {
-    log.warn(`Error checking if ${dep.name} is deprecated`, { error });
+    log.warn(`Error getting license info for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check if an NPM package is deprecated
+ * Get license for NPM package
  */
-async function checkNpmDeprecation(
+async function getNpmLicense(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Query npm registry for package info
-    const { stdout } = await execAsync(`npm view ${dep.name} deprecated --json`);
+    // Use npm view to get license information
+    const { stdout } = await execAsync(`npm view ${dep.name}@${dep.version} license --json`);
     
     try {
-      const deprecationInfo = JSON.parse(stdout.trim());
+      const licenseInfo = JSON.parse(stdout.trim());
       
-      if (deprecationInfo && typeof deprecationInfo === 'string') {
-        dep.isDeprecated = true;
-        dep.deprecationMessage = deprecationInfo;
+      if (typeof licenseInfo === 'string') {
+        dep.license = licenseInfo;
+      } else if (licenseInfo && licenseInfo.type) {
+        dep.license = licenseInfo.type;
       }
     } catch (jsonError) {
-      // If not valid JSON, it might be "undefined" which means not deprecated
-      if (stdout.trim() !== 'undefined') {
-        log.warn(`Error parsing npm deprecation info for ${dep.name}`, { error: jsonError });
+      // Handle non-JSON output (sometimes npm returns plain text)
+      if (stdout.trim() && stdout.trim() !== 'undefined') {
+        dep.license = stdout.trim();
       }
     }
   } catch (error) {
-    // npm view can exit with an error if the package doesn't exist
-    log.warn(`Error checking NPM deprecation for ${dep.name}`, { error });
+    log.debug(`Error getting NPM license for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check if a Python package is deprecated
+ * Get license for Python package
  */
-async function checkPipDeprecation(
+async function getPythonLicense(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Use PyPI API to check for deprecation markers
+    // Use PyPI API to get license information
     const { stdout } = await execAsync(`curl -s https://pypi.org/pypi/${dep.name}/json`);
     
     try {
       const packageInfo = JSON.parse(stdout);
       
-      // Check description and summary for deprecation keywords
-      const description = (packageInfo.info.description || '').toLowerCase();
-      const summary = (packageInfo.info.summary || '').toLowerCase();
-      
-      if (description.includes('deprecated') || 
-          summary.includes('deprecated') || 
-          description.includes('no longer maintained') || 
-          summary.includes('no longer maintained')) {
-        
-        dep.isDeprecated = true;
-        dep.deprecationMessage = 'Package appears to be deprecated based on its description';
-      }
-      
-      // Check if there's a specific classifier for deprecated
-      if (packageInfo.info.classifiers && 
-          packageInfo.info.classifiers.some((c: string) => 
-            c.toLowerCase().includes('deprecated') || 
-            c.toLowerCase().includes('inactive')
-          )) {
-        
-        dep.isDeprecated = true;
-        dep.deprecationMessage = 'Package is marked with deprecated/inactive classifier';
-      }
-      
-      // Check development status
-      const devStatus = packageInfo.info.classifiers.find((c: string) => 
-        c.toLowerCase().includes('development status')
-      );
-      
-      if (devStatus && 
-          (devStatus.includes('Inactive') || 
-           devStatus.includes('7 - Inactive'))) {
-        
-        dep.isDeprecated = true;
-        dep.deprecationMessage = `Package development status: ${devStatus}`;
+      if (packageInfo.info) {
+        // PyPI stores license information in different fields
+        dep.license = packageInfo.info.license || packageInfo.info.classifiers.find((c: string) => c.startsWith('License ::'))?.replace('License :: ', '') || 'unknown';
       }
     } catch (jsonError) {
-      log.warn(`Error parsing PyPI API output for ${dep.name} deprecation check`, { error: jsonError });
+      log.warn(`Error parsing PyPI API output for ${dep.name}`, { error: jsonError });
     }
   } catch (error) {
-    log.warn(`Error checking Python deprecation for ${dep.name}`, { error });
+    log.debug(`Error getting Python license for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check if a Maven/Gradle package is deprecated
+ * Get license for Maven package
  */
-async function checkMavenDeprecation(
+async function getMavenLicense(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
@@ -1884,203 +2981,450 @@ async function checkMavenDeprecation(
     // Extract groupId and artifactId
     const [groupId, artifactId] = dep.name.split(':');
     
-    // Use Maven Central API to check for potential deprecation markers
+    if (!groupId || !artifactId) {
+      return;
+    }
+    
+    // Use Maven Central API to get license information
     const { stdout } = await execAsync(`curl -s "https://search.maven.org/solrsearch/select?q=g:%22${groupId}%22+AND+a:%22${artifactId}%22&rows=1&wt=json"`);
     
     try {
       const searchResult = JSON.parse(stdout);
       
       if (searchResult.response && searchResult.response.docs && searchResult.response.docs.length > 0) {
-        const latestVersion = searchResult.response.docs[0].latestVersion;
+        // Maven Central stores license information in the license field
+        const doc = searchResult.response.docs[0];
         
-        // If the latest version is very old (e.g., >5 years), it might be abandoned
-        const timestamp = searchResult.response.docs[0].timestamp;
-        if (timestamp) {
-          const lastUpdateDate = new Date(timestamp);
-          const fiveYearsAgo = new Date();
-          fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
+        if (doc.licenseUrl && doc.licenseUrl.length > 0) {
+          // Try to determine license from URL
+          const licenseUrl = doc.licenseUrl[0];
           
-          if (lastUpdateDate < fiveYearsAgo) {
-            dep.isDeprecated = true;
-            dep.deprecationMessage = `Package has not been updated since ${lastUpdateDate.toISOString().split('T')[0]} and may be abandoned`;
+          if (licenseUrl.includes('apache.org/licenses')) {
+            dep.license = 'Apache-2.0';
+          } else if (licenseUrl.includes('opensource.org/licenses/MIT')) {
+            dep.license = 'MIT';
+          } else if (licenseUrl.includes('gnu.org/licenses/gpl')) {
+            dep.license = 'GPL';
+          } else if (licenseUrl.includes('gnu.org/licenses/lgpl')) {
+            dep.license = 'LGPL';
+          } else if (licenseUrl.includes('opensource.org/licenses/BSD')) {
+            dep.license = 'BSD';
+          } else if (licenseUrl.includes('mozilla.org/MPL')) {
+            dep.license = 'MPL';
+          } else {
+            dep.license = licenseUrl; // Use URL as fallback
           }
+        } else if (doc.license && doc.license.length > 0) {
+          dep.license = doc.license[0];
+        } else {
+          dep.license = 'unknown';
         }
       }
     } catch (jsonError) {
-      log.warn(`Error parsing Maven Central API output for ${dep.name} deprecation check`, { error: jsonError });
+      log.warn(`Error parsing Maven Central API output for ${dep.name}`, { error: jsonError });
     }
   } catch (error) {
-    log.warn(`Error checking Maven/Gradle deprecation for ${dep.name}`, { error });
+    log.debug(`Error getting Maven license for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check if a NuGet package is deprecated
+ * Get license for Composer package
  */
-async function checkNugetDeprecation(
+async function getComposerLicense(
   dep: DependencyInfo,
   config: DependencyScannerConfig
 ): Promise<void> {
   try {
-    // Use NuGet API to check for deprecation
-    const { stdout } = await execAsync(`curl -s "https://api.nuget.org/v3/registration5-semver1/${dep.name.toLowerCase()}/index.json"`);
+    // Use Packagist API to get license information
+    const { stdout } = await execAsync(`curl -s https://repo.packagist.org/p2/${dep.name}.json`);
     
     try {
       const packageInfo = JSON.parse(stdout);
       
-      // Check if there's deprecation info
-      // See: https://docs.microsoft.com/en-us/nuget/api/registration-base-url-resource#package-deprecation
-      if (packageInfo.items && packageInfo.items.length > 0) {
-        for (const item of packageInfo.items) {
-          if (item.items && item.items.length > 0) {
-            for (const version of item.items) {
-              if (version.catalogEntry && 
-                  version.catalogEntry.version === dep.version && 
-                  version.catalogEntry.deprecation) {
-                
-                dep.isDeprecated = true;
-                dep.deprecationMessage = version.catalogEntry.deprecation.message || 'Package is deprecated';
-                return;
-              }
-            }
-          }
-        }
-      }
-      
-      // Also check for packages that haven't been updated in a long time
-      if (packageInfo.items && packageInfo.items.length > 0) {
-        const lastItem = packageInfo.items[packageInfo.items.length - 1];
-        if (lastItem.items && lastItem.items.length > 0) {
-          const lastVersion = lastItem.items[lastItem.items.length - 1];
-          
-          if (lastVersion.catalogEntry && lastVersion.catalogEntry.published) {
-            const publishedDate = new Date(lastVersion.catalogEntry.published);
-            const fiveYearsAgo = new Date();
-            fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
-            
-            if (publishedDate < fiveYearsAgo) {
-              dep.isDeprecated = true;
-              dep.deprecationMessage = `Package has not been updated since ${publishedDate.toISOString().split('T')[0]} and may be abandoned`;
-            }
+      if (packageInfo.packages && packageInfo.packages[dep.name]) {
+        // Find the specific version if available
+        const versions = packageInfo.packages[dep.name];
+        
+        if (versions[dep.version]) {
+          dep.license = versions[dep.version].license?.[0] || 'unknown';
+        } else {
+          // Use the latest version's license as fallback
+          const latestVersion = Object.keys(versions).sort().pop();
+          if (latestVersion) {
+            dep.license = versions[latestVersion].license?.[0] || 'unknown';
           }
         }
       }
     } catch (jsonError) {
-      log.warn(`Error parsing NuGet API output for ${dep.name} deprecation check`, { error: jsonError });
+      log.warn(`Error parsing Packagist API output for ${dep.name}`, { error: jsonError });
     }
   } catch (error) {
-    log.warn(`Error checking NuGet deprecation for ${dep.name}`, { error });
+    log.debug(`Error getting Composer license for ${dep.name}`, { error });
   }
 }
 
 /**
- * Assess the impact of updating a dependency
+ * Get license for NuGet package
  */
-async function assessUpdateImpact(
+async function getNuGetLicense(
   dep: DependencyInfo,
   config: DependencyScannerConfig
-): Promise<{
-  breakingChanges: boolean;
-  affectedComponents?: string[];
-  estimatedEffort: 'low' | 'medium' | 'high';
-}> {
-  // Default impact assessment
-  const impact = {
-    breakingChanges: false,
-    affectedComponents: [] as string[],
-    estimatedEffort: 'low' as 'low' | 'medium' | 'high'
-  };
-  
+): Promise<void> {
   try {
-    if (!config.assessUpdateImpact || !dep.latestVersion || dep.version === dep.latestVersion) {
-      return impact;
-    }
+    // Use NuGet API to get license information
+    const { stdout } = await execAsync(`curl -s "https://api-v2v3search-0.nuget.org/query?q=PackageId:${dep.name}&prerelease=false"`);
     
-    // If version info suggests breaking changes, update impact
-    if (isMajorVersionUpdate(dep.version, dep.latestVersion)) {
-      impact.breakingChanges = true;
-      impact.estimatedEffort = 'medium';
-    }
-    
-    // Determine affected components based on files that depend on this
-    if (dep.dependentFiles.length > 0) {
-      // Extract component names from file paths
-      const components = new Set<string>();
+    try {
+      const searchResult = JSON.parse(stdout);
       
-      for (const file of dep.dependentFiles) {
-        const parts = file.split('/');
-        if (parts.length >= 3) {
-          // Use the top 2-3 directories as the "component"
-          const component = parts.slice(parts.length - 3, parts.length - 1).join('/');
-          components.add(component);
+      if (searchResult.data && searchResult.data.length > 0) {
+        // Find exact match for the package
+        const pkg = searchResult.data.find((p: any) => p.id.toLowerCase() === dep.name.toLowerCase());
+        
+        if (pkg) {
+          // NuGet stores license information in licenseUrl or license
+          if (pkg.license) {
+            dep.license = pkg.license;
+          } else if (pkg.licenseUrl) {
+            // Try to determine license from URL
+            if (pkg.licenseUrl.includes('apache.org/licenses')) {
+              dep.license = 'Apache-2.0';
+            } else if (pkg.licenseUrl.includes('opensource.org/licenses/MIT')) {
+              dep.license = 'MIT';
+            } else if (pkg.licenseUrl.includes('gnu.org/licenses/gpl')) {
+              dep.license = 'GPL';
+            } else if (pkg.licenseUrl.includes('gnu.org/licenses/lgpl')) {
+              dep.license = 'LGPL';
+            } else if (pkg.licenseUrl.includes('opensource.org/licenses/BSD')) {
+              dep.license = 'BSD';
+            } else if (pkg.licenseUrl.includes('mozilla.org/MPL')) {
+              dep.license = 'MPL';
+            } else {
+              dep.license = pkg.licenseUrl; // Use URL as fallback
+            }
+          } else if (pkg.licenseExpression) {
+            dep.license = pkg.licenseExpression;
+          } else {
+            dep.license = 'unknown';
+          }
         }
       }
-      
-      impact.affectedComponents = Array.from(components);
-      
-      // If many components are affected, increase effort
-      if (impact.affectedComponents.length > 3) {
-        impact.estimatedEffort = 'medium';
-      }
-      
-      if (impact.affectedComponents.length > 8) {
-        impact.estimatedEffort = 'high';
-      }
+    } catch (jsonError) {
+      log.warn(`Error parsing NuGet API output for ${dep.name}`, { error: jsonError });
     }
-    
-    // If it's both a breaking change and affects many components, that's high effort
-    if (impact.breakingChanges && impact.affectedComponents && impact.affectedComponents.length > 3) {
-      impact.estimatedEffort = 'high';
-    }
-    
-    // If it's a major library upgrade, consider it high effort
-    const knownMajorLibraries = [
-      'react', 'angular', 'vue', 'next', 'nuxt', 
-      'express', 'koa', 'django', 'flask', 'spring', 
-      'hibernate', 'tensorflow', 'pytorch', 'pandas', 
-      'numpy', 'symfony', 'laravel', 'dotnet'
-    ];
-    
-    if (knownMajorLibraries.some(lib => dep.name === lib || dep.name.startsWith(`${lib}-`)) && 
-        impact.breakingChanges) {
-      impact.estimatedEffort = 'high';
-    }
-    
-    // Vulnerabilities often require targeted testing
-    if (dep.vulnerabilities && dep.vulnerabilities.length > 0) {
-      // Critical vulnerabilities may require urgent changes
-      if (dep.vulnerabilities.some(v => v.severity === 'critical')) {
-        impact.breakingChanges = true; // Assume high risk of changes
-        impact.estimatedEffort = 'high';
-      }
-    }
-    
-    return impact;
   } catch (error) {
-    log.warn(`Error assessing update impact for ${dep.name}`, { error });
-    return impact;
+    log.debug(`Error getting NuGet license for ${dep.name}`, { error });
   }
 }
 
 /**
- * Check if a version update is a major version change
- * This is a simplified implementation - in a real system, use semver
+ * Get license for Cargo package
  */
-function isMajorVersionUpdate(currentVersion: string, latestVersion: string): boolean {
+async function getCargoLicense(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
   try {
-    const current = currentVersion.split('.');
-    const latest = latestVersion.split('.');
+    // Use crates.io API to get license information
+    const { stdout } = await execAsync(`curl -s https://crates.io/api/v1/crates/${dep.name}`);
     
-    // If major version number changed, it's a major update
-    if (parseInt(current[0], 10) < parseInt(latest[0], 10)) {
-      return true;
+    try {
+      const crateInfo = JSON.parse(stdout);
+      
+      if (crateInfo.crate) {
+        // Cargo stores license information in the license field
+        dep.license = crateInfo.crate.license || 'unknown';
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing crates.io API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.debug(`Error getting Cargo license for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Get license for Go module
+ */
+async function getGoLicense(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // This is a simplified approach - a real implementation would need to
+    // fetch the module source and look for LICENSE files
+    
+    // Try to determine license from GitHub
+    if (dep.name.includes('github.com/')) {
+      try {
+        const repoPath = dep.name.replace('github.com/', '');
+        const { stdout } = await execAsync(`curl -s https://api.github.com/repos/${repoPath}/license`);
+        
+        try {
+          const licenseInfo = JSON.parse(stdout);
+          
+          if (licenseInfo.license && licenseInfo.license.spdx_id) {
+            dep.license = licenseInfo.license.spdx_id;
+          } else if (licenseInfo.license && licenseInfo.license.key) {
+            dep.license = licenseInfo.license.key.toUpperCase();
+          }
+        } catch (jsonError) {
+          log.debug(`Error parsing GitHub API output for ${dep.name}`, { error: jsonError });
+        }
+      } catch (githubError) {
+        log.debug(`Error getting GitHub license for ${dep.name}`, { error: githubError });
+      }
     }
     
-    return false;
+    // Set to unknown if not determined
+    if (!dep.license) {
+      dep.license = 'unknown';
+    }
   } catch (error) {
-    // If can't parse, assume it's a major update to be safe
+    log.debug(`Error getting Go license for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Get license for RubyGems package
+ */
+async function getRubyGemsLicense(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use RubyGems API to get license information
+    const { stdout } = await execAsync(`curl -s https://rubygems.org/api/v1/gems/${dep.name}.json`);
+    
+    try {
+      const gemInfo = JSON.parse(stdout);
+      
+      // RubyGems stores license information in the licenses array or license field
+      if (gemInfo.licenses && gemInfo.licenses.length > 0) {
+        dep.license = gemInfo.licenses.join(', ');
+      } else {
+        dep.license = gemInfo.license || 'unknown';
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing RubyGems API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.debug(`Error getting RubyGems license for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Get license for CocoaPods package
+ */
+async function getCocoaPodsLicense(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Use CocoaPods API to get license information
+    const { stdout } = await execAsync(`curl -s https://trunk.cocoapods.org/api/v1/pods/${dep.name}`);
+    
+    try {
+      const podInfo = JSON.parse(stdout);
+      
+      if (podInfo.pod && podInfo.pod.license) {
+        // CocoaPods stores license information in the license field
+        // which can be a string or an object
+        if (typeof podInfo.pod.license === 'string') {
+          dep.license = podInfo.pod.license;
+        } else if (podInfo.pod.license.type) {
+          dep.license = podInfo.pod.license.type;
+        }
+      }
+    } catch (jsonError) {
+      log.warn(`Error parsing CocoaPods API output for ${dep.name}`, { error: jsonError });
+    }
+  } catch (error) {
+    log.debug(`Error getting CocoaPods license for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Get license for Swift package
+ */
+async function getSwiftLicense(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // For Swift packages, we have less standardized means to check
+    // For GitHub repositories, we can use the GitHub API
+    if (dep.name.includes('/') && !dep.name.startsWith('http')) {
+      // Extract owner and repo
+      const parts = dep.name.split('/');
+      if (parts.length >= 2) {
+        const owner = parts[parts.length - 2];
+        const repo = parts[parts.length - 1];
+        
+        try {
+          const { stdout } = await execAsync(`curl -s https://api.github.com/repos/${owner}/${repo}/license`);
+          
+          try {
+            const licenseInfo = JSON.parse(stdout);
+            
+            if (licenseInfo.license && licenseInfo.license.spdx_id) {
+              dep.license = licenseInfo.license.spdx_id;
+            } else if (licenseInfo.license && licenseInfo.license.key) {
+              dep.license = licenseInfo.license.key.toUpperCase();
+            }
+          } catch (jsonError) {
+            log.debug(`Error parsing GitHub API output for ${dep.name}`, { error: jsonError });
+          }
+        } catch (githubError) {
+          log.debug(`Error getting GitHub license for ${dep.name}`, { error: githubError });
+        }
+      }
+    }
+    
+    // Set to unknown if not determined
+    if (!dep.license) {
+      dep.license = 'unknown';
+    }
+  } catch (error) {
+    log.debug(`Error getting Swift license for ${dep.name}`, { error });
+  }
+}
+
+/**
+ * Check if license matches a pattern
+ */
+function licenseMatches(license: string, pattern: string): boolean {
+  // Normalize licenses for comparison
+  const normalizedLicense = license.toLowerCase().trim();
+  const normalizedPattern = pattern.toLowerCase().trim();
+  
+  // Exact match
+  if (normalizedLicense === normalizedPattern) {
     return true;
   }
+  
+  // Wildcard match
+  if (normalizedPattern.includes('*')) {
+    const regexPattern = normalizedPattern.replace(/\*/g, '.*');
+    return new RegExp(`^${regexPattern}$`).test(normalizedLicense);
+  }
+  
+  // License family match (e.g., 'MIT' should match 'MIT License')
+  if (normalizedLicense.includes(normalizedPattern)) {
+    return true;
+  }
+  
+  // SPDX license expressions
+  // For AND and OR expressions, this is a simplified approach
+  // A complete solution would use a proper SPDX expression parser
+  if (normalizedLicense.includes(' AND ') || normalizedLicense.includes(' OR ')) {
+    const parts = normalizedLicense
+      .replace(' AND ', ' ')
+      .replace(' OR ', ' ')
+      .split(' ');
+    
+    for (const part of parts) {
+      if (licenseMatches(part, pattern)) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * Check if dependency is maintained
+ */
+async function checkIfDependencyMaintained(
+  dep: DependencyInfo,
+  config: DependencyScannerConfig
+): Promise<void> {
+  try {
+    // Consider a dependency not maintained if it hasn't been updated in a long time
+    if (dep.lastPublishDate) {
+      const now = new Date();
+      const ageInDays = (now.getTime() - dep.lastPublishDate.getTime()) / (1000 * 60 * 60 * 24);
+      
+      const maxAge = config.maxUpdateAge || 365; // Default to 1 year
+      
+      if (ageInDays > maxAge) {
+        dep.isNotMaintained = true;
+      }
+    }
+    
+    // If no publish date information is available, check for other signs of lack of maintenance
+    if (!dep.lastPublishDate && dep.isOutdated && dep.latestVersion) {
+      // If the package is significantly behind the latest version, it might not be maintained
+      try {
+        const currentParts = dep.version.split('.');
+        const latestParts = dep.latestVersion.split('.');
+        
+        if (currentParts.length > 0 && latestParts.length > 0) {
+          const currentMajor = parseInt(currentParts[0], 10);
+          const latestMajor = parseInt(latestParts[0], 10);
+          
+          // If multiple major versions behind, flag as potentially not maintained
+          if (latestMajor - currentMajor >= 2) {
+            dep.isNotMaintained = true;
+          }
+        }
+      } catch (parseError) {
+        // Ignore version parsing errors
+      }
+    }
+  } catch (error) {
+    log.warn(`Error checking if dependency ${dep.name} is maintained`, { error });
+  }
+}
+
+/**
+ * Check if a version is affected by a specified range
+ */
+function isVersionAffected(version: string, affectedVersions: string): boolean {
+  if (version === 'unknown' || version === 'local') {
+    return true; // Assume unknown or local versions are affected
+  }
+  
+  // Very simplified version check - in a real implementation use semver or similar
+  if (affectedVersions === '*') {
+    return true;
+  }
+  
+  // Check exact version match
+  if (affectedVersions === version) {
+    return true;
+  }
+  
+  // Check range using commas
+  if (affectedVersions.includes(',')) {
+    const ranges = affectedVersions.split(',');
+    return ranges.some(range => isVersionAffected(version, range.trim()));
+  }
+  
+  // Check range with operators (very simplified)
+  if (affectedVersions.startsWith('<=')) {
+    const maxVersion = affectedVersions.substring(2);
+    return version <= maxVersion;
+  }
+  
+  if (affectedVersions.startsWith('<')) {
+    const maxVersion = affectedVersions.substring(1);
+    return version < maxVersion;
+  }
+  
+  if (affectedVersions.startsWith('>=')) {
+    const minVersion = affectedVersions.substring(2);
+    return version >= minVersion;
+  }
+  
+  if (affectedVersions.startsWith('>')) {
+    const minVersion = affectedVersions.substring(1);
+    return version > minVersion;
+  }
+  
+  return false;
 }
 
 /**
@@ -2106,22 +3450,38 @@ function calculateRiskLevel(
     }
   }
   
-  // Then consider deprecation
-  if (dep.isDeprecated) {
-    // Deprecated packages are at least medium risk
+  // Then consider license issues
+  if (dep.isLicenseIssue) {
+    // License issues are at least medium risk
     if (riskLevel === 'low') riskLevel = 'medium';
     
-    // If already has vulnerabilities and is deprecated, raise to high
+    // If license issue is combined with vulnerabilities, raise to high
     if (dep.vulnerabilities && dep.vulnerabilities.length > 0 && riskLevel === 'medium') {
       riskLevel = 'high';
     }
   }
   
-  // Consider how outdated the package is
+  // Then consider maintenance status
+  if (dep.isNotMaintained) {
+    // Unmaintained packages are at least medium risk
+    if (riskLevel === 'low') riskLevel = 'medium';
+    
+    // If unmaintained package has vulnerabilities, raise to high
+    if (dep.vulnerabilities && dep.vulnerabilities.length > 0 && riskLevel === 'medium') {
+      riskLevel = 'high';
+    }
+    
+    // If unmaintained package has license issues, raise to high
+    if (dep.isLicenseIssue && riskLevel === 'medium') {
+      riskLevel = 'high';
+    }
+  }
+  
+  // Consider how outdated the dependency is
   if (dep.isOutdated && dep.version && dep.latestVersion) {
     try {
       // Check if it's a major version behind
-      if (isMajorVersionUpdate(dep.version, dep.latestVersion)) {
+      if (dep.upgradeBreaking) {
         // Being a major version behind is at least medium risk
         if (riskLevel === 'low') riskLevel = 'medium';
         
@@ -2134,217 +3494,90 @@ function calculateRiskLevel(
         }
       }
     } catch (parseError) {
-      // If version parsing fails, default to medium for outdated packages
+      // If can't parse, default to medium for outdated dependencies
       if (riskLevel === 'low') riskLevel = 'medium';
     }
   }
   
-  // Consider criticality based on usage
-  // For direct dependencies in key files, increase risk
-  if (dep.isDirect && isKeyCriticalDependency(dep)) {
+  // Consider whether the dependency is unused
+  if (dep.isUnused) {
+    // Unused dependencies are at least medium risk because they add unnecessary bloat and attack surface
     if (riskLevel === 'low') riskLevel = 'medium';
-    if (riskLevel === 'medium') riskLevel = 'high';
+    
+    // If unused dependency has vulnerabilities, maintain vulnerability severity
+    // If unused dependency has license issues, raise to high
+    if (dep.isLicenseIssue && riskLevel === 'medium') {
+      riskLevel = 'high';
+    }
   }
   
   return riskLevel;
 }
 
 /**
- * Determine if a dependency is critical based on name and usage
- */
-function isKeyCriticalDependency(dep: DependencyInfo): boolean {
-  // Known critical packages by type
-  const criticalPackages: Record<string, string[]> = {
-    npm: [
-      'react', 'angular', 'vue', 'next', 'nuxt', 'express', 'koa',
-      'aws-sdk', 'azure-sdk', 'google-cloud', 'firebase',
-      'sequelize', 'mongoose', 'typeorm', 'prisma',
-      'axios', 'node-fetch', 'got',
-      'jsonwebtoken', 'passport', 'auth0',
-      'webpack', 'babel', 'typescript'
-    ],
-    pip: [
-      'django', 'flask', 'fastapi', 'tornado', 'pyramid',
-      'sqlalchemy', 'django-orm', 'peewee',
-      'boto3', 'azure-sdk', 'google-cloud-storage',
-      'requests', 'httpx', 'aiohttp',
-      'numpy', 'scipy', 'pandas', 'tensorflow', 'pytorch',
-      'jwt', 'python-jose', 'authlib'
-    ],
-    maven: [
-      'org.springframework', 'javax.servlet', 'jakarta.servlet',
-      'org.hibernate', 'javax.persistence', 'jakarta.persistence',
-      'com.amazonaws', 'com.azure', 'com.google.cloud',
-      'com.fasterxml.jackson', 'org.json', 'com.google.code.gson',
-      'org.apache.httpcomponents', 'java.net.http',
-      'io.jsonwebtoken', 'org.springframework.security'
-    ],
-    gradle: [
-      'org.springframework', 'javax.servlet', 'jakarta.servlet',
-      'org.hibernate', 'javax.persistence', 'jakarta.persistence',
-      'com.amazonaws', 'com.azure', 'com.google.cloud',
-      'com.fasterxml.jackson', 'org.json', 'com.google.code.gson',
-      'org.apache.httpcomponents', 'java.net.http',
-      'io.jsonwebtoken', 'org.springframework.security'
-    ],
-    nuget: [
-      'Microsoft.AspNetCore', 'Microsoft.EntityFrameworkCore',
-      'Microsoft.Extensions', 'Microsoft.Azure', 'AWS.SDK',
-      'Newtonsoft.Json', 'System.Text.Json',
-      'Microsoft.Data.SqlClient', 'System.Data.SqlClient',
-      'Microsoft.IdentityModel.Tokens', 'System.IdentityModel.Tokens.Jwt'
-    ]
-  };
-  
-  // Check if the dependency is in the critical list for its package manager
-  if (criticalPackages[dep.packageManager]) {
-    for (const criticalPkg of criticalPackages[dep.packageManager]) {
-      if (dep.name === criticalPkg || dep.name.startsWith(criticalPkg + '.') || 
-          dep.name.startsWith(criticalPkg + '-') || dep.name.startsWith(criticalPkg + '/')) {
-        return true;
-      }
-    }
-  }
-  
-  // Check for criticality based on dependent files
-  const criticalPathPatterns = [
-    'src/main/', 'src/app/', 'app/main.', 'index.js', 'index.ts',
-    'core/', 'auth/', 'security/', 'database/', 'api/',
-    'server.js', 'server.ts', 'app.js', 'app.ts', 'main.py'
-  ];
-  
-  // If the dependency is used in critical files, it's likely important
-  for (const filePath of dep.dependentFiles) {
-    for (const pattern of criticalPathPatterns) {
-      if (filePath.includes(pattern)) {
-        return true;
-      }
-    }
-  }
-  
-  return false;
-}
-
-/**
  * Generate tags for a dependency issue
  */
-function generateTags(
-  dep: DependencyInfo
-): string[] {
+function generateTags(dep: DependencyInfo): string[] {
   const tags: string[] = [dep.packageManager];
   
-  // Add descriptive tags based on issue type
+  // Add tag for dependency type
+  tags.push(`type:${dep.type}`);
+  
+  // Add tags based on issue type
   if (dep.isOutdated) {
     tags.push('outdated');
+    
+    if (dep.upgradeBreaking) {
+      tags.push('breaking-update');
+    } else {
+      tags.push('non-breaking-update');
+    }
   }
   
-  if (dep.vulnerabilities && dep.vulnerabilities.length > 0) {
+  if (dep.isVulnerable) {
     tags.push('vulnerable');
     
     // Add highest severity level
-    let highestSeverity = 'low';
-    for (const vuln of dep.vulnerabilities) {
-      if (vuln.severity === 'critical') {
-        highestSeverity = 'critical';
-        break;
-      } else if (vuln.severity === 'high' && highestSeverity !== 'critical') {
-        highestSeverity = 'high';
-      } else if (vuln.severity === 'medium' && highestSeverity !== 'critical' && highestSeverity !== 'high') {
-        highestSeverity = 'medium';
+    if (dep.vulnerabilities && dep.vulnerabilities.length > 0) {
+      let highestSeverity = 'low';
+      for (const vuln of dep.vulnerabilities) {
+        if (vuln.severity === 'critical') {
+          highestSeverity = 'critical';
+          break;
+        } else if (vuln.severity === 'high' && highestSeverity !== 'critical') {
+          highestSeverity = 'high';
+        } else if (vuln.severity === 'medium' && highestSeverity !== 'critical' && highestSeverity !== 'high') {
+          highestSeverity = 'medium';
+        }
       }
+      tags.push(`vulnerability:${highestSeverity}`);
     }
-    tags.push(`vulnerability:${highestSeverity}`);
+  }
+  
+  if (dep.isLicenseIssue) {
+    tags.push('license-issue');
+    
+    if (dep.license) {
+      tags.push(`license:${dep.license.toLowerCase().replace(/\s/g, '-')}`);
+    } else {
+      tags.push('license:unknown');
+    }
+  }
+  
+  if (dep.isNotMaintained) {
+    tags.push('not-maintained');
+  }
+  
+  if (dep.isUnused) {
+    tags.push('unused');
   }
   
   if (dep.isDeprecated) {
     tags.push('deprecated');
   }
   
-  // Add dependency type tags
-  if (dep.devDependency) {
-    tags.push('dev-dependency');
-  }
-  
-  if (dep.peerDependency) {
-    tags.push('peer-dependency');
-  }
-  
-  if (dep.optionalDependency) {
-    tags.push('optional-dependency');
-  }
-  
-  if (dep.isDirect) {
-    tags.push('direct');
-  } else {
-    tags.push('transitive');
-  }
-  
-  // Add tags for known package types
-  const packageTypeTags = getPackageTypeTags(dep);
-  tags.push(...packageTypeTags);
-  
-  return tags;
-}
-
-/**
- * Get package type tags based on package name and content
- */
-function getPackageTypeTags(dep: DependencyInfo): string[] {
-  const tags: string[] = [];
-  const name = dep.name.toLowerCase();
-  
-  // Frontend frameworks
-  if (['react', 'vue', 'angular', 'svelte', 'preact'].some(fw => 
-      name === fw || name.startsWith(`${fw}-`) || name.startsWith(`@${fw}/`))) {
-    tags.push('frontend', 'framework');
-  }
-  
-  // Backend frameworks
-  if (['express', 'koa', 'hapi', 'fastify', 'nest', 'spring', 'django', 'flask', 'rails'].some(fw => 
-      name === fw || name.startsWith(`${fw}-`) || name.startsWith(`@${fw}/`))) {
-    tags.push('backend', 'framework');
-  }
-  
-  // Data and databases
-  if (['sequelize', 'mongoose', 'typeorm', 'prisma', 'knex', 'sqlalchemy', 
-       'mongodb', 'mysql', 'postgres', 'sqlite', 'redis'].some(db => 
-      name === db || name.startsWith(`${db}-`) || name.includes('database') || name.includes('db'))) {
-    tags.push('database');
-  }
-  
-  // Testing libraries
-  if (['jest', 'mocha', 'chai', 'jasmine', 'karma', 'cypress', 'selenium', 
-       'puppeteer', 'pytest', 'unittest', 'testng', 'junit'].some(test => 
-      name === test || name.includes('test') || name.includes('spec'))) {
-    tags.push('testing');
-  }
-  
-  // Security related
-  if (['helmet', 'passport', 'jwt', 'auth', 'oauth', 'permission', 'acl', 'rbac',
-       'bcrypt', 'crypto', 'hash', 'security', 'firewall'].some(sec =>
-      name === sec || name.includes(sec))) {
-    tags.push('security');
-  }
-  
-  // UI libraries
-  if (['material-ui', 'bootstrap', 'tailwind', 'bulma', 'semantic', 'antd', 
-       'chakra', 'fontawesome', 'styled'].some(ui =>
-      name.includes(ui) || name.includes('ui-') || name.includes('-ui'))) {
-    tags.push('ui', 'frontend');
-  }
-  
-  // Cloud providers
-  if (['aws', 'azure', 'gcp', 'google-cloud', 'firebase', 'cloudflare', 'netlify', 
-       'vercel', 'heroku', 'digitalocean'].some(cloud =>
-      name.includes(cloud))) {
-    tags.push('cloud');
-  }
-  
-  // Data science/AI
-  if (['tensorflow', 'pytorch', 'keras', 'scikit', 'numpy', 'pandas', 'scipy', 
-       'matplotlib', 'seaborn', 'jupyter', 'ai', 'ml', 'machine-learning', 'data-science'].some(ds =>
-      name.includes(ds))) {
-    tags.push('data-science', 'ai');
+  if (dep.duplicates) {
+    tags.push('duplicate');
   }
   
   return tags;
@@ -2353,18 +3586,13 @@ function getPackageTypeTags(dep: DependencyInfo): string[] {
 /**
  * Generate a recommendation for a dependency issue
  */
-function generateRecommendation(
-  dep: DependencyInfo
-): string {
+function generateRecommendation(dep: DependencyInfo): string {
   const recommendations: string[] = [];
   
-  // Start with header based on risk level
-  let riskStr = ``;
-  
   // Handle vulnerable dependencies with highest priority
-  if (dep.vulnerabilities && dep.vulnerabilities.length > 0) {
+  if (dep.isVulnerable && dep.vulnerabilities && dep.vulnerabilities.length > 0) {
     recommendations.push(
-      `Found ${dep.vulnerabilities.length} ${dep.vulnerabilities.length === 1 ? 'vulnerability' : 'vulnerabilities'} in ${dep.packageManager} package ${dep.name}@${dep.version}.`
+      `Found ${dep.vulnerabilities.length} ${dep.vulnerabilities.length === 1 ? 'vulnerability' : 'vulnerabilities'} in ${dep.name}@${dep.version}.`
     );
     
     // Group vulnerabilities by severity for better readability
@@ -2412,141 +3640,112 @@ function generateRecommendation(
     }
   }
   
-  // Handle deprecated dependencies
-  if (dep.isDeprecated) {
-    recommendations.push(
-      `The ${dep.packageManager} package ${dep.name} is deprecated.`
-    );
-    
-    if (dep.deprecationMessage) {
-      recommendations.push(`Deprecation message: ${dep.deprecationMessage}`);
+  // Handle license issues
+  if (dep.isLicenseIssue && dep.licenseIssue) {
+    // Only add this header if not already covered by vulnerabilities
+    if (recommendations.length === 0) {
+      recommendations.push(
+        `Found license issue with ${dep.name}@${dep.version}: ${dep.licenseIssue.reason}`
+      );
+    } else {
+      recommendations.push(
+        `Additionally, there is a license issue: ${dep.licenseIssue.reason}`
+      );
     }
     
     recommendations.push(
-      `Find and migrate to an actively maintained alternative package.`
+      `Review the license compliance requirements for this dependency.`
+    );
+  }
+  
+  // Handle unmaintained dependencies
+  if (dep.isNotMaintained) {
+    // Only add this header if not already covered by other issues
+    if (recommendations.length === 0) {
+      recommendations.push(
+        `${dep.name}@${dep.version} appears to be unmaintained or abandoned.`
+      );
+    } else {
+      recommendations.push(
+        `Additionally, this dependency appears to be unmaintained or abandoned.`
+      );
+    }
+    
+    if (dep.lastPublishDate) {
+      recommendations.push(
+        `Last update was on ${dep.lastPublishDate.toISOString().split('T')[0]}, which is more than ${config.maxUpdateAge || 365} days ago.`
+      );
+    }
+    
+    recommendations.push(
+      `Consider finding an alternative, actively maintained package.`
+    );
+  }
+  
+  // Handle unused dependencies
+  if (dep.isUnused) {
+    // Only add this if not already covered by other issues
+    if (recommendations.length === 0) {
+      recommendations.push(
+        `${dep.name}@${dep.version} appears to be unused in the codebase.`
+      );
+    } else {
+      recommendations.push(
+        `Additionally, this dependency appears to be unused in the codebase.`
+      );
+    }
+    
+    recommendations.push(
+      `Remove this dependency to reduce package size and potential security issues.`
     );
   }
   
   // Handle outdated dependencies
   if (dep.isOutdated && dep.latestVersion) {
-    // Only add this if not already covered by vulnerabilities
-    if (!dep.vulnerabilities || dep.vulnerabilities.length === 0) {
+    // Only add this if not already covered by vulnerabilities, license issues, or maintenance issues
+    if (recommendations.length === 0) {
       recommendations.push(
-        `The ${dep.packageManager} package ${dep.name} (${dep.version}) is outdated. Latest version is ${dep.latestVersion}.`
+        `${dep.name}@${dep.version} is outdated. Latest version is ${dep.latestVersion}.`
       );
       
-      // Check if it's a major version update
-      try {
-        if (isMajorVersionUpdate(dep.version, dep.latestVersion)) {
-          recommendations.push(
-            `This is a major version update which may include breaking changes. Review the changelog before updating.`
-          );
-        } else {
-          recommendations.push(
-            `Update to the latest version to receive bug fixes and enhancements.`
-          );
-        }
-      } catch (versionError) {
+      // Check if it's a breaking update
+      if (dep.upgradeBreaking) {
         recommendations.push(
-          `Update to the latest version to receive bug fixes and enhancements.`
+          `This is a major version update which may include breaking changes. Review the changelog before updating.`
+        );
+      } else {
+        recommendations.push(
+          `Update to the latest version to receive bug fixes, performance improvements, and new features.`
         );
       }
+    } else if (!recommendations.some(r => r.includes('Update to the latest version'))) {
+      // Add update recommendation if not already present
+      recommendations.push(
+        `Update to ${dep.latestVersion} to receive the latest improvements and fixes.`
+      );
+    }
+  }
+  
+  // Add additional information if available
+  if (recommendations.length > 0 && (dep.homepageUrl || dep.repositoryUrl)) {
+    recommendations.push('');
+    recommendations.push('Additional information:');
+    
+    if (dep.homepageUrl) {
+      recommendations.push(`- Homepage: ${dep.homepageUrl}`);
+    }
+    
+    if (dep.repositoryUrl) {
+      recommendations.push(`- Repository: ${dep.repositoryUrl}`);
     }
   }
   
   // If no specific recommendations were made, add generic advice
   if (recommendations.length === 0) {
     recommendations.push(
-      `Review ${dep.packageManager} package ${dep.name} for potential updates or replacements as part of regular maintenance.`
+      `Review ${dep.name}@${dep.version} for potential updates or replacements as part of regular dependency maintenance.`
     );
   }
   
-  // Add update command example
-  recommendations.push(getUpdateCommandExample(dep));
-  
   return recommendations.join('\n');
 }
-
-/**
- * Get an example command to update the dependency
- */
-function getUpdateCommandExample(dep: DependencyInfo): string {
-  const latestVersion = dep.latestVersion || 'latest';
-  
-  switch (dep.packageManager) {
-    case 'npm':
-      const isDev = dep.devDependency ? ' --save-dev' : '';
-      return `Update command: npm install ${dep.name}@${latestVersion}${isDev}`;
-    
-    case 'pip':
-      return `Update command: pip install --upgrade ${dep.name}==${latestVersion}`;
-    
-    case 'maven':
-      const [groupId, artifactId] = dep.name.split(':');
-      return `Update in pom.xml: <dependency>\n  <groupId>${groupId}</groupId>\n  <artifactId>${artifactId}</artifactId>\n  <version>${latestVersion}</version>\n</dependency>`;
-    
-    case 'gradle':
-      const [gradleGroup, gradleArtifact] = dep.name.split(':');
-      return `Update in build.gradle: implementation '${gradleGroup}:${gradleArtifact}:${latestVersion}'`;
-    
-    case 'nuget':
-      return `Update command: dotnet add package ${dep.name} --version ${latestVersion}`;
-    
-    default:
-      return `Update ${dep.name} to version ${latestVersion}`;
-  }
-}
-
-/**
- * Check if a version is affected by a specified range
- * This is a simplified implementation
- */
-function isVersionAffected(version: string, affectedVersions: string): boolean {
-  if (version === 'unknown') {
-    return true; // Assume unknown versions are affected
-  }
-  
-  // Very simplified version check - in a real implementation use semver or similar
-  if (affectedVersions === '*') {
-    return true;
-  }
-  
-  // Check exact version match
-  if (affectedVersions === version) {
-    return true;
-  }
-  
-  // Check range using commas
-  if (affectedVersions.includes(',')) {
-    const versions = affectedVersions.split(',').map(v => v.trim());
-    return versions.includes(version);
-  }
-  
-  // Check range with operators (very simplified)
-  if (affectedVersions.startsWith('<=')) {
-    const maxVersion = affectedVersions.substring(2);
-    return version <= maxVersion;
-  }
-  
-  if (affectedVersions.startsWith('<')) {
-    const maxVersion = affectedVersions.substring(1);
-    return version < maxVersion;
-  }
-  
-  if (affectedVersions.startsWith('>=')) {
-    const minVersion = affectedVersions.substring(2);
-    return version >= minVersion;
-  }
-  
-  if (affectedVersions.startsWith('>')) {
-    const minVersion = affectedVersions.substring(1);
-    return version > minVersion;
-  }
-  
-  return false;
-}
-
-/**
- * Utility imports
- */
-import * as os from 'os';
