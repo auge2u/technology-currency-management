@@ -1,131 +1,173 @@
 /**
- * Common severity levels for issues
- */
-export type OutdatedTechnologySeverity = 'low' | 'medium' | 'high' | 'critical';
-
-/**
- * Represents an outdated technology detected in scans
+ * Represents an outdated technology detected in the codebase
  */
 export interface OutdatedTechnology {
+  /** Unique identifier for the finding */
   id: string;
+  /** Name of the technology or pattern detected */
   technology: string;
+  /** Path to the file where the outdated technology was found */
   filePath: string;
-  lineNumber?: number;
-  lineContent?: string;
-  severity: OutdatedTechnologySeverity;
+  /** Line number in the file */
+  lineNumber: number;
+  /** Content of the line where the issue was found */
+  lineContent: string;
+  /** Severity level of the issue */
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  /** Description of why this is an issue */
   message: string;
+  /** Recommended version to upgrade to */
   recommendedVersion: string;
+  /** Steps to remediate the issue */
   remediationSteps: string;
+  /** ID of the rule that detected this issue */
   ruleId: string;
+  /** When the issue was detected */
   detectedAt: Date;
 }
 
 /**
- * Represents an outdated dependency detected in scans
+ * Represents an outdated dependency in package.json, requirements.txt, etc.
  */
 export interface OutdatedDependency {
-  name: string;
+  /** Unique identifier for the finding */
+  id: string;
+  /** Name of the dependency package */
+  packageName: string;
+  /** Current version being used */
   currentVersion: string;
+  /** Latest available version */
   latestVersion: string;
-  packageManager: 'npm' | 'yarn' | 'pnpm' | 'pip' | 'gem' | 'composer' | 'maven' | 'gradle' | 'other';
+  /** Version difference type (patch, minor, major) */
+  updateType: 'patch' | 'minor' | 'major' | 'unknown';
+  /** Path to the file defining this dependency */
   filePath: string;
-  isDirectDependency: boolean;
-  isDev: boolean;
-  isDeprecated?: boolean;
-  severity: OutdatedTechnologySeverity;
-  breakingChanges?: boolean;
-  remediationSteps: string;
-  releaseDate?: Date;
+  /** When the dependency was last updated */
+  lastUpdated?: Date;
+  /** Number of versions behind latest */
+  versionsBehind?: number;
+  /** Severity level based on how outdated and critical the package is */
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  /** Whether the outdated version has known security vulnerabilities */
+  hasSecurityIssues: boolean;
+  /** Steps to update the dependency */
+  updateSteps: string;
+  /** When the issue was detected */
   detectedAt: Date;
 }
 
 /**
- * Represents a security vulnerability detected in scans
+ * Represents a security vulnerability found in dependencies
  */
 export interface SecurityVulnerability {
+  /** Unique identifier for the vulnerability */
   id: string;
+  /** CVE ID if available */
+  cveId?: string;
+  /** Name of the affected dependency */
   packageName: string;
-  version: string;
-  title: string;
+  /** Version range affected by the vulnerability */
+  affectedVersions: string;
+  /** Severity of the vulnerability */
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  /** Brief description of the vulnerability */
   description: string;
-  cve: string[];
-  cvss?: number;
-  fixedIn?: string;
-  exploitAvailable: boolean;
-  severity: OutdatedTechnologySeverity;
-  publicationDate?: Date;
+  /** URL to vulnerability details */
+  infoUrl?: string;
+  /** Versions that fix the vulnerability */
+  patchedVersions: string;
+  /** Path to the file defining this dependency */
+  filePath: string;
+  /** Steps to remediate the vulnerability */
   remediationSteps: string;
-  references: string[];
+  /** When the vulnerability was published */
+  publishedDate?: Date;
+  /** When the issue was detected */
   detectedAt: Date;
 }
 
 /**
- * Represents an outdated browser extension detected in scans
+ * Represents an outdated or problematic browser extension
  */
-export interface OutdatedExtension {
+export interface BrowserExtensionIssue {
+  /** Unique identifier for the finding */
   id: string;
-  name: string;
-  browser: 'chrome' | 'firefox' | 'safari' | 'edge';
+  /** Name of the browser extension */
+  extensionName: string;
+  /** Current version of the extension */
   currentVersion: string;
+  /** Latest available version */
   latestVersion: string;
-  manifestPath: string;
-  severity: OutdatedTechnologySeverity;
-  hasSecurityIssues: boolean;
-  hasCompatibilityIssues: boolean;
-  isDeprecated: boolean;
-  updateUrl?: string;
+  /** Browser(s) the extension is used in */
+  browsers: Array<'Chrome' | 'Firefox' | 'Safari' | 'Edge'>;
+  /** Type of issue with the extension */
+  issueType: 'outdated' | 'deprecated' | 'security' | 'compatibility';
+  /** Severity level of the issue */
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  /** Description of the issue */
+  description: string;
+  /** Steps to update or replace the extension */
+  remediationSteps: string;
+  /** When the issue was detected */
   detectedAt: Date;
 }
 
 /**
- * Represents a result of a scan
+ * Configuration for running scans
+ */
+export interface ScanConfig {
+  /** Root directory to scan */
+  rootDir: string;
+  /** Whether to include node_modules */
+  includeNodeModules: boolean;
+  /** Whether to include dev dependencies */
+  includeDevDependencies: boolean;
+  /** Maximum depth for directory traversal */
+  maxDepth?: number;
+  /** File patterns to include */
+  includePatterns: string[];
+  /** File patterns to exclude */
+  excludePatterns: string[];
+  /** Minimum severity level to report */
+  minSeverity: 'low' | 'medium' | 'high' | 'critical';
+  /** Types of scans to run */
+  scanTypes: Array<'technology' | 'dependency' | 'security' | 'browser-extension'>;
+}
+
+/**
+ * Combined scan results across all scan types
  */
 export interface ScanResult {
-  id: string;
-  scanType: 'dependency' | 'technology' | 'security' | 'extension' | 'all';
-  startedAt: Date;
-  completedAt?: Date;
-  findings: number;
-  scanStatus: 'running' | 'completed' | 'failed';
-  errorMessage?: string;
-}
-
-/**
- * Represents the output of a technological currency report
- */
-export interface TechnologyCurrencyReport {
+  /** Unique identifier for this scan */
   scanId: string;
-  scanDate: Date;
-  outdatedTechnologies: OutdatedTechnology[];
-  outdatedDependencies: OutdatedDependency[];
-  securityVulnerabilities: SecurityVulnerability[];
-  outdatedExtensions: OutdatedExtension[];
-  summary: {
-    totalIssues: number;
-    criticalCount: number;
-    highCount: number;
-    mediumCount: number;
-    lowCount: number;
-    outdatedTechnologiesCount: number;
-    outdatedDependenciesCount: number;
-    securityVulnerabilitiesCount: number;
-    outdatedExtensionsCount: number;
+  /** When the scan was started */
+  startTime: Date;
+  /** When the scan was completed */
+  endTime: Date;
+  /** Configuration used for the scan */
+  config: ScanConfig;
+  /** Technology patterns detected */
+  technologies: OutdatedTechnology[];
+  /** Outdated dependencies detected */
+  dependencies: OutdatedDependency[];
+  /** Security vulnerabilities detected */
+  vulnerabilities: SecurityVulnerability[];
+  /** Browser extension issues detected */
+  browserExtensions: BrowserExtensionIssue[];
+  /** Total issues found */
+  totalIssues: number;
+  /** Issues by severity */
+  issuesBySeverity: {
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
   };
-}
-
-/**
- * Represents a webhook notification payload
- */
-export interface WebhookNotificationPayload {
-  scanId: string;
-  scanDate: Date;
-  summary: {
-    totalIssues: number;
-    criticalCount: number;
-    highCount: number;
-    mediumCount: number;
-    lowCount: number;
+  /** Issues by type */
+  issuesByType: {
+    technology: number;
+    dependency: number;
+    security: number;
+    browserExtension: number;
   };
-  criticalIssues: Array<OutdatedTechnology | OutdatedDependency | SecurityVulnerability | OutdatedExtension>;
-  highIssues: Array<OutdatedTechnology | OutdatedDependency | SecurityVulnerability | OutdatedExtension>;
 }
